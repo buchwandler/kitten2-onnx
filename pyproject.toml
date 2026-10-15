@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kitten2-onnx"
+dynamic = ["version"]
+description = "Experimental ONNX export and parity tooling for KittenTTS 2."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+dependencies = [
+  "numpy>=1.26",
+  "onnx>=1.17",
+  "onnxruntime>=1.22",
+  "safetensors>=0.5",
+  "torch>=2.7",
+  "transformers>=4.53",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.12",
+]
+kitten = [
+  "huggingface-hub>=0.34",
+  "librosa>=0.11",
+  "soundfile>=0.13",
+]
+
+[tool.setuptools]
+packages = ["kitten2_onnx"]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.dev0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

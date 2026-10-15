@@ -218,3 +218,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+kitten2_onnx/_version.py
+context_kitten2_onnx*.*
