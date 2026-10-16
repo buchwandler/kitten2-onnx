@@ -112,14 +112,21 @@ def test_real_bruno_prompt_injection_and_32_step_lm_parity(monkeypatch):
         atol=1e-5,
     )
 
-    embedding_table = np.load(onnx_dir / metadata["embedding_file"], mmap_mode="r")
+    input_mode = metadata.get("input_mode", "inputs_embeds")
+    assert input_mode in {"inputs_embeds", "input_ids"}
     prompt_tensor = torch.from_numpy(prompt_ids[None])
     with torch.inference_mode():
         token_embeddings = model.get_input_embeddings()(prompt_tensor)
-    exported_embeddings = torch.from_numpy(
-        np.asarray(embedding_table[prompt_ids], dtype=np.float32).copy()[None]
-    )
-    torch.testing.assert_close(exported_embeddings, token_embeddings, rtol=0, atol=0)
+    if input_mode == "inputs_embeds":
+        embedding_table = np.load(onnx_dir / metadata["embedding_file"], mmap_mode="r")
+        stored_embeddings = embedding_table[prompt_ids]
+        if metadata.get("embedding_storage_dtype") == "bfloat16-u16":
+            bits = np.asarray(stored_embeddings, dtype=np.uint32) << 16
+            stored_embeddings = bits.view(np.float32)
+        exported_embeddings = torch.from_numpy(
+            np.asarray(stored_embeddings, dtype=np.float32).copy()[None]
+        )
+        torch.testing.assert_close(exported_embeddings, token_embeddings, rtol=0, atol=0)
     inputs_embeds = token_embeddings.clone()
     inputs_embeds[:, 0, :] = torch.from_numpy(speaker_hidden_onnx)
     torch.testing.assert_close(
@@ -152,15 +159,17 @@ def test_real_bruno_prompt_injection_and_32_step_lm_parity(monkeypatch):
         np.zeros((1, kv_heads, 0, head_dim), dtype=np.float32)
         for _ in range(2 * layers)
     ]
-    onnx_outputs = session.run(
-        None,
-        {
-            "inputs_embeds": inputs_embeds.numpy(),
-            "attention_mask": attention_mask.numpy(),
-            "position_ids": position_ids.numpy(),
-            **dict(zip(past_names, empty_cache, strict=True)),
-        },
-    )
+    prefill_inputs = {
+        "attention_mask": attention_mask.numpy(),
+        "position_ids": position_ids.numpy(),
+        **dict(zip(past_names, empty_cache, strict=True)),
+    }
+    if input_mode == "inputs_embeds":
+        prefill_inputs["inputs_embeds"] = inputs_embeds.numpy()
+    else:
+        prefill_inputs["input_ids"] = prompt_tensor.numpy()
+        prefill_inputs["speaker_hidden"] = speaker_hidden_onnx.astype(np.float32)
+    onnx_outputs = session.run(None, prefill_inputs)
     logits = reference.logits[:, -1, :].float()
     _assert_outputs(onnx_outputs, logits, reference.past_key_values)
     onnx_logits = onnx_outputs[0]
@@ -181,21 +190,19 @@ def test_real_bruno_prompt_injection_and_32_step_lm_parity(monkeypatch):
         past_length = len(prompt_ids) + step
         next_mask = torch.ones((1, past_length + 1), dtype=torch.long)
         next_positions = torch.tensor([[past_length]], dtype=torch.long)
-        onnx_outputs = session.run(
-            None,
-            {
-                "inputs_embeds": token_embeds.numpy(),
-                "attention_mask": next_mask.numpy(),
-                "position_ids": next_positions.numpy(),
-                **dict(
-                    zip(
-                        past_names,
-                        onnx_cache,
-                        strict=True,
-                    )
-                ),
-            },
-        )
+        decode_inputs = {
+            "attention_mask": next_mask.numpy(),
+            "position_ids": next_positions.numpy(),
+            **dict(zip(past_names, onnx_cache, strict=True)),
+        }
+        if input_mode == "inputs_embeds":
+            decode_inputs["inputs_embeds"] = token_embeds.numpy()
+        else:
+            decode_inputs["input_ids"] = token_ids.numpy()
+            decode_inputs["speaker_hidden"] = np.zeros(
+                (1, int(model.config.hidden_size)), dtype=np.float32
+            )
+        onnx_outputs = session.run(None, decode_inputs)
         with torch.inference_mode():
             reference = model(
                 inputs_embeds=token_embeds,

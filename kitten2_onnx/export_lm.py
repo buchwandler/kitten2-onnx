@@ -1,8 +1,8 @@
 """Export the KittenTTS 2 Qwen3 speech LM to ONNX.
 
-The graph intentionally starts at ``inputs_embeds``. Kitten's speaker projection
-replaces embedding position 0 during prefill, so keeping token lookup outside the
-graph is both simpler and closer to the upstream implementation.
+The default graph starts at ``inputs_embeds`` and keeps Kitten speaker injection
+in the runtime. An optional ``input_ids`` graph performs tied token lookup and
+position-zero speaker injection inside ONNX.
 
 One graph serves prefill and decode:
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +89,53 @@ class KittenQwen3ExportWrapper(nn.Module):
         return (logits, *flat)
 
 
+
+class KittenQwen3InputIdsExportWrapper(nn.Module):
+    """Run token lookup and Kitten speaker injection inside the ONNX graph."""
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.transformer = model.model
+        input_weight = model.get_input_embeddings().weight
+        output_weight = model.get_output_embeddings().weight
+        if input_weight.data_ptr() != output_weight.data_ptr():
+            raise ValueError("Qwen3 input and output embeddings are not tied")
+        self.embedding_weight = input_weight
+        self.num_layers = int(model.config.num_hidden_layers)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        speaker_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, ...]:
+        from transformers.cache_utils import DynamicCache
+
+        legacy = tuple((past[2 * i], past[2 * i + 1]) for i in range(self.num_layers))
+        cache = DynamicCache.from_legacy_cache(legacy)
+        token_embeddings = torch.nn.functional.embedding(input_ids, self.embedding_weight)
+        speaker_mask = position_ids.eq(0).unsqueeze(-1)
+        inputs_embeds = torch.where(
+            speaker_mask,
+            speaker_hidden.to(token_embeddings.dtype).unsqueeze(1),
+            token_embeddings,
+        )
+        out = self.transformer(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=cache,
+            use_cache=True,
+        )
+        last_hidden = out.last_hidden_state[:, -1:, :]
+        logits = torch.matmul(last_hidden, self.embedding_weight.transpose(0, 1))
+        logits = logits[:, 0, :].float()
+        present = out.past_key_values.to_legacy_cache()
+        flat = [tensor for layer in present for tensor in layer]
+        return (logits, *flat)
+
 def _io_names(num_layers: int) -> tuple[list[str], list[str]]:
     past = [name for i in range(num_layers) for name in (f"past_key_{i}", f"past_value_{i}")]
     present = [
@@ -107,6 +155,21 @@ def _dummy_inputs(config, dtype: torch.dtype, seq: int = 4, past_len: int = 3):
     pos = torch.arange(past_len, past_len + seq, dtype=torch.int64)[None, :]
     past = [torch.zeros(1, kv_heads, past_len, head_dim, dtype=dtype) for _ in range(2 * layers)]
     return embeds, mask, pos, past
+
+
+
+def _dummy_input_ids(config, dtype: torch.dtype, seq: int = 4, past_len: int = 3):
+    hidden = int(config.hidden_size)
+    kv_heads = int(config.num_key_value_heads)
+    head_dim = int(config.head_dim)
+    layers = int(config.num_hidden_layers)
+
+    input_ids = torch.randint(int(config.vocab_size), (1, seq), dtype=torch.int64)
+    speaker_hidden = torch.randn(1, hidden, dtype=dtype)
+    mask = torch.ones(1, past_len + seq, dtype=torch.int64)
+    pos = torch.arange(past_len, past_len + seq, dtype=torch.int64)[None, :]
+    past = [torch.zeros(1, kv_heads, past_len, head_dim, dtype=dtype) for _ in range(2 * layers)]
+    return input_ids, speaker_hidden, mask, pos, past
 
 
 def load_hf_lm(repo_dir: Path, dtype: torch.dtype):
@@ -154,18 +217,167 @@ def load_hf_lm(repo_dir: Path, dtype: torch.dtype):
     return model
 
 
-def save_embedding_table(model: nn.Module, output_dir: Path) -> Path:
-    """Store token embeddings outside ONNX for speaker injection and token lookup."""
+def save_embedding_table(
+    model: nn.Module, output_dir: Path, *, source_dtype: str
+) -> tuple[Path, str]:
+    """Store the selected token table compactly without expanding it at runtime."""
     table = model.get_input_embeddings().weight.detach().cpu()
-    # NumPy has no broadly interoperable bf16 dtype. Store bf16 tables as fp32;
-    # fp16 remains fp16.
-    if table.dtype == torch.bfloat16:
-        array = table.float().numpy()
+    source_dtype = source_dtype.removeprefix("torch.").lower()
+    if table.dtype == torch.bfloat16 or (
+        table.dtype == torch.float32 and source_dtype == "bfloat16"
+    ):
+        packed = table.to(torch.bfloat16).contiguous()
+        array = packed.view(torch.uint16).numpy()
+        storage_dtype = "bfloat16-u16"
+        path = output_dir / "embed_tokens.bf16.npy"
     else:
-        array = table.numpy()
-    path = output_dir / "embed_tokens.npy"
+        array = table.contiguous().numpy()
+        storage_dtype = str(array.dtype)
+        path = output_dir / "embed_tokens.npy"
     np.save(path, array, allow_pickle=False)
-    return path
+    return path, storage_dtype
+
+def _share_tied_vocabulary_weight(graph_path: Path, *, vocab_size: int, hidden_size: int) -> bool:
+    """Replace an exported transposed tied-head copy with a graph transpose."""
+    import onnx
+
+    graph_path = Path(graph_path)
+    model = onnx.load(str(graph_path), load_external_data=False)
+
+    def consumers(value_name: str) -> set[str]:
+        return {node.op_type for node in model.graph.node if value_name in node.input}
+
+    source_candidates = [
+        tensor
+        for tensor in model.graph.initializer
+        if tuple(tensor.dims) == (vocab_size, hidden_size) and "Gather" in consumers(tensor.name)
+    ]
+    if len(source_candidates) != 1:
+        raise ValueError("Could not identify one tied vocabulary embedding initializer")
+    source = source_candidates[0]
+
+    transposed_candidates = [
+        tensor
+        for tensor in model.graph.initializer
+        if tuple(tensor.dims) == (hidden_size, vocab_size) and "MatMul" in consumers(tensor.name)
+    ]
+    if not transposed_candidates:
+        if any(
+            node.op_type == "Transpose"
+            and node.input[0] == source.name
+            and next((list(attr.ints) for attr in node.attribute if attr.name == "perm"), [])
+            == [1, 0]
+            for node in model.graph.node
+        ):
+            return False
+        raise ValueError("Could not identify the tied vocabulary output initializer")
+    if len(transposed_candidates) != 1:
+        raise ValueError("Found multiple tied vocabulary output initializers")
+    transposed = transposed_candidates[0]
+    removed_external = {entry.key: entry.value for entry in transposed.external_data}
+    removed_location = removed_external.get("location")
+    removed_offset = int(removed_external["offset"]) if "offset" in removed_external else None
+
+    from onnx import helper
+
+    transpose_node = helper.make_node(
+        "Transpose",
+        [source.name],
+        [transposed.name],
+        perm=[1, 0],
+        name="kitten_tied_embedding_transpose",
+    )
+    nodes = list(model.graph.node)
+    nodes.insert(0, transpose_node)
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+    model.graph.initializer.remove(transposed)
+
+    external_records: dict[str, list[tuple[object, int, int | None]]] = {}
+    for tensor in model.graph.initializer:
+        entries = {entry.key: entry.value for entry in tensor.external_data}
+        location = entries.get("location")
+        if location is not None:
+            if Path(location).is_absolute():
+                raise ValueError("ONNX external-data locations must be relative")
+            offset = int(entries.get("offset", "0"))
+            length = int(entries["length"]) if "length" in entries else None
+            external_records.setdefault(location, []).append((tensor, offset, length))
+
+    replacements: list[tuple[Path, Path, Path]] = []
+    truncations: list[tuple[Path, int]] = []
+    for location, records in external_records.items():
+        source_path = graph_path.parent / location
+        source_size = source_path.stat().st_size
+        records.sort(key=lambda item: item[1])
+        lengths = []
+        for index, (_, offset, length) in enumerate(records):
+            if length is not None:
+                lengths.append(length)
+                continue
+            end = source_size
+            if index + 1 < len(records):
+                end = min(end, records[index + 1][1])
+            if (
+                location == removed_location
+                and removed_offset is not None
+                and removed_offset > offset
+            ):
+                end = min(end, removed_offset)
+            lengths.append(end - offset)
+        if (
+            location == removed_location
+            and removed_offset is not None
+            and all(
+                offset + length <= removed_offset
+                for (_, offset, _), length in zip(records, lengths, strict=True)
+            )
+        ):
+            truncations.append((source_path, removed_offset))
+            continue
+        target_path = source_path.with_name(source_path.name + ".shared")
+        target_location = Path(os.path.relpath(target_path, graph_path.parent)).as_posix()
+        temporary_path = target_path.with_name(target_path.name + ".tmp")
+        with source_path.open("rb") as source_file, temporary_path.open("wb") as target_file:
+            for (tensor, old_offset, _), length in zip(records, lengths, strict=True):
+                aligned_offset = (target_file.tell() + 63) // 64 * 64
+                target_file.write(bytes(aligned_offset - target_file.tell()))
+                new_offset = target_file.tell()
+                source_file.seek(old_offset)
+                remaining = length
+                while remaining:
+                    chunk = source_file.read(min(8 * 1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("ONNX external data ended before the initializer length")
+                    target_file.write(chunk)
+                    remaining -= len(chunk)
+                for entry in tensor.external_data:
+                    if entry.key == "location":
+                        entry.value = target_location
+                    elif entry.key == "offset":
+                        entry.value = str(new_offset)
+                    elif entry.key == "length":
+                        entry.value = str(length)
+                if not any(entry.key == "offset" for entry in tensor.external_data):
+                    tensor.external_data.add(key="offset", value=str(new_offset))
+                if not any(entry.key == "length" for entry in tensor.external_data):
+                    tensor.external_data.add(key="length", value=str(length))
+        replacements.append((source_path, temporary_path, target_path))
+
+    temporary_graph = graph_path.with_name(graph_path.name + ".tmp")
+    onnx.save_model(model, str(temporary_graph))
+    for _, temporary_path, target_path in replacements:
+        os.replace(temporary_path, target_path)
+    onnx.checker.check_model(str(temporary_graph))
+    for source_path, offset in truncations:
+        with source_path.open("r+b") as data_file:
+            data_file.truncate(offset)
+    os.replace(temporary_graph, graph_path)
+    for source_path, _, target_path in replacements:
+        if source_path != target_path:
+            source_path.unlink(missing_ok=True)
+    onnx.checker.check_model(str(graph_path))
+    return True
 
 
 def _export_with_diagnostics(
@@ -208,6 +420,7 @@ def export_lm(
     output_dir: str | Path,
     *,
     profile_name: str = "dev-fp32",
+    input_mode: str = "inputs_embeds",
     opset: int = 18,
     diagnostics_dir: str | Path | None = None,
 ) -> Path:
@@ -218,6 +431,8 @@ def export_lm(
             f"Unknown export profile {profile_name!r}. Choose from {sorted(RUNTIME_PROFILES)}"
         ) from error
 
+    if input_mode not in {"inputs_embeds", "input_ids"}:
+        raise ValueError("input_mode must be 'inputs_embeds' or 'input_ids'")
     repo_dir = Path(repo_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -229,24 +444,37 @@ def export_lm(
     revision = json.loads(revision_path.read_text(encoding="utf-8")) if revision_path.is_file() else {}
 
     model = load_hf_lm(repo_dir, profile.graph_dtype)
-    wrapper = KittenQwen3ExportWrapper(model).eval()
     config = model.config
-    past_names, present_names = _io_names(wrapper.num_layers)
-    input_names = ["inputs_embeds", "attention_mask", "position_ids", *past_names]
+    past_names, present_names = _io_names(int(config.num_hidden_layers))
+    if input_mode == "inputs_embeds":
+        wrapper = KittenQwen3ExportWrapper(model).eval()
+        input_names = ["inputs_embeds", "attention_mask", "position_ids", *past_names]
+        dummy = _dummy_inputs(config, dtype=profile.graph_dtype, seq=4, past_len=3)
+    else:
+        wrapper = KittenQwen3InputIdsExportWrapper(model).eval()
+        input_names = ["input_ids", "speaker_hidden", "attention_mask", "position_ids", *past_names]
+        dummy = _dummy_input_ids(config, dtype=profile.graph_dtype, seq=4, past_len=3)
     output_names = ["logits", *present_names]
 
     batch_dim = torch.export.Dim("batch", min=1)
     seq_dim = torch.export.Dim("seq", min=1)
     total_dim = torch.export.Dim("total", min=1)
     past_dim = torch.export.Dim("past", min=0)
-    dynamic_shapes = {
-        "inputs_embeds": {0: batch_dim, 1: seq_dim},
-        "attention_mask": {0: batch_dim, 1: total_dim},
-        "position_ids": {0: batch_dim, 1: seq_dim},
-        "past": [{0: batch_dim, 2: past_dim} for _ in range(len(past_names))],
-    }
-
-    dummy = _dummy_inputs(config, dtype=profile.graph_dtype, seq=4, past_len=3)
+    if input_mode == "inputs_embeds":
+        dynamic_shapes = {
+            "inputs_embeds": {0: batch_dim, 1: seq_dim},
+            "attention_mask": {0: batch_dim, 1: total_dim},
+            "position_ids": {0: batch_dim, 1: seq_dim},
+            "past": [{0: batch_dim, 2: past_dim} for _ in range(len(past_names))],
+        }
+    else:
+        dynamic_shapes = {
+            "input_ids": {0: batch_dim, 1: seq_dim},
+            "speaker_hidden": {0: batch_dim},
+            "attention_mask": {0: batch_dim, 1: total_dim},
+            "position_ids": {0: batch_dim, 1: seq_dim},
+            "past": [{0: batch_dim, 2: past_dim} for _ in range(len(past_names))],
+        }
     output_path = output_dir / "lm.onnx"
     _export_with_diagnostics(
         wrapper,
@@ -261,8 +489,23 @@ def export_lm(
         dynamo=True,
         external_data=True,
     )
+    if input_mode == "input_ids":
+        _share_tied_vocabulary_weight(
+            output_path,
+            vocab_size=int(config.vocab_size),
+            hidden_size=int(config.hidden_size),
+        )
 
-    embedding_path = save_embedding_table(model, output_dir)
+    embedding_metadata = {}
+    if input_mode == "inputs_embeds":
+        embedding_path, embedding_storage_dtype = save_embedding_table(
+            model, output_dir, source_dtype=source_dtype
+        )
+        embedding_metadata = {
+            "embedding_file": embedding_path.name,
+            "embedding_storage_dtype": embedding_storage_dtype,
+            "embedding_runtime_dtype": profile.io_dtype,
+        }
     meta = {
         "format": "kitten2-onnx-lm-v1",
         "architecture": (getattr(config, "architectures", None) or [config.model_type])[0],
@@ -285,10 +528,8 @@ def export_lm(
         "attention_implementation": "eager",
         "external_data": True,
         "opset": int(opset),
-        "embedding_file": embedding_path.name,
-        "embedding_storage_dtype": (
-            "float32" if profile.graph_dtype == torch.bfloat16 else profile.graph_dtype_name
-        ),
+        "input_mode": input_mode,
+        **embedding_metadata,
         "input_names": input_names,
         "output_names": output_names,
     }
@@ -301,6 +542,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("repo_dir", type=Path, help="Local KittenML/kitten-tts-2 directory")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", choices=sorted(RUNTIME_PROFILES), default="dev-fp32")
+    parser.add_argument(
+        "--input-mode", choices=("inputs_embeds", "input_ids"), default="inputs_embeds"
+    )
     parser.add_argument("--opset", type=int, default=18)
     args = parser.parse_args(argv)
 
@@ -308,6 +552,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         args.repo_dir,
         args.output,
         profile_name=args.profile,
+        input_mode=args.input_mode,
         opset=args.opset,
     )
     print(path)

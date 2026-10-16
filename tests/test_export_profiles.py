@@ -100,9 +100,12 @@ def test_export_lm_records_precision_profile(
     assert metadata["verify_on_export"] is verify
     assert metadata["source_model_revision"] == "pinned-revision"
     assert metadata["loading_path"] == str((lm_dir / "model.safetensors").resolve())
-    assert metadata["embedding_storage_dtype"] == (
-        "float32" if dtype == torch.bfloat16 else graph_dtype
-    )
+    assert metadata["input_mode"] == "inputs_embeds"
+    expected_storage_dtype = "float16" if dtype == torch.float16 else "bfloat16-u16"
+    assert metadata["embedding_storage_dtype"] == expected_storage_dtype
+    assert metadata["embedding_runtime_dtype"] == io_dtype
+    embedding = np.load(output_dir / metadata["embedding_file"], allow_pickle=False)
+    assert str(embedding.dtype) == ("float16" if dtype == torch.float16 else "uint16")
 
 
 def test_load_hf_lm_tolerates_speaker_head_but_verifies_transformer_weights(tmp_path, monkeypatch):
@@ -171,7 +174,7 @@ def test_runtime_uses_profile_provider_and_refuses_bfloat16_numpy(tmp_path, monk
             self.path = path
 
         def get_inputs(self):
-            return [SimpleNamespace(type="tensor(float16)")]
+            return [SimpleNamespace(name="inputs_embeds", type="tensor(float16)")]
 
     ort.InferenceSession = FakeSession
     monkeypatch.setitem(sys.modules, "onnxruntime", ort)

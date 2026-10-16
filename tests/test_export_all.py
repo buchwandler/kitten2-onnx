@@ -42,10 +42,10 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
     def fake_export_speaker(_, output_dir, *, opset):
         touch(output_dir / "speaker.onnx")
         (output_dir / "speaker.meta.json").write_text(
-            json.dumps({"hidden_size": 8}), encoding="utf-8"
+            json.dumps({"hidden_size": 8, "dtype": "fp32"}), encoding="utf-8"
         )
 
-    def fake_export_lm(_, output_dir, *, profile_name, opset):
+    def fake_export_lm(_, output_dir, *, profile_name, input_mode, opset):
         touch(output_dir / "lm.onnx")
         touch(output_dir / "lm.onnx.data", b"external")
         touch(output_dir / "embed_tokens.npy", b"embeddings")
@@ -55,6 +55,7 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
                     "embedding_file": "embed_tokens.npy",
                     "source_dtype": "bfloat16",
                     "graph_dtype": "float32",
+                    "io_dtype": "float32",
                 }
             ),
             encoding="utf-8",
@@ -73,7 +74,8 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
         touch(output_dir / graph_name)
         metadata_path = output_dir / graph_name.replace(".onnx", ".meta.json")
         metadata_path.write_text(
-            json.dumps({"graph": graph_name, "parity_passed": True}), encoding="utf-8"
+            json.dumps({"graph": graph_name, "precision": "fp32", "parity_passed": True}),
+            encoding="utf-8",
         )
         return output_dir / graph_name, metadata_path
 
@@ -83,6 +85,7 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
     monkeypatch.setattr(exporter, "write_capture", fake_write_capture)
     monkeypatch.setattr(exporter, "export_flow", fake_export_decoder)
     monkeypatch.setattr(exporter, "export_mel2wav", fake_export_decoder)
+    monkeypatch.setattr(exporter, "_package_versions", lambda: {"torch": "test"})
     checked = []
 
     def fake_check(graphs):
@@ -109,6 +112,12 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
 
     assert bundle["format"] == "kitten2-onnx-bundle-v1"
     assert bundle["sample_rate"] == 24000
+    assert bundle["export"]["speaker_output_cast"] == {
+        "from": "float32",
+        "to": "float32",
+        "applied_by": "Kitten2OnnxLM",
+    }
+    assert bundle["export"]["decoder_precision"] == {"flow": "fp32", "mel2wav": "fp32"}
     assert bundle["lm"]["embeddings"] == "lm/embed_tokens.npy"
     assert bundle["voices"] == {"Bruno": "voices/Bruno.npz"}
     assert bundle["tokenizer_assets"] == ["tokenizer.json"]

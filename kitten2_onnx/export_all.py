@@ -86,6 +86,7 @@ def export_all(
     *,
     voice: str = "Bruno",
     profile_name: str = "dev-fp32",
+    input_mode: str = "inputs_embeds",
     opset: int = 18,
     token_count: int = 32,
     validate: bool = False,
@@ -94,6 +95,8 @@ def export_all(
     if profile_name not in RUNTIME_PROFILES:
         raise ValueError(f"Unknown export profile {profile_name!r}; choose from {sorted(RUNTIME_PROFILES)}")
 
+    if input_mode not in {"inputs_embeds", "input_ids"}:
+        raise ValueError("input_mode must be 'inputs_embeds' or 'input_ids'")
     model_dir = Path(model_dir).resolve()
     output_dir = Path(output_dir).resolve()
     if (
@@ -138,7 +141,7 @@ def export_all(
     voice_dir.mkdir(parents=True)
 
     export_speaker(model_dir, speaker_dir, opset=opset)
-    export_lm(model_dir, lm_dir, profile_name=profile_name, opset=opset)
+    export_lm(model_dir, lm_dir, profile_name=profile_name, input_mode=input_mode, opset=opset)
 
     voice_arrays, voice_metadata = capture_reference(model_dir, voice, token_count=token_count)
     voice_path = voice_dir / f"{voice}.npz"
@@ -157,6 +160,12 @@ def export_all(
 
     lm_metadata = json.loads((lm_dir / "lm.meta.json").read_text(encoding="utf-8"))
     speaker_metadata = json.loads((speaker_dir / "speaker.meta.json").read_text(encoding="utf-8"))
+    lm_bundle_entry = {
+        "model": "lm/lm.onnx",
+        "metadata": "lm/lm.meta.json",
+    }
+    if "embedding_file" in lm_metadata:
+        lm_bundle_entry["embeddings"] = f"lm/{lm_metadata['embedding_file']}"
     graphs = [
         lm_dir / "lm.onnx",
         speaker_dir / "speaker.onnx",
@@ -170,11 +179,7 @@ def export_all(
         "batch_size": 1,
         "default_voice": model_config.get("default_voice", voice),
         "default_preset": model_config.get("default_preset"),
-        "lm": {
-            "model": "lm/lm.onnx",
-            "metadata": "lm/lm.meta.json",
-            "embeddings": f"lm/{lm_metadata['embedding_file']}",
-        },
+        "lm": lm_bundle_entry,
         "speaker": {
             "model": "speaker/speaker.onnx",
             "metadata": "speaker/speaker.meta.json",
@@ -208,6 +213,17 @@ def export_all(
             "opset": int(opset),
             "source_model_dtype": lm_metadata["source_dtype"],
             "graph_dtype": lm_metadata["graph_dtype"],
+            "lm_precision": lm_metadata["graph_dtype"],
+            "speaker_precision": speaker_metadata["dtype"],
+            "speaker_output_cast": {
+                "from": "float32",
+                "to": lm_metadata["io_dtype"],
+                "applied_by": "Kitten2OnnxLM",
+            },
+            "decoder_precision": {
+                "flow": flow_metadata["precision"],
+                "mel2wav": mel2wav_metadata["precision"],
+            },
             "speaker_hidden_size": int(speaker_metadata["hidden_size"]),
         },
         "files": {},
@@ -233,6 +249,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--output", type=Path, required=True, help="Bundle output directory")
     parser.add_argument("--voice", default="Bruno", help="Built-in voice to package")
     parser.add_argument("--profile", choices=sorted(RUNTIME_PROFILES), default="dev-fp32")
+    parser.add_argument(
+        "--input-mode", choices=("inputs_embeds", "input_ids"), default="inputs_embeds"
+    )
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--token-count", type=int, default=32)
     parser.add_argument("--validate", action="store_true", help="Run full bundle validation with CPU ONNX Runtime")
@@ -243,6 +262,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         args.output,
         voice=args.voice,
         profile_name=args.profile,
+        input_mode=args.input_mode,
         opset=args.opset,
         token_count=args.token_count,
         validate=args.validate,

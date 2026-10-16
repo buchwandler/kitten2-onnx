@@ -87,6 +87,24 @@ def _check_graph(
         errors.append(f"{label} graph inputs differ from metadata: {input_names} != {expected_inputs}")
     if output_names != expected_outputs:
         errors.append(f"{label} graph outputs differ from metadata: {output_names} != {expected_outputs}")
+    if label == "lm":
+        input_types = {value.name: value.type for value in inputs}
+        expected_float_type = {
+            "float32": "tensor(float)",
+            "float16": "tensor(float16)",
+            "bfloat16": "tensor(bfloat16)",
+        }.get(metadata.get("io_dtype"))
+        input_mode = metadata.get("input_mode", "inputs_embeds")
+        if input_mode == "inputs_embeds":
+            if input_types.get("inputs_embeds") != expected_float_type:
+                errors.append("LM inputs_embeds type differs from io_dtype metadata")
+        elif input_mode == "input_ids":
+            if input_types.get("input_ids") != "tensor(int64)":
+                errors.append("LM input_ids graph input must be int64")
+            if input_types.get("speaker_hidden") != expected_float_type:
+                errors.append("LM speaker_hidden type differs from io_dtype metadata")
+        else:
+            errors.append(f"Unsupported LM input mode: {input_mode!r}")
 
     for value in inputs:
         expected = (input_shapes or {}).get(value.name)
@@ -250,6 +268,37 @@ def validate_bundle(
     speaker_meta = read_metadata(speaker.get("metadata", ""))
     flow_meta = read_metadata(decoder.get("flow_metadata", ""))
     mel_meta = read_metadata(decoder.get("mel2wav_metadata", ""))
+    export_meta = bundle.get("export", {})
+    if not isinstance(export_meta, dict):
+        errors.append("Bundle export metadata must be an object")
+        export_meta = {}
+    if export_meta.get("runtime_profile") == "cuda-fp16":
+        if lm_meta is not None and (
+            lm_meta.get("graph_dtype") != "float16"
+            or lm_meta.get("io_dtype") != "float16"
+            or lm_meta.get("runtime_provider") != "CUDAExecutionProvider"
+        ):
+            errors.append("cuda-fp16 LM metadata must use float16 and CUDAExecutionProvider")
+        expected_cast = {
+            "from": "float32",
+            "to": "float16",
+            "applied_by": "Kitten2OnnxLM",
+        }
+        if export_meta.get("speaker_output_cast") != expected_cast:
+            errors.append(
+                "cuda-fp16 bundle must cast FP32 speaker output to FP16 in the LM runtime"
+            )
+        if speaker_meta is not None and speaker_meta.get("dtype") != "fp32":
+            errors.append("cuda-fp16 bundle speaker projection must remain FP32")
+        expected_decoder_precision = {"flow": "fp32", "mel2wav": "fp32"}
+        if export_meta.get("decoder_precision") != expected_decoder_precision:
+            errors.append("cuda-fp16 bundle must document FP32 flow and mel2wav graphs")
+        if flow_meta is not None and flow_meta.get("precision") != "fp32":
+            errors.append("cuda-fp16 bundle flow graph must remain FP32")
+        if mel_meta is not None and mel_meta.get("precision") != "fp32":
+            errors.append("cuda-fp16 bundle mel2wav graph must remain FP32")
+        if not any(error.startswith("cuda-fp16") for error in errors):
+            report["checks"].append("cuda-fp16 precision and cast contract")
     tokenizer_dir = bundle.get("tokenizer")
     tokenizer_assets = bundle.get("tokenizer_assets")
     if not isinstance(tokenizer_dir, str) or not isinstance(tokenizer_assets, list) or not tokenizer_assets or not all(isinstance(asset, str) for asset in tokenizer_assets):
@@ -322,16 +371,39 @@ def validate_bundle(
         report["checks"].append("ONNX checker, Runtime sessions, and graph I/O")
 
     try:
-        expected_embedding = (Path(lm["model"]).parent / lm_meta["embedding_file"]).as_posix()
-        if lm.get("embeddings") != expected_embedding:
-            raise ValueError("Bundle embedding path differs from LM metadata")
-        embedding_path = require(lm["embeddings"])
-        if embedding_path is not None and lm_meta is not None:
-            embeddings = np.load(embedding_path, mmap_mode="r", allow_pickle=False)
-            expected_shape = (int(lm_meta["vocab_size"]), int(lm_meta["hidden_size"]))
-            if embeddings.shape != expected_shape:
-                raise ValueError(f"Embedding shape {embeddings.shape} differs from LM config {expected_shape}")
-            report["checks"].append("LM embedding shape")
+        if lm_meta is None:
+            raise ValueError("LM metadata is missing")
+        input_mode = lm_meta.get("input_mode", "inputs_embeds")
+        if input_mode == "inputs_embeds":
+            embedding_file = lm_meta["embedding_file"]
+            expected_embedding = (Path(lm["model"]).parent / embedding_file).as_posix()
+            if lm.get("embeddings") != expected_embedding:
+                raise ValueError("Bundle embedding path differs from LM metadata")
+            embedding_path = require(lm["embeddings"])
+            if embedding_path is not None:
+                embeddings = np.load(embedding_path, mmap_mode="r", allow_pickle=False)
+                expected_shape = (int(lm_meta["vocab_size"]), int(lm_meta["hidden_size"]))
+                if embeddings.shape != expected_shape:
+                    raise ValueError(
+                        f"Embedding shape {embeddings.shape} differs from LM config {expected_shape}"
+                    )
+                storage_dtype = lm_meta.get("embedding_storage_dtype", str(embeddings.dtype))
+                if storage_dtype == "bfloat16-u16":
+                    runtime_dtype = lm_meta.get("embedding_runtime_dtype")
+                    if embeddings.dtype != np.uint16 or runtime_dtype != lm_meta.get("io_dtype"):
+                        raise ValueError("bfloat16-u16 embedding storage metadata is inconsistent")
+                elif str(embeddings.dtype) != storage_dtype:
+                    raise ValueError("Embedding array dtype differs from LM metadata")
+                report["checks"].append("LM embedding shape")
+        elif input_mode == "input_ids":
+            if "embedding_file" in lm_meta or lm.get("embeddings") is not None:
+                raise ValueError("input_ids LM must not use a separate embedding table")
+            input_names = set(lm_meta.get("input_names", []))
+            if not {"input_ids", "speaker_hidden"}.issubset(input_names):
+                raise ValueError("input_ids LM metadata must declare speaker_hidden input")
+            report["checks"].append("LM input_ids and speaker injection contract")
+        else:
+            raise ValueError(f"Unsupported LM input mode: {input_mode!r}")
         if lm_meta is not None and speaker_meta is not None:
             if int(speaker_meta["hidden_size"]) != int(lm_meta["hidden_size"]):
                 raise ValueError("Speaker output size differs from LM hidden size")

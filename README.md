@@ -7,19 +7,19 @@ the KittenTTS 2 speech language model. KittenTTS 2 uses a `Qwen3ForCausalLM`
 backbone, but speaker identity is injected by replacing the first token embedding
 with the output of a learned `spk_proj` head.
 
-This repository therefore exports:
+The project exports complete KittenTTS 2 ONNX bundles with speaker projection, Qwen3 language model, Flow, and mel-to-waveform graphs. `Kitten2OnnxTTS` runs the inference pipeline.
 
-1. `lm.onnx` — Qwen3 transformer + LM head with explicit KV cache and
-   **`inputs_embeds`** rather than `input_ids`.
-2. `embed_tokens.npy` — the token embedding table used outside the graph.
-3. `speaker.onnx` — Kitten's 512-dimensional speaker projection head.
-4. `lm.meta.json` / `speaker.meta.json` — graph contracts and model metadata.
+The LM supports two graph input contracts:
 
-The S3 codec/vocoder is intentionally not claimed as complete in this MVP.
-`export_codec.py` records the proposed split and exits with a clear message until
-the S3Gen flow and vocoder have parity-tested ONNX wrappers.
+- `inputs_embeds` is the default and keeps token lookup outside the LM graph. For a BF16 source checkpoint, the external table is stored as `embed_tokens.bf16.npy` using packed `uint16` BF16 bits.
+- `input_ids` is an opt-in mode that performs tied token lookup and position-zero speaker injection inside the graph. It omits the separate embedding file.
 
-## Why `inputs_embeds`?
+Both modes use the same tied vocabulary weight for token lookup and the LM head. The input_ids exporter normalizes the transposed head weight into one shared initializer. The CPU benchmark currently favors the default mode for latency, so input_ids is not the default.
+
+Older LM metadata without `input_mode` continues to use `inputs_embeds`.
+The `cuda-fp16` bundle keeps the speaker projection and S3 decoder graphs in FP32. `Kitten2OnnxLM` casts the FP32 speaker output to the LM I/O dtype; the bundle metadata records this boundary and the decoder precision choice. CUDA execution still requires a CUDA-enabled environment.
+
+## LM input contracts
 
 KittenTTS 2 performs speaker injection at prefill:
 
@@ -38,8 +38,9 @@ Qwen3 transformer
 S3 codec token logits
 ```
 
-Keeping the embedding lookup outside `lm.onnx` makes that behavior explicit and
-avoids patching a generated ONNX graph.
+In the default mode, the runtime projects the speaker vector and replaces the first
+embedding before calling `lm.onnx`. The opt-in `input_ids` mode performs the same
+lookup and injection inside the graph.
 
 ## Expected source layout
 
@@ -68,6 +69,17 @@ python -m kitten2_onnx.export_lm \
 python -m kitten2_onnx.export_speaker \
   /path/to/kitten-tts-2 \
   --output build/speaker
+```
+
+The full bundle defaults to `inputs_embeds`. To build the opt-in `input_ids` variant:
+
+```bash
+python -m kitten2_onnx.export_all \
+  /path/to/kitten-tts-2 \
+  --output build/input-ids \
+  --profile dev-fp32 \
+  --input-mode input_ids \
+  --validate
 ```
 
 The LM exporter uses `torch.onnx.export(..., dynamo=True)` and opset 18 by

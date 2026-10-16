@@ -89,7 +89,28 @@ class Kitten2OnnxLM:
         if runtime_provider == "CUDAExecutionProvider" and runtime_provider not in providers:
             raise ValueError(f"Profile {runtime_profile!r} requires CUDAExecutionProvider")
 
-        self.embeddings = np.load(self.model_dir / self.meta["embedding_file"], mmap_mode="r")
+        self.input_mode = self.meta.get("input_mode", "inputs_embeds")
+        if self.input_mode == "inputs_embeds":
+            self.embeddings = np.load(
+                self.model_dir / self.meta["embedding_file"], mmap_mode="r", allow_pickle=False
+            )
+            self.embedding_storage_dtype = self.meta.get(
+                "embedding_storage_dtype", str(self.embeddings.dtype)
+            )
+            if self.embedding_storage_dtype == "bfloat16-u16":
+                if self.embeddings.dtype != np.uint16:
+                    raise ValueError("bfloat16-u16 embedding storage must use uint16")
+            elif str(self.embeddings.dtype) != self.embedding_storage_dtype:
+                raise ValueError("Embedding array dtype differs from LM metadata")
+        elif self.input_mode == "input_ids":
+            if "embedding_file" in self.meta:
+                raise ValueError(
+                    "input_ids LM metadata must not reference a separate embedding table"
+                )
+            self.embeddings = None
+            self.embedding_storage_dtype = None
+        else:
+            raise ValueError(f"Unsupported LM input mode: {self.input_mode!r}")
         self.session = ort.InferenceSession(
             str(self.model_dir / "lm.onnx"),
             providers=providers,
@@ -103,12 +124,20 @@ class Kitten2OnnxLM:
         self.kv_heads = int(self.meta["num_key_value_heads"])
         self.head_dim = int(self.meta["head_dim"])
 
-        first = self.session.get_inputs()[0]
+        graph_inputs = {item.name: item.type for item in self.session.get_inputs()}
         expected_type = {"float32": "tensor(float)", "float16": "tensor(float16)"}[io_dtype]
-        if first.type != expected_type:
-            raise ValueError(
-                f"LM metadata io_dtype {io_dtype!r} does not match graph input type {first.type!r}"
-            )
+        if self.input_mode == "inputs_embeds":
+            graph_input_type = graph_inputs.get("inputs_embeds")
+            if graph_input_type != expected_type:
+                raise ValueError(
+                    f"LM metadata io_dtype {io_dtype!r} does not match inputs_embeds type "
+                    f"{graph_input_type!r}"
+                )
+        else:
+            if graph_inputs.get("input_ids") != "tensor(int64)":
+                raise ValueError("input_ids LM graph must accept int64 token IDs")
+            if graph_inputs.get("speaker_hidden") != expected_type:
+                raise ValueError("LM metadata io_dtype does not match speaker_hidden graph input")
         self.model_numpy_dtype = {"float32": np.float32, "float16": np.float16}[io_dtype]
 
     def _empty_cache(self) -> dict[str, np.ndarray]:
@@ -138,7 +167,11 @@ class Kitten2OnnxLM:
         prefill: bool,
     ) -> np.ndarray:
         token_ids = np.asarray(token_ids, dtype=np.int64)
-        values = np.asarray(self.embeddings[token_ids], dtype=self.model_numpy_dtype)
+        if self.embedding_storage_dtype == "bfloat16-u16":
+            bits = np.asarray(self.embeddings[token_ids], dtype=np.uint32) << 16
+            values = bits.view(np.float32).astype(self.model_numpy_dtype)
+        else:
+            values = np.asarray(self.embeddings[token_ids], dtype=self.model_numpy_dtype)
         if prefill and speaker_embedding is not None:
             speaker_hidden = self._project_speaker(speaker_embedding)
             values = values.copy()
@@ -167,21 +200,33 @@ class Kitten2OnnxLM:
         past_len = next(iter(past.values())).shape[2]
         start = past_len if position is None else int(position)
 
+        attention_mask = np.ones((1, past_len + token_ids.shape[1]), dtype=np.int64)
+        position_ids = np.arange(
+            start,
+            start + token_ids.shape[1],
+            dtype=np.int64,
+        )[None, :]
         inputs = {
-            "inputs_embeds": self._embed(
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            **past,
+        }
+        if self.input_mode == "inputs_embeds":
+            inputs["inputs_embeds"] = self._embed(
                 token_ids,
                 speaker_embedding=speaker_embedding,
                 prefill=is_prefill,
-            ),
-            "attention_mask": np.ones((1, past_len + token_ids.shape[1]), dtype=np.int64),
-            "position_ids": np.arange(
-                start,
-                start + token_ids.shape[1],
-                dtype=np.int64,
-            )[None, :],
-            **past,
-        }
-
+            )
+        else:
+            speaker_hidden = np.zeros(
+                (1, int(self.meta["hidden_size"])), dtype=self.model_numpy_dtype
+            )
+            if is_prefill and speaker_embedding is not None:
+                speaker_hidden = self._project_speaker(speaker_embedding).astype(
+                    self.model_numpy_dtype, copy=False
+                )
+            inputs["input_ids"] = token_ids
+            inputs["speaker_hidden"] = speaker_hidden
         outputs = self.session.run(None, inputs)
         logits = outputs[0]
         new_past: dict[str, np.ndarray] = {}

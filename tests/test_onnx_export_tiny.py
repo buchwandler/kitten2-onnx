@@ -10,8 +10,10 @@ import torch
 
 from kitten2_onnx.export_lm import (
     KittenQwen3ExportWrapper,
+    KittenQwen3InputIdsExportWrapper,
     _export_with_diagnostics,
     _io_names,
+    _share_tied_vocabulary_weight,
     export_lm,
 )
 
@@ -139,8 +141,11 @@ def test_tiny_qwen3_onnx_prefill_dynamic_cache_and_decode(tmp_path, tiny_qwen3, 
     past_names, present_names = _io_names(num_layers)
 
     assert any(file.suffix == ".md" for file in diagnostics_dir.iterdir())
-    assert (export_dir / "embed_tokens.npy").is_file()
-    assert json.loads((export_dir / "lm.meta.json").read_text(encoding="utf-8"))["runtime_profile"] == "dev-fp32"
+    lm_metadata = json.loads((export_dir / "lm.meta.json").read_text(encoding="utf-8"))
+    assert lm_metadata["runtime_profile"] == "dev-fp32"
+    assert lm_metadata["embedding_storage_dtype"] == "bfloat16-u16"
+    embedding = np.load(export_dir / lm_metadata["embedding_file"], allow_pickle=False)
+    assert embedding.dtype == np.uint16
     onnx.checker.check_model(str(path))
     graph = onnx.load(str(path), load_external_data=False)
     locations = {
@@ -215,6 +220,152 @@ def test_tiny_qwen3_onnx_prefill_dynamic_cache_and_decode(tmp_path, tiny_qwen3, 
         _assert_cache_shapes(torch_result[1:], num_layers, kv_heads, head_dim, total_length)
         onnx_logits, onnx_cache = onnx_result[0], list(onnx_result[1:])
         torch_logits, torch_cache = torch_result[0], list(torch_result[1:])
+
+
+def test_export_lm_input_ids_mode_omits_external_embedding_table(tmp_path, tiny_qwen3, monkeypatch):
+    onnx = pytest.importorskip("onnx")
+    source_dir = tmp_path / "source"
+    source_lm_dir = source_dir / "lm"
+    source_lm_dir.mkdir(parents=True)
+    (source_lm_dir / "config.json").write_text(
+        '{"model_type":"qwen3","dtype":"bfloat16"}', encoding="utf-8"
+    )
+    (source_lm_dir / "model.safetensors").write_bytes(b"tiny-model-placeholder")
+    model = tiny_qwen3
+    monkeypatch.setattr(
+        "kitten2_onnx.export_lm.load_hf_lm",
+        lambda repo_dir, dtype: model.to(dtype),
+    )
+    export_dir = tmp_path / "input-ids-export"
+    path = export_lm(
+        source_dir,
+        export_dir,
+        profile_name="dev-fp32",
+        input_mode="input_ids",
+        diagnostics_dir=tmp_path / "diagnostics",
+    )
+
+    metadata = json.loads((export_dir / "lm.meta.json").read_text(encoding="utf-8"))
+    assert metadata["input_mode"] == "input_ids"
+    assert "embedding_file" not in metadata
+    assert metadata["input_names"][:4] == [
+        "input_ids",
+        "speaker_hidden",
+        "attention_mask",
+        "position_ids",
+    ]
+    assert not (export_dir / "embed_tokens.npy").exists()
+    assert not (export_dir / "embed_tokens.bf16.npy").exists()
+    onnx.checker.check_model(str(path))
+    graph = onnx.load(str(path), load_external_data=False)
+    vocabulary_weight_count = sum(
+        int(np.prod(tensor.dims)) == int(model.config.vocab_size * model.config.hidden_size)
+        for tensor in graph.graph.initializer
+    )
+    assert vocabulary_weight_count == 1
+
+
+def test_input_ids_graph_injects_speaker_and_shares_tied_embedding(tmp_path, tiny_qwen3):
+    onnx = pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    model = tiny_qwen3.eval()
+    wrapper = KittenQwen3InputIdsExportWrapper(model).eval()
+    layers = int(model.config.num_hidden_layers)
+    kv_heads = int(model.config.num_key_value_heads)
+    head_dim = int(model.config.head_dim)
+    hidden = int(model.config.hidden_size)
+    vocab = int(model.config.vocab_size)
+    past_names, present_names = _io_names(layers)
+    input_names = ["input_ids", "speaker_hidden", "attention_mask", "position_ids", *past_names]
+    output_names = ["logits", *present_names]
+    batch_dim = torch.export.Dim("batch", min=1)
+    seq_dim = torch.export.Dim("seq", min=1)
+    total_dim = torch.export.Dim("total", min=1)
+    past_dim = torch.export.Dim("past", min=0)
+    dynamic_shapes = {
+        "input_ids": {0: batch_dim, 1: seq_dim},
+        "speaker_hidden": {0: batch_dim},
+        "attention_mask": {0: batch_dim, 1: total_dim},
+        "position_ids": {0: batch_dim, 1: seq_dim},
+        "past": [{0: batch_dim, 2: past_dim} for _ in range(len(past_names))],
+    }
+    dummy = (
+        torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+        torch.randn(1, hidden),
+        torch.ones(1, 7, dtype=torch.long),
+        torch.arange(3, 7, dtype=torch.long)[None, :],
+        [torch.zeros(1, kv_heads, 3, head_dim) for _ in range(2 * layers)],
+    )
+    path = tmp_path / "input_ids.onnx"
+    _export_with_diagnostics(
+        wrapper,
+        dummy,
+        path,
+        verify=False,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_shapes=dynamic_shapes,
+        opset_version=18,
+        dynamo=True,
+        external_data=True,
+    )
+    assert _share_tied_vocabulary_weight(path, vocab_size=vocab, hidden_size=hidden)
+
+    onnx.checker.check_model(str(path))
+    graph = onnx.load(str(path), load_external_data=False)
+    vocabulary_initializers = [
+        tensor for tensor in graph.graph.initializer if int(np.prod(tensor.dims)) == vocab * hidden
+    ]
+    assert len(vocabulary_initializers) == 1
+    vocabulary_weight = vocabulary_initializers[0]
+    consumers = {node.op_type for node in graph.graph.node if vocabulary_weight.name in node.input}
+    assert "Gather" in consumers
+    assert consumers & {"Transpose", "MatMul"}
+    assert {value.name for value in graph.graph.input} >= set(input_names)
+
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    torch.manual_seed(13)
+
+    def run(input_ids, speaker_hidden, past, position):
+        attention_mask = torch.ones(1, position + input_ids.shape[1], dtype=torch.long)
+        position_ids = torch.arange(
+            position, position + input_ids.shape[1], dtype=torch.long
+        )[None, :]
+        with torch.inference_mode():
+            expected = wrapper(input_ids, speaker_hidden, attention_mask, position_ids, past)
+        feed = {
+            "input_ids": input_ids.numpy(),
+            "speaker_hidden": speaker_hidden.numpy(),
+            "attention_mask": attention_mask.numpy(),
+            "position_ids": position_ids.numpy(),
+            **dict(zip(past_names, [value.numpy() for value in past], strict=True)),
+        }
+        actual = session.run(None, feed)
+        _assert_parity(actual, expected)
+        return actual
+
+    empty_cache = [torch.zeros(1, kv_heads, 0, head_dim) for _ in range(2 * layers)]
+    prefill_outputs = []
+    for length in (2, 5):
+        input_ids = torch.arange(1, length + 1, dtype=torch.long)[None, :] % vocab
+        speaker_hidden = torch.randn(1, hidden)
+        output = run(input_ids, speaker_hidden, empty_cache, 0)
+        _assert_cache_shapes(output[1:], layers, kv_heads, head_dim, length)
+        prefill_outputs.append((input_ids, output))
+
+    input_ids, output = prefill_outputs[-1]
+    decode_id = torch.tensor([[7 % vocab]], dtype=torch.long)
+    decode_speaker = torch.randn(1, hidden)
+    decode_past = [torch.from_numpy(value) for value in output[1:]]
+    decode_output = run(decode_id, decode_speaker, decode_past, input_ids.shape[1])
+    zero_speaker_output = run(
+        decode_id,
+        torch.zeros_like(decode_speaker),
+        decode_past,
+        input_ids.shape[1],
+    )
+    np.testing.assert_array_equal(decode_output[0], zero_speaker_output[0])
+    _assert_cache_shapes(decode_output[1:], layers, kv_heads, head_dim, input_ids.shape[1] + 1)
 
 
 def test_export_failure_preserves_diagnostic(tmp_path, monkeypatch):
