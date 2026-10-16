@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -14,19 +13,10 @@ import numpy as np
 import onnx
 from onnx import TensorProto
 
+from kitten2_onnx.external_data import logical_tensor_bytes, resolve_external_data_range
 from scripts.audit_checkpoint_weights import audit_checkpoint
 
 _OPERATORS_OF_INTEREST = {"MatMul", "Gemm", "Gather", "Conv"}
-_PACKED_DTYPE_BITS = {
-    "INT4": 4,
-    "UINT4": 4,
-    "FLOAT4E2M1": 4,
-    "FLOAT8E4M3FN": 8,
-    "FLOAT8E4M3FNUZ": 8,
-    "FLOAT8E5M2": 8,
-    "FLOAT8E5M2FNUZ": 8,
-    "FLOAT8E8M0": 8,
-}
 
 
 def _dtype_name(tensor: TensorProto) -> str:
@@ -34,15 +24,7 @@ def _dtype_name(tensor: TensorProto) -> str:
 
 
 def _logical_tensor_bytes(tensor: TensorProto) -> int:
-    count = math.prod(tensor.dims) if tensor.dims else 1
-    dtype = _dtype_name(tensor)
-    if dtype in _PACKED_DTYPE_BITS:
-        return (count * _PACKED_DTYPE_BITS[dtype] + 7) // 8
-    if tensor.data_type == TensorProto.STRING:
-        return sum(len(value) for value in tensor.string_data)
-    dtype_np = onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type)
-    return count * np.dtype(dtype_np).itemsize
-
+    return logical_tensor_bytes(tensor)
 
 def _external_data(tensor: TensorProto) -> dict[str, str]:
     return {item.key: item.value for item in tensor.external_data}
@@ -57,14 +39,13 @@ def _storage_info(tensor: TensorProto, graph_dir: Path, logical_bytes: int) -> d
             "bytes": raw_bytes or logical_bytes,
         }
 
-    location = external["location"]
-    offset = int(external.get("offset", "0"))
-    length = int(external.get("length", str(logical_bytes)))
-    path = graph_dir / location
-    if not path.is_file():
-        raise FileNotFoundError(f"ONNX external data not found: {path}")
-    if offset < 0 or length < 0 or offset + length > path.stat().st_size:
-        raise ValueError(f"Invalid external-data range for initializer {tensor.name!r}")
+    resolved = resolve_external_data_range(
+        graph_dir, tensor, logical_bytes=logical_bytes
+    )
+    location = resolved.location
+    offset = resolved.offset
+    length = resolved.length
+    path = resolved.path
     return {
         "kind": "external",
         "location": location,

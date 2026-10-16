@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import shutil
+import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +49,58 @@ def _external_locations(model: Any) -> set[str]:
                 if Path(entry.value).is_absolute():
                     raise ValueError("ONNX external-data locations must be relative")
                 locations.add(entry.value)
+    return locations
+
+
+
+def _all_external_locations(model: Any) -> set[str]:
+    import onnx
+
+    locations: set[str] = set()
+
+    def add_tensor(tensor: Any) -> None:
+        external = {entry.key: entry.value for entry in tensor.external_data}
+        location = external.get("location")
+        if tensor.data_location == onnx.TensorProto.EXTERNAL and not location:
+            raise ValueError("External ONNX tensor has no location")
+        if location:
+            if Path(location).is_absolute():
+                raise ValueError("ONNX external-data locations must be relative")
+            locations.add(location)
+
+    def visit_node(node: Any) -> None:
+        for attribute in node.attribute:
+            if attribute.type == onnx.AttributeProto.TENSOR:
+                add_tensor(attribute.t)
+            elif attribute.type == onnx.AttributeProto.TENSORS:
+                for tensor in attribute.tensors:
+                    add_tensor(tensor)
+            elif attribute.type == onnx.AttributeProto.GRAPH:
+                visit_graph(attribute.g)
+            elif attribute.type == onnx.AttributeProto.GRAPHS:
+                for graph in attribute.graphs:
+                    visit_graph(graph)
+            elif attribute.type == onnx.AttributeProto.SPARSE_TENSOR:
+                add_tensor(attribute.sparse_tensor.values)
+                add_tensor(attribute.sparse_tensor.indices)
+            elif attribute.type == onnx.AttributeProto.SPARSE_TENSORS:
+                for sparse_tensor in attribute.sparse_tensors:
+                    add_tensor(sparse_tensor.values)
+                    add_tensor(sparse_tensor.indices)
+
+    def visit_graph(graph: Any) -> None:
+        for tensor in graph.initializer:
+            add_tensor(tensor)
+        for node in graph.node:
+            visit_node(node)
+
+    visit_graph(model.graph)
+    for function in model.functions:
+        for node in function.node:
+            visit_node(node)
+    for training_info in model.training_info:
+        visit_graph(training_info.initialization)
+        visit_graph(training_info.algorithm)
     return locations
 
 
@@ -115,6 +169,135 @@ def _quantize_lm(bundle_dir: Path, bundle: dict[str, Any]) -> dict[str, Any]:
     return metadata["quantization"]
 
 
+
+
+def _bundle_external_paths(bundle_dir: Path) -> set[Path]:
+    import onnx
+
+    root = bundle_dir.resolve()
+    paths: set[Path] = set()
+    for graph_path in sorted(root.rglob("*.onnx")):
+        model = onnx.load(str(graph_path), load_external_data=False)
+        for location in _all_external_locations(model):
+            external_path = (graph_path.parent / location).resolve()
+            if not external_path.is_relative_to(root):
+                raise ValueError(f"ONNX external-data path escapes bundle: {graph_path}: {location}")
+            paths.add(external_path)
+    return paths
+
+
+def _chunked_external_location(
+    lm_model_path: Path,
+    referenced_paths: set[Path],
+) -> tuple[str, Path, list[Path]]:
+    stale_candidates: list[Path] = []
+    for index in range(1000):
+        location = "lm.int8.onnx.data" if index == 0 else f"lm.int8-{index}.onnx.data"
+        path = _bundle_path(lm_model_path.parent, location)
+        if path in referenced_paths:
+            continue
+        if path.exists():
+            stale_candidates.append(path)
+            continue
+        return location, path, stale_candidates
+    raise FileExistsError("Could not allocate an unreferenced chunked external-data path")
+
+
+def _quantize_lm_chunked(
+    bundle_dir: Path,
+    bundle: dict[str, Any],
+    *,
+    exclude_nodes: Sequence[str] = (),
+    exclude_initializers: Sequence[str] = (),
+    chunk_rows: int = 64,
+) -> dict[str, Any]:
+    import onnx
+    import onnxruntime as ort
+
+    from kitten2_onnx.quantize_int8_streaming import quantize_dynamic_matmul_streaming
+
+    lm_entry = bundle["lm"]
+    lm_meta_path = _bundle_path(bundle_dir, lm_entry["metadata"])
+    lm_model_path = _bundle_path(bundle_dir, lm_entry["model"])
+    metadata = json.loads(lm_meta_path.read_text(encoding="utf-8"))
+    if metadata.get("runtime_provider") != "CPUExecutionProvider":
+        raise ValueError("Chunked INT8 LM optimization requires a CPU deployment bundle")
+    if metadata.get("io_dtype") != "float32":
+        raise ValueError("Chunked INT8 LM optimization currently requires float32 graph I/O")
+
+    source_hash = _sha256(lm_model_path)
+    source_graph = onnx.load(str(lm_model_path), load_external_data=False)
+    source_locations = _all_external_locations(source_graph)
+    source_paths = {
+        _bundle_path(lm_model_path.parent, location) for location in source_locations
+    }
+    source_external_hashes = {
+        location: _sha256(_bundle_path(lm_model_path.parent, location))
+        for location in sorted(source_locations)
+    }
+    referenced_before = _bundle_external_paths(bundle_dir)
+    external_location, external_path, stale_candidates = _chunked_external_location(
+        lm_model_path,
+        referenced_before,
+    )
+    temporary_graph = lm_model_path.with_name(
+        f".{lm_model_path.stem}.chunked-{uuid.uuid4().hex}.tmp.onnx"
+    )
+
+    try:
+        transformation = quantize_dynamic_matmul_streaming(
+            lm_model_path,
+            temporary_graph,
+            output_external_data=external_location,
+            chunk_rows=chunk_rows,
+            exclude_nodes=exclude_nodes,
+            exclude_initializers=exclude_initializers,
+        )
+        quantized_graph = onnx.load(str(temporary_graph), load_external_data=False)
+        quantized_locations = _all_external_locations(quantized_graph)
+        for location in quantized_locations:
+            external_file = _bundle_path(lm_model_path.parent, location)
+            if not external_file.is_file():
+                raise FileNotFoundError(f"Chunked ONNX external data is missing: {external_file}")
+        onnx.checker.check_model(str(temporary_graph))
+        ort.InferenceSession(str(temporary_graph), providers=["CPUExecutionProvider"])
+        os.replace(temporary_graph, lm_model_path)
+    except BaseException:
+        temporary_graph.unlink(missing_ok=True)
+        external_path.unlink(missing_ok=True)
+        raise
+
+    referenced_after = _bundle_external_paths(bundle_dir)
+    stale_paths = (source_paths | set(stale_candidates)) - referenced_after
+    for stale_path in sorted(stale_paths):
+        if stale_path.is_file():
+            stale_path.unlink()
+
+    metadata["external_data"] = bool(quantized_locations)
+    metadata["external_data_files"] = sorted(quantized_locations)
+    metadata["quantization"] = {
+        "method": "int8-dynamic-chunked",
+        "external_data_files": sorted(quantized_locations),
+        "backend": "streaming",
+        "weight_type": "QInt8",
+        "op_types": ["MatMul"],
+        "per_channel": True,
+        "matmul_const_b_only": True,
+        "chunk_rows": chunk_rows,
+        "exclude_nodes": sorted(exclude_nodes),
+        "exclude_initializers": sorted(exclude_initializers),
+        "source_graph_sha256": source_hash,
+        "source_external_data_sha256": source_external_hashes,
+        "graph_sha256": _sha256(lm_model_path),
+        "external_data_sha256": {
+            location: _sha256(_bundle_path(lm_model_path.parent, location))
+            for location in sorted(quantized_locations)
+        },
+        **transformation,
+    }
+    lm_meta_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return metadata["quantization"]
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -129,6 +312,9 @@ def optimize_bundle(
     model_dir: str | Path | None = None,
     corpus_path: str | Path | None = None,
     report_dir: str | Path | None = None,
+    chunk_rows: int = 64,
+    exclude_matmul_nodes: Sequence[str] = (),
+    exclude_matmul_initializers: Sequence[str] = (),
 ) -> dict[str, Any]:
     from kitten2_onnx.validate_bundle import validate_bundle
     from scripts.audit_bundle_size import audit_bundle
@@ -152,8 +338,10 @@ def optimize_bundle(
     )
     report_root.mkdir(parents=True, exist_ok=True)
     output_root.parent.mkdir(parents=True, exist_ok=True)
-    if lm_method != "int8-dynamic":
+    if lm_method not in ("int8-dynamic", "int8-dynamic-chunked"):
         raise ValueError(f"Unsupported LM optimization method: {lm_method!r}")
+    if lm_method == "int8-dynamic" and (exclude_matmul_nodes or exclude_matmul_initializers):
+        raise ValueError("MatMul exclusions are supported only by int8-dynamic-chunked")
 
     input_bundle_path = input_root / "bundle.json"
     bundle = json.loads(input_bundle_path.read_text(encoding="utf-8"))
@@ -164,7 +352,16 @@ def optimize_bundle(
     output_bundle_path = output_root / "bundle.json"
     bundle = json.loads(output_bundle_path.read_text(encoding="utf-8"))
 
-    quantization = _quantize_lm(output_root, bundle)
+    if lm_method == "int8-dynamic":
+        quantization = _quantize_lm(output_root, bundle)
+    else:
+        quantization = _quantize_lm_chunked(
+            output_root,
+            bundle,
+            exclude_nodes=exclude_matmul_nodes,
+            exclude_initializers=exclude_matmul_initializers,
+            chunk_rows=chunk_rows,
+        )
     export_metadata = bundle.get("export")
     if not isinstance(export_metadata, dict):
         raise TypeError("Bundle export metadata must be an object")
@@ -232,11 +429,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_bundle", type=Path)
     parser.add_argument("output_bundle", type=Path)
-    parser.add_argument("--lm", choices=("int8-dynamic",), required=True)
+    parser.add_argument("--lm", choices=("int8-dynamic", "int8-dynamic-chunked"), required=True)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--corpus", type=Path)
     parser.add_argument("--report-dir", type=Path)
+    parser.add_argument("--chunk-rows", type=int, default=64)
+    parser.add_argument("--exclude-matmul-node", action="append", default=[])
+    parser.add_argument("--exclude-matmul-initializer", action="append", default=[])
     args = parser.parse_args()
     report = optimize_bundle(
         args.input_bundle,
@@ -246,6 +446,9 @@ def main() -> None:
         model_dir=args.model_dir,
         corpus_path=args.corpus,
         report_dir=args.report_dir,
+        chunk_rows=args.chunk_rows,
+        exclude_matmul_nodes=args.exclude_matmul_node,
+        exclude_matmul_initializers=args.exclude_matmul_initializer,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 
