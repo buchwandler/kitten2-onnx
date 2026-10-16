@@ -12,16 +12,32 @@ from kitten2_onnx.runtime import Kitten2OnnxLM
 
 
 @pytest.mark.parametrize(
-    ("io_dtype", "expected_type", "expected_numpy_dtype", "provider"),
+    (
+        "hidden_size",
+        "kv_heads",
+        "head_dim",
+        "io_dtype",
+        "expected_type",
+        "expected_numpy_dtype",
+        "provider",
+    ),
     [
-        ("float32", "tensor(float)", np.float32, "CPUExecutionProvider"),
-        ("float16", "tensor(float16)", np.float16, "CUDAExecutionProvider"),
+        (4, 1, 1, "float32", "tensor(float)", np.float32, "CPUExecutionProvider"),
+        (4, 1, 1, "float16", "tensor(float16)", np.float16, "CUDAExecutionProvider"),
+        (1024, 8, 128, "float32", "tensor(float)", np.float32, "CPUExecutionProvider"),
     ],
 )
 def test_input_ids_runtime_projects_speaker_only_during_prefill(
-    tmp_path, monkeypatch, io_dtype, expected_type, expected_numpy_dtype, provider
+    tmp_path,
+    monkeypatch,
+    hidden_size,
+    kv_heads,
+    head_dim,
+    io_dtype,
+    expected_type,
+    expected_numpy_dtype,
+    provider,
 ):
-    hidden_size = 4
 
     class FakeSession:
         def __init__(self, path, providers):
@@ -47,7 +63,7 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
                 return [np.arange(hidden_size, dtype=np.float32)[None, :]]
             past_length = feeds["past_key_0"].shape[2]
             seq_length = feeds["input_ids"].shape[1]
-            cache = np.zeros((1, 1, past_length + seq_length, 1), dtype=np.float32)
+            cache = np.zeros((1, kv_heads, past_length + seq_length, head_dim), dtype=np.float32)
             logits = np.zeros((1, 16), dtype=np.float32)
             return [logits, cache, cache]
 
@@ -76,8 +92,8 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
         "io_dtype": io_dtype,
         "hidden_size": hidden_size,
         "num_hidden_layers": 1,
-        "num_key_value_heads": 1,
-        "head_dim": 1,
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
     }
     (tmp_path / "lm.meta.json").write_text(json.dumps(metadata), encoding="utf-8")
     (tmp_path / "lm.onnx").write_bytes(b"fake graph")
@@ -85,16 +101,20 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
     speaker_path.write_bytes(b"fake graph")
 
     runtime = Kitten2OnnxLM(tmp_path, speaker_model=speaker_path, providers=[provider])
+    assert runtime._empty_cache()["past_key_0"].shape == (1, kv_heads, 0, head_dim)
     logits, past = runtime.step(
         np.asarray([[3, 5]], dtype=np.int64),
         speaker_embedding=np.asarray([0.25, -0.5], dtype=np.float32),
     )
 
+    assert past["past_key_0"].shape == (1, kv_heads, 2, head_dim)
     assert runtime.embeddings is None
     assert logits.shape == (1, 16)
     lm_session = sessions[0]
     np.testing.assert_array_equal(lm_session.feeds[0]["input_ids"], [[3, 5]])
-    np.testing.assert_array_equal(lm_session.feeds[0]["speaker_hidden"], [[0, 1, 2, 3]])
+    np.testing.assert_array_equal(
+        lm_session.feeds[0]["speaker_hidden"], np.arange(hidden_size)[None, :]
+    )
     assert lm_session.feeds[0]["speaker_hidden"].dtype == expected_numpy_dtype
     np.testing.assert_array_equal(lm_session.feeds[0]["position_ids"], [[0, 1]])
 

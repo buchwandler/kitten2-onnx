@@ -93,6 +93,22 @@ python scripts/inspect_model.py /path/to/kitten-tts-2
 python scripts/inspect_model.py --onnx build/lm/lm.onnx
 ```
 
+
+
+## Initialize a 0.6B student
+
+Create an initial Kitten-compatible student checkpoint from the Hugging Face PyTorch Qwen3-0.6B base model and the pinned local teacher assets:
+
+```bash
+uv run python scripts/build_qwen3_06b_student.py \
+  --base Qwen/Qwen3-0.6B-Base \
+  --teacher .models/kitten-tts-2 \
+  --output .models/kitten-tts-2-qwen3-0.6b-student-init
+```
+
+Use `--base-revision` to select a specific base checkpoint revision. The resolved base revision and pinned Kitten teacher revision are recorded in `model_revision.json`.
+
+This command creates an initialization checkpoint, not a trained or usable TTS model. It preserves the shared text-token rows, initializes the Kitten-specific vocabulary rows, copies the Kitten tokenizer and non-LM assets, and adds a randomly initialized speaker projection. Distillation and speech-quality evaluation are required before treating the student as a speech model or using it as a release candidate.
 ## Parity
 
 Start with deterministic logits, not generated audio:
