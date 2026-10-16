@@ -198,6 +198,9 @@ def test_runtime_uses_profile_provider_and_refuses_bfloat16_numpy(tmp_path, monk
 
     runtime = Kitten2OnnxLM(model_dir)
 
+    with pytest.raises(ValueError, match="requires CUDAExecutionProvider"):
+        Kitten2OnnxLM(model_dir, providers=["CPUExecutionProvider"])
+
     assert runtime.session.providers == ["CUDAExecutionProvider"]
     assert runtime.model_numpy_dtype is np.float16
 
