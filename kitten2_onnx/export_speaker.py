@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from collections.abc import Iterable
+from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
@@ -88,6 +88,8 @@ def export_speaker(repo_dir: str | Path, output_dir: str | Path, *, opset: int =
 
     meta = {
         "format": "kitten2-onnx-speaker-v1",
+        "input_names": ["speaker_embedding"],
+        "output_names": ["speaker_hidden"],
         "speaker_dim": speaker_dim,
         "hidden_size": hidden,
         "dtype": "fp32",

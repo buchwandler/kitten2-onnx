@@ -1,0 +1,84 @@
+{
+  "upstream_code_revision": "36ef3090ca1e59122a81fc23be4a659a502b9d55",
+  "source_model_revision": "fa8ce5c7547e322a065cad9b813d27a78fad9640",
+  "fixtures": [
+    {
+      "name": "reference_roles_with_emotion_and_audio_offset",
+      "config": {
+        "token_map": {
+          "audio_id_base": 151675,
+          "num_audio_tokens": 6561,
+          "speech_start_id": 151669,
+          "speech_end_id": 151670,
+          "text_start_id": 151671,
+          "text_end_id": 151672,
+          "start_id": 151673,
+          "stop_id": 151674,
+          "final_seg_id": 158236,
+          "reference_speech_start_id": 158237,
+          "reference_speech_end_id": 158238,
+          "reference_text_start_id": 158239,
+          "reference_text_end_id": 158240
+        }
+      },
+      "reference_text_ids": [101, 102, 103],
+      "reference_audio_tokens": [0, 7, 6560],
+      "emotion_ids": [81, 82],
+      "target_text_ids": [301, 302],
+      "expected_reference_prefix": [151673, 158239, 101, 102, 103, 158240, 158237, 151675, 151682, 158235, 158238],
+      "expected_prompt_ids": [151673, 158239, 101, 102, 103, 158240, 158237, 151675, 151682, 158235, 158238, 81, 82, 151671, 301, 302, 158236, 151669]
+    },
+    {
+      "name": "speaker_only_prompt_with_emotion",
+      "config": {
+        "token_map": {
+          "audio_id_base": 151675,
+          "num_audio_tokens": 6561,
+          "speech_start_id": 151669,
+          "speech_end_id": 151670,
+          "text_start_id": 151671,
+          "text_end_id": 151672,
+          "start_id": 151673,
+          "stop_id": 151674,
+          "final_seg_id": 158236,
+          "reference_speech_start_id": 158237,
+          "reference_speech_end_id": 158238,
+          "reference_text_start_id": 158239,
+          "reference_text_end_id": 158240
+        }
+      },
+      "reference_text_ids": [],
+      "reference_audio_tokens": [],
+      "emotion_ids": [42],
+      "target_text_ids": [900, 901],
+      "expected_reference_prefix": null,
+      "expected_prompt_ids": [151673, 42, 151671, 900, 901, 158236, 151669]
+    },
+    {
+      "name": "legacy_reference_wrappers_without_role_tokens",
+      "config": {
+        "token_map": {
+          "audio_id_base": 151675,
+          "num_audio_tokens": 6561,
+          "speech_start_id": 151669,
+          "speech_end_id": 151670,
+          "text_start_id": 151671,
+          "text_end_id": 151672,
+          "start_id": 151673,
+          "stop_id": 151674,
+          "final_seg_id": 158236,
+          "reference_speech_start_id": 0,
+          "reference_speech_end_id": 0,
+          "reference_text_start_id": 0,
+          "reference_text_end_id": 0
+        }
+      },
+      "reference_text_ids": [501, 502],
+      "reference_audio_tokens": [1, 2],
+      "emotion_ids": [],
+      "target_text_ids": [601],
+      "expected_reference_prefix": [151673, 151671, 501, 502, 151669, 151676, 151677, 151670],
+      "expected_prompt_ids": [151673, 151671, 501, 502, 151669, 151676, 151677, 151670, 151671, 601, 158236, 151669]
+    }
+  ]
+}

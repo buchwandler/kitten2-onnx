@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from kitten2_onnx.export_lm import DTYPES, load_hf_lm
+from kitten2_onnx.export_lm import RUNTIME_PROFILES, load_hf_lm
 from kitten2_onnx.runtime import Kitten2OnnxLM
 
 
@@ -23,18 +23,20 @@ def main() -> None:
     parser.add_argument("onnx_dir", type=Path)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--prompt", default="Hello from Kitten.")
-    parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
+    parser.add_argument("--profile", choices=sorted(RUNTIME_PROFILES), default="dev-fp32")
     args = parser.parse_args()
 
     from transformers import AutoTokenizer
 
-    model = load_hf_lm(args.repo_dir, DTYPES[args.dtype])
+    profile = RUNTIME_PROFILES[args.profile]
+    model = load_hf_lm(args.repo_dir, profile.graph_dtype)
     tokenizer = AutoTokenizer.from_pretrained(str(args.repo_dir / "lm"))
     ids = tokenizer.encode(args.prompt, add_special_tokens=False)
     if not ids:
         raise SystemExit("tokenizer produced no ids")
 
-    ort_lm = Kitten2OnnxLM(args.onnx_dir)
+    providers = [profile.provider] if profile.provider == "CUDAExecutionProvider" else None
+    ort_lm = Kitten2OnnxLM(args.onnx_dir, providers=providers)
     ort_logits, ort_past = ort_lm.step(np.asarray([ids], dtype=np.int64))
 
     input_ids = torch.tensor([ids], dtype=torch.long)

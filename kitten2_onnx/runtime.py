@@ -3,24 +3,63 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from collections.abc import Callable
 
 import numpy as np
 
+from kitten2_onnx.sampling import SamplingSettings, is_eos_token, sample
+from kitten2_onnx.tokens import TokenMap
 
-Sampler = Callable[[np.ndarray], int]
+S3GEN_SILENCE_TOKEN = 4299
+S3GEN_SILENCE_TAIL_TOKENS = 3
+S3GEN_MEL_FRAMES_PER_TOKEN = 2
+S3GEN_SAMPLE_RATE = 24000
+S3GEN_SAMPLES_PER_MEL_FRAME = 480
+S3GEN_SPEECH_VOCAB_SIZE = 6561
 
 
-def greedy_sampler(logits: np.ndarray) -> int:
-    return int(np.argmax(logits))
+def clean_s3_tokens(
+    speech_tokens: list[int] | np.ndarray, vocab_size: int = S3GEN_SPEECH_VOCAB_SIZE
+) -> np.ndarray:
+    """Keep only valid zero-based codec IDs accepted by the flow graph."""
+    tokens = np.asarray(speech_tokens, dtype=np.int64)
+    if tokens.ndim == 2 and tokens.shape[0] == 1:
+        tokens = tokens[0]
+    elif tokens.ndim != 1:
+        raise ValueError("speech_tokens must have shape [T] or [1, T]")
+    return tokens[(tokens >= 0) & (tokens < vocab_size)]
+
+
+def append_s3_silence_tail(
+    speech_tokens: list[int] | np.ndarray,
+    token_id: int = S3GEN_SILENCE_TOKEN,
+    count: int = S3GEN_SILENCE_TAIL_TOKENS,
+) -> np.ndarray:
+    """Append the silence tokens required by upstream S3 lookahead."""
+    tokens = np.asarray(speech_tokens, dtype=np.int64)
+    if tokens.ndim == 1:
+        tail_shape = (count,)
+    elif tokens.ndim == 2 and tokens.shape[0] == 1:
+        tail_shape = (1, count)
+    else:
+        raise ValueError("speech_tokens must have shape [T] or [1, T]")
+    tail = np.full(tail_shape, token_id, dtype=np.int64)
+    return np.concatenate((tokens, tail), axis=-1)
+
+
+@dataclass(frozen=True)
+class GenerationResult:
+    raw_ids: list[int]
+    s3_ids: list[int]
 
 
 class Kitten2OnnxLM:
     """Drive the exported Qwen3 LM with explicit embeddings and KV cache.
 
-    This class intentionally handles *only* LM token generation. It does not
-    reproduce Kitten's custom logits processors or S3 waveform decoder yet.
+    This class handles speaker projection and LM token generation. It does not yet
+    reproduce the S3 waveform decoder.
     """
 
     def __init__(
@@ -34,8 +73,23 @@ class Kitten2OnnxLM:
 
         self.model_dir = Path(model_dir)
         self.meta = json.loads((self.model_dir / "lm.meta.json").read_text(encoding="utf-8"))
+        runtime_profile = self.meta.get("runtime_profile")
+        io_dtype = self.meta.get("io_dtype")
+        if runtime_profile is None or io_dtype is None:
+            raise ValueError("LM metadata must declare runtime_profile and io_dtype")
+        if io_dtype == "bfloat16":
+            raise NotImplementedError(
+                "bfloat16 LM I/O requires ONNX Runtime I/O binding; NumPy session.run is unsupported"
+            )
+
+        runtime_provider = self.meta.get("runtime_provider")
+        if runtime_provider not in {"CPUExecutionProvider", "CUDAExecutionProvider"}:
+            raise ValueError(f"Unsupported runtime provider in LM metadata: {runtime_provider!r}")
+        providers = providers or [runtime_provider]
+        if runtime_provider == "CUDAExecutionProvider" and runtime_provider not in providers:
+            raise ValueError(f"Profile {runtime_profile!r} requires CUDAExecutionProvider")
+
         self.embeddings = np.load(self.model_dir / self.meta["embedding_file"], mmap_mode="r")
-        providers = providers or ["CPUExecutionProvider"]
         self.session = ort.InferenceSession(
             str(self.model_dir / "lm.onnx"),
             providers=providers,
@@ -49,13 +103,13 @@ class Kitten2OnnxLM:
         self.kv_heads = int(self.meta["num_key_value_heads"])
         self.head_dim = int(self.meta["head_dim"])
 
-        # ONNX initial graph dtype can differ from embedding storage dtype (bf16
-        # embeddings are stored as fp32). Infer the desired tensor type.
         first = self.session.get_inputs()[0]
-        self.model_numpy_dtype = {
-            "tensor(float)": np.float32,
-            "tensor(float16)": np.float16,
-        }.get(first.type, np.float32)
+        expected_type = {"float32": "tensor(float)", "float16": "tensor(float16)"}[io_dtype]
+        if first.type != expected_type:
+            raise ValueError(
+                f"LM metadata io_dtype {io_dtype!r} does not match graph input type {first.type!r}"
+            )
+        self.model_numpy_dtype = {"float32": np.float32, "float16": np.float16}[io_dtype]
 
     def _empty_cache(self) -> dict[str, np.ndarray]:
         shape = (1, self.kv_heads, 0, self.head_dim)
@@ -140,33 +194,182 @@ class Kitten2OnnxLM:
         self,
         prompt_ids: list[int],
         *,
+        token_map: TokenMap,
         max_new_tokens: int,
         speaker_embedding: np.ndarray | None = None,
-        sampler: Sampler = greedy_sampler,
+        settings: SamplingSettings | None = None,
+        seed: int | None = None,
         stop_ids: set[int] | None = None,
-    ) -> list[int]:
-        """Greedy/custom-sampler LM loop.
-
-        This does not yet include Kitten's temperature/top-k/top-p/min-p and
-        repetition processors. Supply a custom ``sampler`` while experimenting.
-        """
+        logits_callback: Callable[[int, np.ndarray], None] | None = None,
+    ) -> GenerationResult:
+        """Generate raw LM IDs and their in-range, zero-based S3 counterparts."""
         if not prompt_ids:
             raise ValueError("prompt_ids may not be empty")
-        stop_ids = stop_ids or set()
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if max_new_tokens == 0:
+            return GenerationResult(raw_ids=[], s3_ids=[])
 
+        settings = settings or SamplingSettings()
+        rng = np.random.default_rng(seed)
+        history = [int(token) for token in prompt_ids]
+        prompt_length = len(history)
         logits, past = self.step(
-            np.asarray([prompt_ids], dtype=np.int64),
+            np.asarray([history], dtype=np.int64),
             speaker_embedding=speaker_embedding,
         )
-        generated: list[int] = []
+        raw_ids: list[int] = []
 
-        for _ in range(int(max_new_tokens)):
-            token = int(sampler(logits[0]))
-            generated.append(token)
-            if token in stop_ids:
+        for step_index in range(max_new_tokens):
+            if logits_callback is not None:
+                logits_callback(step_index, np.asarray(logits[0]).copy())
+            token = sample(
+                logits[0],
+                history,
+                token_map,
+                settings,
+                float(rng.random()),
+                prompt_length=prompt_length,
+            )
+            raw_ids.append(token)
+            if stop_ids is None:
+                should_stop = is_eos_token(token, token_map)
+            else:
+                should_stop = token in stop_ids
+            if should_stop:
                 break
+            history.append(token)
             logits, past = self.step(
                 np.asarray([[token]], dtype=np.int64),
                 past=past,
             )
-        return generated
+
+        s3_ids = [
+            token - token_map.audio_id_base
+            for token in raw_ids
+            if token_map.audio_id_base <= token < token_map.audio_id_end
+        ]
+        return GenerationResult(raw_ids=raw_ids, s3_ids=s3_ids)
+
+
+class Kitten2OnnxDecoder:
+    """Run the deterministic S3 flow and HiFT ONNX stages for zero-based S3 IDs."""
+
+    def __init__(
+        self,
+        flow_dir: str | Path,
+        mel2wav_dir: str | Path,
+        *,
+        providers: list[str] | None = None,
+    ):
+        import onnxruntime as ort
+
+        self.flow_dir = Path(flow_dir)
+        self.mel2wav_dir = Path(mel2wav_dir)
+        self.flow_meta = json.loads((self.flow_dir / "flow.meta.json").read_text(encoding="utf-8"))
+        self.mel2wav_meta = json.loads(
+            (self.mel2wav_dir / "mel2wav.meta.json").read_text(encoding="utf-8")
+        )
+        if self.flow_meta.get("format") != "kitten2-onnx-flow-v1":
+            raise ValueError("Unsupported S3 flow graph metadata")
+        if self.mel2wav_meta.get("format") != "kitten2-onnx-mel2wav-v1":
+            raise ValueError("Unsupported mel2wav graph metadata")
+        tail = self.flow_meta["silence_tail"]
+        self.token_mel_ratio = int(self.flow_meta["token_mel_ratio"])
+        self.speech_vocab_size = int(self.flow_meta["speech_vocab_size"])
+        self.silence_token_id = int(tail["token_id"])
+        self.silence_tail_count = int(tail["count"])
+        self.samples_per_mel_frame = int(self.mel2wav_meta["samples_per_mel_frame"])
+        self.sample_rate = int(self.mel2wav_meta["sample_rate"])
+        self.trim_fade_samples = int(self.mel2wav_meta["trim_fade_samples"])
+
+        providers = providers or [self.flow_meta["provider"]]
+        self.flow_session = ort.InferenceSession(
+            str(self.flow_dir / self.flow_meta["graph"]), providers=providers
+        )
+        self.mel2wav_session = ort.InferenceSession(
+            str(self.mel2wav_dir / self.mel2wav_meta["graph"]), providers=providers
+        )
+        self.flow_channels = int(self.flow_meta["input_shapes"]["flow_noise"][1])
+        self.vocoder_harmonics = int(self.mel2wav_meta["input_shapes"]["phase_noise"][1])
+
+    def decode(
+        self,
+        speech_tokens: list[int] | np.ndarray,
+        conditioning: Mapping[str, np.ndarray],
+        *,
+        seed: int | None = None,
+        flow_noise: np.ndarray | None = None,
+        phase_noise: np.ndarray | None = None,
+        sine_noise: np.ndarray | None = None,
+    ) -> np.ndarray | None:
+        """Decode S3 IDs and apply the upstream silence lookahead and trim fade."""
+        tokens = clean_s3_tokens(speech_tokens, self.speech_vocab_size)
+        if tokens.size == 0:
+            return None
+        tokens = append_s3_silence_tail(
+            tokens, self.silence_token_id, self.silence_tail_count
+        )[None, :]
+
+        prompt_token = np.asarray(conditioning["conditioning_prompt_token"], dtype=np.int64)
+        prompt_token_len = np.asarray(conditioning["conditioning_prompt_token_len"], dtype=np.int64)
+        prompt_feat = np.asarray(conditioning["conditioning_prompt_feat"], dtype=np.float32)
+        embedding = np.asarray(conditioning["conditioning_embedding"], dtype=np.float32)
+        if prompt_token.shape[0] != 1 or prompt_token_len.shape != (1,):
+            raise ValueError("conditioning prompt tokens must have batch size one")
+        if int(prompt_token_len[0]) != prompt_token.shape[1]:
+            raise ValueError("conditioning_prompt_token_len does not match its token array")
+
+        rng = np.random.default_rng(seed)
+        flow_shape = (
+            1,
+            self.flow_channels,
+            self.token_mel_ratio * (int(prompt_token_len[0]) + tokens.shape[1]),
+        )
+        if flow_noise is None:
+            flow_noise = rng.standard_normal(flow_shape, dtype=np.float32)
+        else:
+            flow_noise = np.asarray(flow_noise, dtype=np.float32)
+        if flow_noise.shape != flow_shape:
+            raise ValueError(f"flow_noise must have shape {flow_shape}, found {flow_noise.shape}")
+
+        flow_inputs = {
+            "speech_tokens": tokens,
+            "speech_token_lengths": np.asarray([tokens.shape[1]], dtype=np.int64),
+            "prompt_token": prompt_token,
+            "prompt_token_len": prompt_token_len,
+            "prompt_feat": prompt_feat,
+            "embedding": embedding,
+            "flow_noise": flow_noise,
+        }
+        mel = self.flow_session.run(["mel"], flow_inputs)[0]
+
+        phase_shape = (1, self.vocoder_harmonics, 1)
+        if phase_noise is None:
+            phase_noise = rng.uniform(-np.pi, np.pi, size=phase_shape).astype(np.float32)
+            phase_noise[:, 0, :] = 0
+        else:
+            phase_noise = np.asarray(phase_noise, dtype=np.float32)
+        sine_shape = (
+            1,
+            self.vocoder_harmonics,
+            mel.shape[2] * self.samples_per_mel_frame,
+        )
+        if sine_noise is None:
+            sine_noise = rng.standard_normal(sine_shape, dtype=np.float32)
+        else:
+            sine_noise = np.asarray(sine_noise, dtype=np.float32)
+        if phase_noise.shape != phase_shape:
+            raise ValueError(f"phase_noise must have shape {phase_shape}, found {phase_noise.shape}")
+        if sine_noise.shape != sine_shape:
+            raise ValueError(f"sine_noise must have shape {sine_shape}, found {sine_noise.shape}")
+
+        waveform = self.mel2wav_session.run(
+            ["waveform"],
+            {"mel": mel, "phase_noise": phase_noise, "sine_noise": sine_noise},
+        )[0]
+        n_trim = self.trim_fade_samples
+        fade = np.zeros(2 * n_trim, dtype=np.float32)
+        fade[n_trim:] = (np.cos(np.linspace(np.pi, 0, n_trim, dtype=np.float32)) + 1) / 2
+        waveform[:, : fade.shape[0]] *= fade
+        return waveform

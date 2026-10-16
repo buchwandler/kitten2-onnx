@@ -1,0 +1,74 @@
+{
+  "format": "kitten2-onnx-e2e-corpus-v1",
+  "voice": "Bruno",
+  "preset": "stable",
+  "max_new_tokens": 32,
+  "seed": 7,
+  "cases": [
+    {
+      "name": "very_short",
+      "text": "Hi.",
+      "normalized_text": "Hi.",
+      "reference_prompt_length": 291,
+      "reference_raw_ids": [153174, 155812, 155893, 153625, 155806, 157993, 155087, 157266, 157346, 157104, 152487, 151791, 152070, 152042, 152006, 153464, 153706, 151670],
+      "reference_s3_ids": [1499, 4137, 4218, 1950, 4131, 6318, 3412, 5591, 5671, 5429, 812, 116, 395, 367, 331, 1789, 2031],
+      "reference_token_count": 17,
+      "reference_waveform_samples": 18720,
+      "reference_duration_seconds": 0.78,
+      "reference_peak": 0.9068335890769958,
+      "reference_rms": 0.09569660373002349
+    },
+    {
+      "name": "normal",
+      "text": "The warm sun filled the small garden as the birds sang.",
+      "normalized_text": "The warm sun filled the small garden as the birds sang.",
+      "reference_prompt_length": 301,
+      "reference_raw_ids": [154635, 157510, 155323, 153133, 153463, 153760, 151738, 152388, 153861, 153859, 153833, 153132, 154581, 156732, 157941, 155789, 158176, 155669, 156427, 157320, 156591, 153925, 156375, 154350, 151704, 153238, 153240, 155359, 158185, 158134, 154726, 154023],
+      "reference_s3_ids": [2960, 5835, 3648, 1458, 1788, 2085, 63, 713, 2186, 2184, 2158, 1457, 2906, 5057, 6266, 4114, 6501, 3994, 4752, 5645, 4916, 2250, 4700, 2675, 29, 1563, 1565, 3684, 6510, 6459, 3051, 2348],
+      "reference_token_count": 32,
+      "reference_waveform_samples": 33120,
+      "reference_duration_seconds": 1.38,
+      "reference_peak": 0.8041384816169739,
+      "reference_rms": 0.12037824298841619
+    },
+    {
+      "name": "punctuation_heavy",
+      "text": "Wait... really?! I said, \"yes\"; then--nothing.",
+      "normalized_text": "Wait... really?! I said, \"yes\"; then--nothing.",
+      "reference_prompt_length": 303,
+      "reference_raw_ids": [154632, 157507, 155347, 152890, 152978, 153833, 153132, 156267, 156533, 152970, 153437, 153625, 153706, 153787, 153831, 153855, 155562, 156282, 155231, 156609, 156281, 156668, 154364, 152410, 153136, 153382, 155812, 155893, 153624, 155808, 154302, 156110],
+      "reference_s3_ids": [2957, 5832, 3672, 1215, 1303, 2158, 1457, 4592, 4858, 1295, 1762, 1950, 2031, 2112, 2156, 2180, 3887, 4607, 3556, 4934, 4606, 4993, 2689, 735, 1461, 1707, 4137, 4218, 1949, 4133, 2627, 4435],
+      "reference_token_count": 32,
+      "reference_waveform_samples": 33120,
+      "reference_duration_seconds": 1.38,
+      "reference_peak": 0.9494483470916748,
+      "reference_rms": 0.1372982461457831
+    },
+    {
+      "name": "number_date_currency",
+      "text": "On 2024-03-14, the total was $19.99 after a 12% discount.",
+      "normalized_text": "On march fourteenth twenty twenty four, the total was nineteen dollars ninety nine cents after a twelve percent discount.",
+      "reference_prompt_length": 311,
+      "reference_raw_ids": [153383, 154356, 156624, 151794, 153158, 155743, 152337, 158160, 157725, 153274, 156997, 155509, 158212, 156025, 157497, 158214, 155555, 153571, 152707, 156107, 153877, 156641, 156642, 151944, 153236, 153760, 154645, 153409, 155326, 157510, 155323, 153136],
+      "reference_s3_ids": [1708, 2681, 4949, 119, 1483, 4068, 662, 6485, 6050, 1599, 5322, 3834, 6537, 4350, 5822, 6539, 3880, 1896, 1032, 4432, 2202, 4966, 4967, 269, 1561, 2085, 2970, 1734, 3651, 5835, 3648, 1461],
+      "reference_token_count": 32,
+      "reference_waveform_samples": 33120,
+      "reference_duration_seconds": 1.38,
+      "reference_peak": 0.7961156964302063,
+      "reference_rms": 0.11919101776854735
+    },
+    {
+      "name": "two_sentence_paragraph",
+      "text": "The train arrived before sunrise. Everyone boarded quietly.",
+      "normalized_text": "The train arrived before sunrise. Everyone boarded quietly.",
+      "reference_prompt_length": 299,
+      "reference_raw_ids": [154632, 157510, 155323, 153136, 153706, 153814, 151738, 151823, 153436, 156998, 157696, 155239, 155538, 156219, 156722, 154774, 156989, 158211, 156044, 156042, 153567, 155079, 157023, 153951, 151905, 156031, 152464, 153613, 153841, 154575, 155225, 158209],
+      "reference_s3_ids": [2957, 5835, 3648, 1461, 2031, 2139, 63, 148, 1761, 5323, 6021, 3564, 3863, 4544, 5047, 3099, 5314, 6536, 4369, 4367, 1892, 3404, 5348, 2276, 230, 4356, 789, 1938, 2166, 2900, 3550, 6534],
+      "reference_token_count": 32,
+      "reference_waveform_samples": 33120,
+      "reference_duration_seconds": 1.38,
+      "reference_peak": 0.7767831683158875,
+      "reference_rms": 0.13318003928901004
+    }
+  ]
+}

@@ -21,18 +21,28 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
 
 
-DTYPES = {
-    "fp32": torch.float32,
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
+@dataclass(frozen=True)
+class ExportProfile:
+    graph_dtype: torch.dtype
+    graph_dtype_name: str
+    io_dtype: str
+    provider: str
+    verify: bool
+
+
+RUNTIME_PROFILES = {
+    "dev-fp32": ExportProfile(torch.float32, "float32", "float32", "CPUExecutionProvider", True),
+    "cuda-fp16": ExportProfile(torch.float16, "float16", "float16", "CUDAExecutionProvider", False),
+    "cuda-bf16": ExportProfile(torch.bfloat16, "bfloat16", "bfloat16", "CUDAExecutionProvider", False),
 }
 
 
@@ -100,19 +110,46 @@ def _dummy_inputs(config, dtype: torch.dtype, seq: int = 4, past_len: int = 3):
 
 
 def load_hf_lm(repo_dir: Path, dtype: torch.dtype):
-    """Load the plain Hugging Face-compatible Kitten LM checkpoint."""
+    """Load and validate the plain Kitten Qwen3 checkpoint for ONNX export."""
     from transformers import AutoModelForCausalLM
 
+    repo_dir = Path(repo_dir)
     lm_dir = repo_dir / "lm"
-    if not lm_dir.is_dir():
-        raise FileNotFoundError(f"Kitten LM directory not found: {lm_dir}")
+    config_path = lm_dir / "config.json"
+    checkpoint_path = lm_dir / "model.safetensors"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"Kitten LM config not found: {config_path}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Plain Kitten LM checkpoint not found: {checkpoint_path}")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if config.get("model_type") != "qwen3":
+        raise ValueError(f"Expected a Qwen3 checkpoint in {lm_dir}")
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model, loading_info = AutoModelForCausalLM.from_pretrained(
         str(lm_dir),
-        torch_dtype=dtype,
+        dtype=dtype,
         attn_implementation="eager",
         low_cpu_mem_usage=True,
+        local_files_only=True,
+        output_loading_info=True,
     )
+    missing = set(loading_info["missing_keys"])
+    if model.config.tie_word_embeddings:
+        missing.discard("lm_head.weight")
+    unexpected = {
+        name for name in loading_info["unexpected_keys"] if not name.startswith("spk_proj.")
+    }
+    if missing:
+        raise ValueError(f"Missing transformer checkpoint weights: {sorted(missing)}")
+    if unexpected:
+        raise ValueError(f"Unexpected checkpoint weights: {sorted(unexpected)}")
+
+    model.tie_weights()
+    if model.config.tie_word_embeddings:
+        input_weight = model.get_input_embeddings().weight
+        output_weight = model.get_output_embeddings().weight
+        if input_weight.data_ptr() != output_weight.data_ptr():
+            raise ValueError("Qwen3 input and output embeddings are not tied")
     model.eval()
     return model
 
@@ -131,47 +168,92 @@ def save_embedding_table(model: nn.Module, output_dir: Path) -> Path:
     return path
 
 
+def _export_with_diagnostics(
+    model: nn.Module,
+    args: tuple,
+    output_path: str | Path,
+    *,
+    artifacts_dir: str | Path | None = None,
+    verify: bool = True,
+    **export_kwargs,
+) -> None:
+    artifacts_dir = (
+        Path(artifacts_dir)
+        if artifacts_dir is not None
+        else (Path(__file__).resolve().parents[1] / "build" / "debug" / "lm-export")
+    )
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    output_path = Path(output_path)
+    try:
+        torch.onnx.export(
+            model,
+            args,
+            str(output_path),
+            report=True,
+            verify=verify,
+            artifacts_dir=str(artifacts_dir),
+            **export_kwargs,
+        )
+    except Exception as error:
+        failure_path = artifacts_dir / "export-failure.txt"
+        failure_path.write_text(
+            f"Output: {output_path}\n{type(error).__name__}: {error}\n",
+            encoding="utf-8",
+        )
+        raise
+
+
 def export_lm(
     repo_dir: str | Path,
     output_dir: str | Path,
     *,
-    dtype_name: str = "bf16",
+    profile_name: str = "dev-fp32",
     opset: int = 18,
+    diagnostics_dir: str | Path | None = None,
 ) -> Path:
+    try:
+        profile = RUNTIME_PROFILES[profile_name]
+    except KeyError as error:
+        raise ValueError(
+            f"Unknown export profile {profile_name!r}. Choose from {sorted(RUNTIME_PROFILES)}"
+        ) from error
+
     repo_dir = Path(repo_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    lm_dir = repo_dir / "lm"
+    checkpoint_path = lm_dir / "model.safetensors"
+    source_config = json.loads((lm_dir / "config.json").read_text(encoding="utf-8"))
+    source_dtype = str(source_config.get("dtype", source_config.get("torch_dtype", "unknown")))
+    revision_path = repo_dir / "model_revision.json"
+    revision = json.loads(revision_path.read_text(encoding="utf-8")) if revision_path.is_file() else {}
 
-    dtype = DTYPES[dtype_name]
-    model = load_hf_lm(repo_dir, dtype)
+    model = load_hf_lm(repo_dir, profile.graph_dtype)
     wrapper = KittenQwen3ExportWrapper(model).eval()
-
     config = model.config
     past_names, present_names = _io_names(wrapper.num_layers)
     input_names = ["inputs_embeds", "attention_mask", "position_ids", *past_names]
     output_names = ["logits", *present_names]
 
+    batch_dim = torch.export.Dim("batch", min=1)
     seq_dim = torch.export.Dim("seq", min=1)
     total_dim = torch.export.Dim("total", min=1)
     past_dim = torch.export.Dim("past", min=0)
-
     dynamic_shapes = {
-        "inputs_embeds": {0: torch.export.Dim("batch", min=1), 1: seq_dim},
-        "attention_mask": {0: torch.export.Dim("batch_mask", min=1), 1: total_dim},
-        "position_ids": {0: torch.export.Dim("batch_pos", min=1), 1: seq_dim},
-        "past": [
-            {0: torch.export.Dim(f"batch_past_{i}", min=1), 2: past_dim}
-            for i in range(len(past_names))
-        ],
+        "inputs_embeds": {0: batch_dim, 1: seq_dim},
+        "attention_mask": {0: batch_dim, 1: total_dim},
+        "position_ids": {0: batch_dim, 1: seq_dim},
+        "past": [{0: batch_dim, 2: past_dim} for _ in range(len(past_names))],
     }
 
-    dummy = _dummy_inputs(config, dtype=dtype, seq=4, past_len=3)
+    dummy = _dummy_inputs(config, dtype=profile.graph_dtype, seq=4, past_len=3)
     output_path = output_dir / "lm.onnx"
-
-    torch.onnx.export(
+    _export_with_diagnostics(
         wrapper,
         dummy,
-        str(output_path),
+        output_path,
+        artifacts_dir=diagnostics_dir,
+        verify=profile.verify,
         input_names=input_names,
         output_names=output_names,
         dynamic_shapes=dynamic_shapes,
@@ -183,16 +265,30 @@ def export_lm(
     embedding_path = save_embedding_table(model, output_dir)
     meta = {
         "format": "kitten2-onnx-lm-v1",
-        "architecture": getattr(config, "architectures", [None])[0],
+        "architecture": (getattr(config, "architectures", None) or [config.model_type])[0],
         "hidden_size": int(config.hidden_size),
         "num_hidden_layers": int(config.num_hidden_layers),
         "num_attention_heads": int(config.num_attention_heads),
         "num_key_value_heads": int(config.num_key_value_heads),
         "head_dim": int(config.head_dim),
         "vocab_size": int(config.vocab_size),
-        "dtype": dtype_name,
+        "source_dtype": source_dtype,
+        "graph_dtype": profile.graph_dtype_name,
+        "io_dtype": profile.io_dtype,
+        "logits_dtype": "float32",
+        "runtime_profile": profile_name,
+        "runtime_provider": profile.provider,
+        "verify_on_export": profile.verify,
+        "source_model_path": str(repo_dir.resolve()),
+        "source_model_revision": revision.get("source_model_revision"),
+        "loading_path": str(checkpoint_path.resolve()),
+        "attention_implementation": "eager",
+        "external_data": True,
         "opset": int(opset),
         "embedding_file": embedding_path.name,
+        "embedding_storage_dtype": (
+            "float32" if profile.graph_dtype == torch.bfloat16 else profile.graph_dtype_name
+        ),
         "input_names": input_names,
         "output_names": output_names,
     }
@@ -204,14 +300,14 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("repo_dir", type=Path, help="Local KittenML/kitten-tts-2 directory")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
+    parser.add_argument("--profile", choices=sorted(RUNTIME_PROFILES), default="dev-fp32")
     parser.add_argument("--opset", type=int, default=18)
     args = parser.parse_args(argv)
 
     path = export_lm(
         args.repo_dir,
         args.output,
-        dtype_name=args.dtype,
+        profile_name=args.profile,
         opset=args.opset,
     )
     print(path)

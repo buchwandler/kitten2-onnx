@@ -12,9 +12,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from collections.abc import Iterable
-
+from pathlib import Path
 
 EXPORT_PLAN = {
     "format": "kitten2-onnx-codec-plan-v1",

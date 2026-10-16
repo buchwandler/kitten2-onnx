@@ -63,7 +63,7 @@ The exporter is designed around the full Hugging Face-compatible LM checkpoint.
 python -m kitten2_onnx.export_lm \
   /path/to/kitten-tts-2 \
   --output build/lm \
-  --dtype bf16
+  --profile dev-fp32
 
 python -m kitten2_onnx.export_speaker \
   /path/to/kitten-tts-2 \

@@ -1,0 +1,14 @@
+{
+  "source_model_path": ".models/kitten-tts-2",
+  "source_model_revision": "fa8ce5c7547e322a065cad9b813d27a78fad9640",
+  "upstream_code_revision": "36ef3090ca1e59122a81fc23be4a659a502b9d55",
+  "torch_version": "2.14.1+cu130",
+  "transformers_version": "4.57.1",
+  "dtype": "bfloat16",
+  "device": "cpu",
+  "voice": "Bruno",
+  "reference_transcript": "When the Western music overwhelms the Chinese music, it evokes the long history of conflict between Asia and the Western nations that sought to exploit and dominate it.",
+  "target_text": "Hello from Kitten.",
+  "prompt_length": 294,
+  "generated_token_count": 32
+}

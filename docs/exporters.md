@@ -69,3 +69,10 @@ patterns include:
 7. S3 decoder parity;
 8. end-to-end waveform parity;
 9. quantization/optimization.
+
+
+## Packed source weights
+
+`kitten2_onnx.weights.load_lm_state_dict(model_dir, variant="packed")` loads the configured packed SafeTensors checkpoint and reconstructs a PyTorch state dictionary. Use `variant="plain"` to load the standard checkpoint. This is an exporter-side source-loading path, not an ONNX inference optimization.
+
+KittenML's ternary format preserves tensor values but does not encode the sign bit of zero. Reconstructed weights can therefore be numerically equal while differing from the plain checkpoint's raw BF16 bytes. `compare_packed_checkpoint` reports both numerical equality and bitwise equality. Strict raw-byte parity is not achievable from the upstream packed format alone.
