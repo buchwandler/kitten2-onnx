@@ -6,11 +6,12 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+from onnx import TensorProto, external_data_helper, helper, numpy_helper
 
 from kitten2_onnx.quantize_ternary_nbits import (
     BLOCK_SIZE,
     pack_ternary_nbits4,
+    quantize_ternary_matmuls_streaming,
     rewrite_matmul_to_nbits4,
     unpack_ternary_nbits4,
 )
@@ -120,3 +121,113 @@ def test_rewrite_rejects_non_ternary_initializer():
 
     with pytest.raises(ValueError, match="exactly ternary"):
         rewrite_matmul_to_nbits4(model)
+
+
+
+def _external_initializer(name: str, weight: np.ndarray, location: str, offset: int) -> TensorProto:
+    tensor = TensorProto()
+    tensor.name = name
+    tensor.data_type = TensorProto.FLOAT
+    tensor.dims.extend(weight.shape)
+
+    tensor.raw_data = weight.tobytes()
+    tensor.data_location = TensorProto.EXTERNAL
+    external_data_helper.set_external_data(
+        tensor,
+        location=location,
+        offset=offset,
+        length=weight.nbytes,
+    )
+
+    tensor.ClearField("raw_data")
+    return tensor
+
+
+def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path):
+    k = 256
+    ternary = _weight(k, 3)
+    dense = np.zeros((k, 2), dtype=np.float32)
+    dense[0, 0] = 0.5
+    dense[1, 0] = 0.625
+    prefix = b"external-prefix"
+    middle = b"external-middle"
+    suffix = b"external-suffix"
+    ternary_offset = len(prefix)
+    dense_offset = ternary_offset + ternary.nbytes + len(middle)
+    external_source = tmp_path / "source"
+    external_source.mkdir()
+    external_path = external_source / "weights.bin"
+    external_path.write_bytes(
+        prefix + ternary.tobytes() + middle + dense.tobytes() + suffix
+    )
+
+    graph = helper.make_graph(
+        [
+            helper.make_node("MatMul", ["A", "W_ternary"], ["Y_ternary"], name="ternary_matmul"),
+            helper.make_node("MatMul", ["A", "W_dense"], ["Y_dense"], name="dense_matmul"),
+            helper.make_node("MatMul", ["A", "W_dynamic"], ["Y_dynamic"], name="dynamic_matmul"),
+        ],
+        "streaming-ternary-test",
+        [
+            helper.make_tensor_value_info("A", TensorProto.FLOAT, [2, k]),
+            helper.make_tensor_value_info("W_dynamic", TensorProto.FLOAT, [k, 1]),
+        ],
+        [
+            helper.make_tensor_value_info("Y_ternary", TensorProto.FLOAT, [2, 3]),
+            helper.make_tensor_value_info("Y_dense", TensorProto.FLOAT, [2, 2]),
+            helper.make_tensor_value_info("Y_dynamic", TensorProto.FLOAT, [2, 1]),
+        ],
+        [
+            _external_initializer("W_ternary", ternary, "weights.bin", ternary_offset),
+            _external_initializer("W_dense", dense, "weights.bin", dense_offset),
+        ],
+    )
+    source_model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    source_model.ir_version = min(source_model.ir_version, 10)
+    source_path = external_source / "lm.onnx"
+    onnx.save_model(source_model, str(source_path))
+    original_graph_bytes = source_path.read_bytes()
+    original_data_bytes = external_path.read_bytes()
+
+    output_dir = tmp_path / "output"
+    output_path = output_dir / "lm.onnx"
+    report = quantize_ternary_matmuls_streaming(
+        source_path,
+        output_path,
+        output_external_data="lm.nbits4.onnx.data",
+        expected_matmul_count=1,
+        column_chunk=2,
+    )
+
+    assert source_path.read_bytes() == original_graph_bytes
+    assert external_path.read_bytes() == original_data_bytes
+    assert report["matmul_count"] == 3
+    assert report["transformed_matmul_count"] == 1
+    assert report["transformed_initializer_count"] == 1
+    assert report["non_ternary_initializer_count"] == 1
+    assert report["accidentally_transformed_non_ternary_count"] == 0
+    tensor_report = report["transformed_tensors"][0]
+    assert tensor_report["source_initializer"] == "W_ternary"
+    assert tensor_report["source_shape"] == [k, 3]
+    assert tensor_report["exact_reconstruction"]
+    assert tensor_report["packed_code_bytes"] == 3 * 2 * 64
+    assert tensor_report["scale_bytes"] == 3 * 2 * 4
+    assert tensor_report["zero_point_bytes"] == 3
+
+    rewritten = onnx.load(str(output_path), load_external_data=False)
+    assert [node.op_type for node in rewritten.graph.node] == ["MatMulNBits", "MatMul", "MatMul"]
+    locations = {
+        entry.value
+        for tensor in rewritten.graph.initializer
+        for entry in tensor.external_data
+        if entry.key == "location"
+    }
+    assert locations == {"lm.nbits4.onnx.data"}
+    session = ort.InferenceSession(str(output_path), providers=["CPUExecutionProvider"])
+    rng = np.random.default_rng(72)
+    activation = rng.normal(size=(2, k)).astype(np.float32)
+    dynamic_weight = rng.normal(size=(k, 1)).astype(np.float32)
+    actual = session.run(None, {"A": activation, "W_dynamic": dynamic_weight})
+    np.testing.assert_allclose(actual[0], activation @ ternary, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(actual[1], activation @ dense)
+    np.testing.assert_allclose(actual[2], activation @ dynamic_weight, rtol=1e-6, atol=1e-6)

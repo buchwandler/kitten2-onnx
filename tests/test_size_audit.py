@@ -8,7 +8,7 @@ import torch
 from onnx import TensorProto, helper
 from safetensors.torch import save_file
 
-from scripts.audit_bundle_size import audit_bundle
+from scripts.audit_bundle_size import _graph_size_report, audit_bundle
 from scripts.audit_checkpoint_weights import audit_checkpoint
 
 
@@ -125,3 +125,51 @@ def test_checkpoint_audit_reports_byte_weighted_ternary_fraction(tmp_path):
     assert report["nonternary_parameter_bytes_bf16"] == 8
     assert report["ternary_fraction_by_bytes"] == 512 / 520
     assert report["ternary_tensors"][0]["name"] == "ternary.weight"
+
+
+
+def test_size_audit_reports_matmul_nbits4_storage_by_operand_role(tmp_path):
+    graph_path = tmp_path / "lm.onnx"
+    packed = onnx.numpy_helper.from_array(
+        np.zeros((2, 2, 64), dtype=np.uint8), "packed_codes"
+    )
+    scales = onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), "scales")
+    zero_points = onnx.numpy_helper.from_array(np.full((2,), 0x88, dtype=np.uint8), "zero_points")
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "MatMulNBits",
+                ["A", "packed_codes", "scales", "zero_points"],
+                ["Y"],
+                name="ternary_projection",
+                domain="com.microsoft",
+                K=256,
+                N=2,
+                bits=4,
+                block_size=128,
+                accuracy_level=1,
+            )
+        ],
+        "nbits4-audit",
+        [helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 256])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+        [packed, scales, zero_points],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = min(model.ir_version, 10)
+    onnx.save_model(model, str(graph_path))
+
+    report = _graph_size_report(graph_path)["matmul_nbits4"]
+
+    assert report["node_count"] == 1
+    assert report["initializer_count"] == 3
+    assert report["storage_bytes_by_role"] == {
+        "packed_codes": 256,
+        "scales": 16,
+        "zero_points": 2,
+    }
+    assert report["total_storage_bytes"] == 274
+    assert report["nodes"][0]["node"] == "ternary_projection"

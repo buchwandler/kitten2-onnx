@@ -203,6 +203,24 @@ def _chunked_external_location(
     raise FileExistsError("Could not allocate an unreferenced chunked external-data path")
 
 
+
+
+def _ternary_external_location(
+    lm_model_path: Path,
+    referenced_paths: set[Path],
+) -> tuple[str, Path, list[Path]]:
+    stale_candidates: list[Path] = []
+    for index in range(1000):
+        location = "lm.nbits4.onnx.data" if index == 0 else f"lm.nbits4-{index}.onnx.data"
+        path = _bundle_path(lm_model_path.parent, location)
+        if path in referenced_paths:
+            continue
+        if path.exists():
+            stale_candidates.append(path)
+            continue
+        return location, path, stale_candidates
+    raise FileExistsError("Could not allocate an unreferenced NBits4 external-data path")
+
 def _quantize_lm_chunked(
     bundle_dir: Path,
     bundle: dict[str, Any],
@@ -296,6 +314,96 @@ def _quantize_lm_chunked(
         **transformation,
     }
     lm_meta_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    return metadata["quantization"]
+
+
+def _quantize_lm_ternary_nbits4(
+    bundle_dir: Path,
+    bundle: dict[str, Any],
+) -> dict[str, Any]:
+    import onnx
+    import onnxruntime as ort
+
+    from kitten2_onnx.quantize_ternary_nbits import quantize_ternary_matmuls_streaming
+
+    lm_entry = bundle["lm"]
+    lm_meta_path = _bundle_path(bundle_dir, lm_entry["metadata"])
+    lm_model_path = _bundle_path(bundle_dir, lm_entry["model"])
+    metadata = json.loads(lm_meta_path.read_text(encoding="utf-8"))
+    if metadata.get("runtime_provider") != "CPUExecutionProvider":
+        raise ValueError("Ternary NBits4 LM optimization requires a CPU deployment bundle")
+    if metadata.get("io_dtype") != "float32":
+        raise ValueError("Ternary NBits4 LM optimization currently requires float32 graph I/O")
+
+    source_hash = _sha256(lm_model_path)
+    source_graph = onnx.load(str(lm_model_path), load_external_data=False)
+    source_locations = _all_external_locations(source_graph)
+    source_paths = {
+        _bundle_path(lm_model_path.parent, location) for location in source_locations
+    }
+    source_external_hashes = {
+        location: _sha256(_bundle_path(lm_model_path.parent, location))
+        for location in sorted(source_locations)
+    }
+    referenced_before = _bundle_external_paths(bundle_dir)
+    external_location, external_path, stale_candidates = _ternary_external_location(
+        lm_model_path,
+        referenced_before,
+    )
+    temporary_graph = lm_model_path.with_name(
+        f".lm.nbits4-{uuid.uuid4().hex}.tmp.onnx"
+    )
+
+    try:
+        transformation = quantize_ternary_matmuls_streaming(
+            lm_model_path,
+            temporary_graph,
+            output_external_data=external_location,
+            expected_matmul_count=196,
+        )
+        quantized_graph = onnx.load(str(temporary_graph), load_external_data=False)
+        quantized_locations = _all_external_locations(quantized_graph)
+        for location in quantized_locations:
+            external_file = _bundle_path(lm_model_path.parent, location)
+            if not external_file.is_file():
+                raise FileNotFoundError(f"NBits4 ONNX external data is missing: {external_file}")
+        onnx.checker.check_model(str(temporary_graph))
+        ort.InferenceSession(str(temporary_graph), providers=["CPUExecutionProvider"])
+        os.replace(temporary_graph, lm_model_path)
+    except BaseException:
+        temporary_graph.unlink(missing_ok=True)
+        external_path.unlink(missing_ok=True)
+        raise
+
+    referenced_after = _bundle_external_paths(bundle_dir)
+    stale_paths = (source_paths | set(stale_candidates)) - referenced_after
+    for stale_path in sorted(stale_paths):
+        if stale_path.is_file():
+            stale_path.unlink()
+
+    metadata["external_data"] = bool(quantized_locations)
+    metadata["external_data_files"] = sorted(quantized_locations)
+    metadata["quantization"] = {
+        **transformation,
+        "method": "ternary-nbits4",
+        "backend": "streaming",
+        "bits": 4,
+        "block_size": 128,
+
+        "external_data_files": sorted(quantized_locations),
+        "source_graph_sha256": source_hash,
+        "source_external_data_sha256": source_external_hashes,
+        "graph_sha256": _sha256(lm_model_path),
+        "external_data_sha256": {
+            location: _sha256(_bundle_path(lm_model_path.parent, location))
+            for location in sorted(quantized_locations)
+        },
+    }
+    lm_meta_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     return metadata["quantization"]
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -338,9 +446,9 @@ def optimize_bundle(
     )
     report_root.mkdir(parents=True, exist_ok=True)
     output_root.parent.mkdir(parents=True, exist_ok=True)
-    if lm_method not in ("int8-dynamic", "int8-dynamic-chunked"):
+    if lm_method not in ("int8-dynamic", "int8-dynamic-chunked", "ternary-nbits4"):
         raise ValueError(f"Unsupported LM optimization method: {lm_method!r}")
-    if lm_method == "int8-dynamic" and (exclude_matmul_nodes or exclude_matmul_initializers):
+    if lm_method != "int8-dynamic-chunked" and (exclude_matmul_nodes or exclude_matmul_initializers):
         raise ValueError("MatMul exclusions are supported only by int8-dynamic-chunked")
 
     input_bundle_path = input_root / "bundle.json"
@@ -354,7 +462,7 @@ def optimize_bundle(
 
     if lm_method == "int8-dynamic":
         quantization = _quantize_lm(output_root, bundle)
-    else:
+    elif lm_method == "int8-dynamic-chunked":
         quantization = _quantize_lm_chunked(
             output_root,
             bundle,
@@ -362,6 +470,8 @@ def optimize_bundle(
             exclude_initializers=exclude_matmul_initializers,
             chunk_rows=chunk_rows,
         )
+    else:
+        quantization = _quantize_lm_ternary_nbits4(output_root, bundle)
     export_metadata = bundle.get("export")
     if not isinstance(export_metadata, dict):
         raise TypeError("Bundle export metadata must be an object")
@@ -429,7 +539,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_bundle", type=Path)
     parser.add_argument("output_bundle", type=Path)
-    parser.add_argument("--lm", choices=("int8-dynamic", "int8-dynamic-chunked"), required=True)
+    parser.add_argument("--lm", choices=("int8-dynamic", "int8-dynamic-chunked", "ternary-nbits4"), required=True)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--corpus", type=Path)

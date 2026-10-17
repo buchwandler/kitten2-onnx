@@ -91,6 +91,73 @@ def _tensor_hash(
     return digest.hexdigest()
 
 
+
+
+def _matmul_nbits4_size_report(
+    graph: Any,
+    initializer_details: list[dict[str, Any]],
+) -> dict[str, Any]:
+    initializers = {item["name"]: item for item in initializer_details}
+    roles: dict[str, set[str]] = {
+        "packed_codes": set(),
+        "scales": set(),
+        "zero_points": set(),
+    }
+    nodes = []
+    for node_index, node in enumerate(graph.node):
+        if node.op_type != "MatMulNBits":
+            continue
+        attributes = {
+            attribute.name: onnx.helper.get_attribute_value(attribute)
+            for attribute in node.attribute
+        }
+        if attributes.get("bits") != 4:
+            continue
+        input_names = {
+            "packed_codes": node.input[1] if len(node.input) > 1 else "",
+            "scales": node.input[2] if len(node.input) > 2 else "",
+            "zero_points": node.input[3] if len(node.input) > 3 else "",
+        }
+        for role, name in input_names.items():
+            if name in initializers:
+                roles[role].add(name)
+        nodes.append(
+            {
+                "node": node.name or f"MatMulNBits#{node_index}",
+                "K": attributes.get("K"),
+                "N": attributes.get("N"),
+                "bits": attributes["bits"],
+                "block_size": attributes.get("block_size"),
+                "initializers": input_names,
+            }
+        )
+
+    initializer_roles = {
+        role: [
+            {
+                "name": name,
+                "dtype": initializers[name]["dtype"],
+                "shape": initializers[name]["shape"],
+                "logical_bytes": initializers[name]["logical_bytes"],
+                "storage_bytes": initializers[name]["storage_bytes"],
+            }
+            for name in sorted(names)
+        ]
+        for role, names in roles.items()
+    }
+    storage_bytes_by_role = {
+        role: sum(initializers[name]["storage_bytes"] for name in names)
+        for role, names in roles.items()
+    }
+    all_names = set().union(*roles.values())
+    return {
+        "node_count": len(nodes),
+        "initializer_count": len(all_names),
+        "storage_bytes_by_role": storage_bytes_by_role,
+        "total_storage_bytes": sum(initializers[name]["storage_bytes"] for name in all_names),
+        "initializer_roles": initializer_roles,
+        "nodes": nodes,
+    }
 def _graph_size_report(graph_path: Path) -> dict[str, Any]:
     model = onnx.load(str(graph_path), load_external_data=False)
     graph = model.graph
@@ -168,6 +235,8 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         )[:20],
         "duplicate_initializer_groups": duplicate_groups,
         "node_type_counts": dict(sorted(node_type_counts.items())),
+
+        "matmul_nbits4": _matmul_nbits4_size_report(graph, initializer_details),
         "initializer_consumers": consumer_rows,
     }
 
