@@ -6,14 +6,23 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
+from kitten2_onnx.lm_parity_reference import (
+    canonical_sha256,
+    load_reference_pack,
+    sha256_file,
+    validate_source_identity,
+)
+from kitten2_onnx.nbits_fallback_delta import build_fallback_delta
+from scripts.nbits_worker_process import run_candidate_worker
 from scripts.optimize_bundle import optimize_bundle
 
 _EXACT_CONFIGURATIONS = ((64, 1), (32, 1), (16, 1))
@@ -111,187 +120,6 @@ def _strict_parity(
         }
 
 
-def _diagnose_candidate_parity(
-    candidate_bundle: Path,
-    model_dir: Path,
-    report_path: Path,
-) -> dict[str, Any]:
-    import importlib.util
-    import re
-
-    project_root = Path(__file__).resolve().parents[1]
-    test_path = project_root / "tests/test_real_lm_parity.py"
-    spec = importlib.util.spec_from_file_location("_nbits_real_lm_parity", test_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not load parity test module from {test_path}")
-    test_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(test_module)
-
-    import onnxruntime as runtime
-
-    original_inference_session = runtime.InferenceSession
-    original_assert_outputs = test_module._assert_outputs
-    original_environment = {
-        name: os.environ.get(name)
-        for name in ("KITTEN2_MODEL_DIR", "KITTEN2_ONNX_DIR", "KITTEN2_SPEAKER_ONNX")
-    }
-    os.environ.update(
-        {
-            "KITTEN2_MODEL_DIR": str(model_dir.resolve()),
-            "KITTEN2_ONNX_DIR": str((candidate_bundle / "lm").resolve()),
-            "KITTEN2_SPEAKER_ONNX": str(
-                (candidate_bundle / "speaker/speaker.onnx").resolve()
-            ),
-        }
-    )
-    output_failures = []
-    comparison_count = 0
-    runtime_ms = 0.0
-    runtime_calls = 0
-    original_run = time.perf_counter
-
-    class TimedSession:
-        def __init__(self, *args, **kwargs):
-            self._session = original_inference_session(*args, **kwargs)
-
-        def run(self, *args, **kwargs):
-            nonlocal runtime_ms, runtime_calls
-            started = original_run()
-            result = self._session.run(*args, **kwargs)
-            runtime_ms += (original_run() - started) * 1000.0
-            runtime_calls += 1
-            return result
-
-        def __getattr__(self, name):
-            return getattr(self._session, name)
-
-    def timed_session(*args, **kwargs):
-        return TimedSession(*args, **kwargs)
-
-    class DiagnosticMonkeyPatch:
-        @staticmethod
-        def setattr(target, name, value):
-            setattr(target, name, value)
-
-    def flatten_cache(cache):
-        if hasattr(cache, "to_legacy_cache"):
-            cache = cache.to_legacy_cache()
-        return [tensor for layer in cache for tensor in layer]
-
-    def compare_output(name, actual, expected, *, atol, rtol, phase):
-        nonlocal comparison_count
-        comparison_count += 1
-        actual_array = np.asarray(actual)
-        expected_array = (
-            expected.detach().cpu().numpy() if hasattr(expected, "detach") else np.asarray(expected)
-        )
-        if actual_array.shape != expected_array.shape:
-            output_failures.append(
-                {
-                    "phase": phase,
-                    "output": name,
-                    "shape_mismatch": True,
-                    "actual_shape": list(actual_array.shape),
-                    "expected_shape": list(expected_array.shape),
-                    "outside_tolerance_count": max(actual_array.size, expected_array.size),
-                    "max_normalized_tolerance_violation": float("inf"),
-                    "max_absolute_error": float("inf"),
-                }
-            )
-            return
-        difference = np.abs(actual_array.astype(np.float64) - expected_array.astype(np.float64))
-        allowed = atol + rtol * np.abs(expected_array.astype(np.float64))
-        outside = difference > allowed
-        outside_count = int(np.count_nonzero(outside))
-        if outside_count:
-            output_failures.append(
-                {
-                    "phase": phase,
-                    "output": name,
-                    "shape": list(actual_array.shape),
-                    "outside_tolerance_count": outside_count,
-                    "output_element_count": int(actual_array.size),
-                    "max_normalized_tolerance_violation": float(np.max(difference / allowed)),
-                    "max_absolute_error": float(np.max(difference)),
-                }
-            )
-
-    call_index = 0
-
-    def collect_outputs(actual, expected_logits, expected_cache):
-        nonlocal call_index
-        phase = "prefill" if call_index == 0 else f"decode_step_{call_index - 1}"
-        compare_output("logits", actual[0], expected_logits, atol=2e-4, rtol=1e-4, phase=phase)
-        expected = flatten_cache(expected_cache)
-        for index, (actual_tensor, expected_tensor) in enumerate(
-            zip(actual[1:], expected, strict=True)
-        ):
-            kind = "key" if index % 2 == 0 else "value"
-            compare_output(
-                f"cache[{index // 2}].{kind}",
-                actual_tensor,
-                expected_tensor,
-                atol=2e-3,
-                rtol=1e-4,
-                phase=phase,
-            )
-        call_index += 1
-
-    test_module._assert_outputs = collect_outputs
-    runtime.InferenceSession = timed_session
-    started = time.perf_counter()
-    failure = None
-    test_completed = False
-    try:
-        test_module.test_real_bruno_prompt_injection_and_32_step_lm_parity(
-            DiagnosticMonkeyPatch()
-        )
-        test_completed = True
-    except AssertionError as error:
-        failure = str(error)
-    finally:
-        test_module._assert_outputs = original_assert_outputs
-        runtime.InferenceSession = original_inference_session
-        for name, value in original_environment.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-
-    token_match = re.search(r"generated token (\d+)", failure or "")
-    token_divergence_steps = [int(token_match.group(1))] if token_match else []
-    failed_output_tensors = len(output_failures)
-    total_values_outside_tolerance = sum(
-        row["outside_tolerance_count"] for row in output_failures
-    )
-    max_normalized = max(
-        (row["max_normalized_tolerance_violation"] for row in output_failures), default=0.0
-    )
-    max_absolute = max((row["max_absolute_error"] for row in output_failures), default=0.0)
-    report = {
-        "diagnostic_only": True,
-        "strict_acceptance_test": "tests/test_real_lm_parity.py",
-        "test_completed": test_completed,
-        "failure": failure[:2000] if failure else None,
-        "comparison_count": comparison_count,
-        "failed_output_tensors": failed_output_tensors,
-        "total_values_outside_tolerance": total_values_outside_tolerance,
-        "max_normalized_tolerance_violation": max_normalized,
-        "max_absolute_error": max_absolute,
-        "token_divergence_steps": token_divergence_steps,
-        "diagnostic_score": [
-            failed_output_tensors + len(token_divergence_steps),
-            total_values_outside_tolerance,
-            max_normalized,
-            max_absolute,
-        ],
-        "onnx_runtime_calls": runtime_calls,
-        "onnx_runtime_total_ms": runtime_ms,
-        "elapsed_seconds": time.perf_counter() - started,
-        "output_failures": output_failures,
-    }
-    _write_json(report_path, report)
-    return report
 
 
 def _load_inputs(
@@ -598,28 +426,664 @@ def _diagnostic_score(result: dict[str, Any]) -> tuple[int, int, float, float]:
     return int(score[0]), int(score[1]), float(score[2]), float(score[3])
 
 
-class FallbackCandidateLimitReached(RuntimeError):
-    pass
+DIAGNOSTIC_VERSION = 2
+ZERO_DIAGNOSTIC_SCORE = (0, 0, 0.0, 0.0)
+_RETRYABLE_WORKER_STATUSES = {"worker_failed"}
+_STOP_WORKER_STATUSES = {"worker_oom_guard", "disk_budget_exceeded", "worker_timeout"}
 
 
-def _diagnostic_summary(result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: result[key]
-        for key in (
-            "test_completed",
-            "failure",
-            "comparison_count",
-            "failed_output_tensors",
-            "total_values_outside_tolerance",
-            "max_normalized_tolerance_violation",
-            "max_absolute_error",
-            "token_divergence_steps",
-            "diagnostic_score",
-            "onnx_runtime_calls",
-            "onnx_runtime_total_ms",
-            "elapsed_seconds",
-        )
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def delta_candidate_key(identity: dict[str, Any], excluded_nodes: list[str] | tuple[str, ...]) -> str:
+    payload = {
+        "identity": identity,
+        "excluded_nodes": sorted(set(excluded_nodes)),
     }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def import_legacy_cache(
+    legacy_path: str | Path,
+    *,
+    baseline_bundle_files: dict[str, str],
+    inventory_sha256: str,
+) -> dict[str, Any]:
+    path = Path(legacy_path)
+    if not path.is_file():
+        return {"source": str(path), "status": "missing", "rows": []}
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        record.get("baseline_bundle_files") != baseline_bundle_files
+        or record.get("inventory_sha256") != inventory_sha256
+    ):
+        return {"source": str(path), "status": "identity_mismatch", "rows": []}
+    rows = []
+    for row in record.get("cache", {}).values():
+        diagnostic = row.get("diagnostic") or {}
+        score = row.get("diagnostic_score") or diagnostic.get("diagnostic_score")
+        excluded = sorted(set(row.get("excluded_nodes", [])))
+        if not isinstance(score, list) or len(score) != 4:
+            continue
+        rows.append(
+            {
+                "legacy_candidate_key": row.get("candidate_key"),
+                "excluded_nodes": excluded,
+                "semantic_label": row.get("semantic_label"),
+                "diagnostic_score": score,
+                "bundle_bytes": row.get("bundle_bytes"),
+                "fallback_count": row.get("fallback_storage", {}).get(
+                    "fallback_initializer_count"
+                ),
+                "status": row.get("status"),
+                "artifact_state": row.get("artifact_state"),
+                "reusable": False,
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            _diagnostic_score(row),
+            row.get("bundle_bytes") or float("inf"),
+            row["legacy_candidate_key"] or "",
+        )
+    )
+    return {
+        "source": str(path),
+        "status": "imported",
+        "row_count": len(rows),
+        "reusable_count": 0,
+        "rows": rows,
+        "group_evaluations": record.get("group_evaluations", []),
+    }
+
+
+def _legacy_seed_sets(legacy_import: dict[str, Any], width: int) -> list[list[str]]:
+    seeds = []
+    seen: set[tuple[str, ...]] = set()
+    for row in legacy_import.get("rows", []):
+        nodes = tuple(sorted(set(row.get("excluded_nodes", []))))
+        if not nodes or nodes in seen:
+            continue
+        seeds.append(list(nodes))
+        seen.add(nodes)
+        if len(seeds) == width:
+            break
+    return seeds
+
+
+def _frontier_objective(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (*_diagnostic_score(row), int(row.get("bundle_bytes_estimate", 0)), row["candidate_key"])
+
+
+def bounded_frontier(rows: list[dict[str, Any]], width: int) -> list[dict[str, Any]]:
+    eligible = [
+        row
+        for row in rows
+        if row.get("diagnostic_score") is not None
+        and row.get("status") in {"diagnostic_complete", "strict_parity_passed"}
+    ]
+    return sorted(eligible, key=_frontier_objective)[:width]
+
+
+def beam_expansions(
+    frontier: list[dict[str, Any]],
+    ranked_nodes: list[str],
+    *,
+    branch_factor: int = 2,
+) -> list[list[str]]:
+    expansions: dict[tuple[str, ...], None] = {}
+    for state in frontier:
+        existing = set(state["excluded_nodes"])
+        additions = 0
+        for node in ranked_nodes:
+            if node in existing:
+                continue
+            nodes = tuple(sorted(existing | {node}))
+            expansions[nodes] = None
+            additions += 1
+            if additions == branch_factor:
+                break
+    return [list(nodes) for nodes in sorted(expansions)]
+
+
+def _known_parent_mismatch(row: dict[str, Any]) -> bool:
+    divergence = row.get("first_divergence") or {}
+    return (
+        divergence.get("phase") == "prefill"
+        and divergence.get("output") == "cache[24].value"
+        and divergence.get("outside_tolerance_count") == 2
+    )
+
+
+class BoundedDeltaEvaluator:
+    """Result-only cache with an absolute attempt budget and bounded retries."""
+
+    def __init__(
+        self,
+        identity: dict[str, Any],
+        cache: dict[str, dict[str, Any]],
+        *,
+        max_evaluations: int,
+        max_retries: int,
+        evaluate_one: Callable[[list[str], str], dict[str, Any]],
+        on_update: Callable[[dict[str, dict[str, Any]], int], None],
+        evaluation_count: int = 0,
+    ) -> None:
+        if max_evaluations <= 0 or max_retries < 0:
+            raise ValueError("Evaluation budget must be positive and retries nonnegative")
+        self.identity = identity
+        self.cache = cache
+        self.max_evaluations = max_evaluations
+        self.max_retries = max_retries
+        self.evaluate_one = evaluate_one
+        self.on_update = on_update
+        self.evaluation_count = evaluation_count
+        self.stop_condition: dict[str, Any] | None = None
+
+    def evaluate(self, excluded_nodes: list[str] | tuple[str, ...], label: str) -> dict[str, Any] | None:
+        nodes = sorted(set(excluded_nodes))
+        key = delta_candidate_key(self.identity, nodes)
+        row = self.cache.get(key)
+        if row and row.get("status") in {"diagnostic_complete", "strict_parity_passed", "strict_parity_failed", "strict_parity_worker_failed"}:
+            return row
+        if row is None:
+            row = {
+                "candidate_key": key,
+                "excluded_nodes": nodes,
+                "semantic_label": label,
+                "status": "not_started",
+                "attempts": 0,
+            }
+            self.cache[key] = row
+        elif label and not row.get("semantic_label"):
+            row["semantic_label"] = label
+
+        for attempt in range(self.max_retries + 1):
+            if self.evaluation_count >= self.max_evaluations:
+                self.stop_condition = {
+                    "reason": "evaluation_budget_exhausted",
+                    "max_evaluations": self.max_evaluations,
+                }
+                self.on_update(self.cache, self.evaluation_count)
+                return None
+            self.evaluation_count += 1
+            row["attempts"] = int(row.get("attempts", 0)) + 1
+            row["status"] = "evaluation_started"
+            try:
+                result = self.evaluate_one(nodes, label)
+            except (OSError, RuntimeError, ValueError, KeyError, AssertionError) as error:
+                result = {
+                    "status": "delta_build_failed",
+                    "error": f"{type(error).__name__}: {error}",
+                }
+            row.update(result)
+            row["candidate_key"] = key
+            row["excluded_nodes"] = nodes
+            row["semantic_label"] = label
+            row["attempts"] = int(row.get("attempts", 1))
+            row["status"] = result.get("status", "worker_failed")
+            self.on_update(self.cache, self.evaluation_count)
+            if row["status"] in _STOP_WORKER_STATUSES:
+                self.stop_condition = {
+                    "reason": row["status"],
+                    "candidate_key": key,
+                    "attempt": row["attempts"],
+                }
+                return row
+            if row["status"] not in _RETRYABLE_WORKER_STATUSES or attempt == self.max_retries:
+                return row
+        return row
+
+
+def _evaluate_delta_worker(
+    parent_model: Path,
+    baseline_model: Path,
+    inventory_path: Path,
+    inventory: dict[str, Any],
+    reference_path: Path,
+    reference_identity_sha256: str,
+    scratch_root: Path,
+    reports_root: Path,
+    parent_bundle_bytes: int,
+    *,
+    max_worker_rss_gib: float,
+    max_search_disk_gib: float,
+    worker_timeout_seconds: float,
+) -> Callable[[list[str], str], dict[str, Any]]:
+    scratch_root.mkdir(parents=True, exist_ok=True)
+
+    def evaluate_one(nodes: list[str], label: str) -> dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="delta-", dir=scratch_root) as temporary:
+            work = Path(temporary)
+            model_path = work / "lm.onnx"
+            fallback_data = work / "fallback.data"
+            result_path = work / "worker.json"
+            delta = build_fallback_delta(
+                parent_model,
+                baseline_model,
+                inventory,
+                set(nodes),
+                model_path,
+                fallback_data,
+            )
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve().with_name("evaluate_nbits_candidate.py")),
+                "--model",
+                str(model_path),
+                "--reference",
+                str(reference_path),
+                "--output",
+                str(result_path),
+                "--expected-source-identity-sha256",
+                reference_identity_sha256,
+            ]
+            result = run_candidate_worker(
+                command,
+                output_path=result_path,
+                search_root=reports_root,
+                max_worker_rss_gib=max_worker_rss_gib,
+                max_search_disk_gib=max_search_disk_gib,
+                timeout_seconds=worker_timeout_seconds,
+                scratch_dir=work,
+                model_path=model_path,
+                fallback_data_path=fallback_data,
+                cwd=Path(__file__).resolve().parents[1],
+            )
+            return {
+                "status": result.get("status", "worker_failed"),
+                "diagnostic_score": result.get("diagnostic_score"),
+                "first_divergence": result.get("first_divergence"),
+                "diagnostic": result.get("diagnostic"),
+                "fallback_storage": delta.fallback_storage,
+                "bundle_bytes_estimate": parent_bundle_bytes
+                + int(delta.fallback_storage["net_bundle_byte_cost"]),
+                "model_sha256": result.get("model_sha256"),
+                "peak_rss_bytes": result.get("peak_rss_bytes"),
+                "scratch_bytes_peak": result.get("scratch_bytes_peak"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+                "worker_exit_code": result.get("worker_exit_code"),
+                "worker_signal": result.get("worker_signal"),
+                "worker_output_tail": result.get("worker_output_tail"),
+                "fallback_data_bytes": result.get("fallback_data_bytes"),
+                "semantic_label": label,
+            }
+
+    return evaluate_one
+
+
+def _run_sensitivity_worker(
+    parent_model: Path,
+    baseline_model: Path,
+    inventory_path: Path,
+    reference_path: Path,
+    identity: dict[str, Any],
+    reports_root: Path,
+    *,
+    max_worker_rss_gib: float,
+    max_search_disk_gib: float,
+    worker_timeout_seconds: float,
+) -> dict[str, Any]:
+    identity_hash = canonical_sha256(identity)
+    result_path = reports_root / "fallback" / f"sensitivity-{identity_hash[:16]}.json"
+    if result_path.is_file():
+        cached = json.loads(result_path.read_text(encoding="utf-8"))
+        if (
+            cached.get("status") == "sensitivity_complete"
+            and cached.get("parent_graph_sha256") == identity["parent_graph_sha256"]
+            and cached.get("reference_pack_sha256") == identity["reference_pack_sha256"]
+            and cached.get("baseline_graph_sha256") == identity["baseline_graph_sha256"]
+        ):
+            return cached
+
+    scratch_root = reports_root / "fallback" / ".scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="sensitivity-", dir=scratch_root) as temporary:
+        work = Path(temporary)
+        instrumented_path = work / "instrumented.onnx"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve().with_name("measure_nbits_sensitivity.py")),
+            "--parent-model",
+            str(parent_model),
+            "--baseline-model",
+            str(baseline_model),
+            "--inventory",
+            str(inventory_path),
+            "--reference",
+            str(reference_path),
+            "--instrumented-model",
+            str(instrumented_path),
+            "--output",
+            str(result_path),
+        ]
+        return run_candidate_worker(
+            command,
+            output_path=result_path,
+            search_root=reports_root,
+            max_worker_rss_gib=max_worker_rss_gib,
+            max_search_disk_gib=max_search_disk_gib,
+            timeout_seconds=worker_timeout_seconds,
+            scratch_dir=work,
+            model_path=parent_model,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+
+
+def _link_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() or destination.is_symlink():
+        if destination.is_file() and os.path.samefile(source, destination):
+            return
+        raise FileExistsError(f"Candidate support file already exists: {destination}")
+    os.link(source, destination)
+
+
+def _run_delta_strict_parity(
+    excluded_nodes: list[str],
+    parent_bundle: Path,
+    parent_model: Path,
+    baseline_model: Path,
+    inventory: dict[str, Any],
+    model_dir: Path,
+    reports_root: Path,
+    *,
+    max_worker_rss_gib: float,
+    max_search_disk_gib: float,
+    worker_timeout_seconds: float,
+) -> dict[str, Any]:
+    scratch_root = reports_root / "fallback" / ".scratch"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="strict-delta-", dir=scratch_root) as temporary:
+        work = Path(temporary)
+        lm_dir = work / "lm"
+        model_path = lm_dir / "lm.onnx"
+        fallback_data = lm_dir / "fallback.data"
+        delta = build_fallback_delta(
+            parent_model,
+            baseline_model,
+            inventory,
+            set(excluded_nodes),
+            model_path,
+            fallback_data,
+        )
+        parent_lm = parent_bundle / "lm"
+        metadata = json.loads((parent_lm / "lm.meta.json").read_text(encoding="utf-8"))
+        metadata["external_data_files"] = sorted(
+            set(metadata.get("external_data_files", [])) | {fallback_data.name}
+        )
+        (lm_dir / "lm.meta.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        _link_file(parent_lm / metadata["embedding_file"], lm_dir / metadata["embedding_file"])
+        speaker_model = work / "speaker" / "speaker.onnx"
+        _link_file(parent_bundle / "speaker" / "speaker.onnx", speaker_model)
+        result_path = work / "strict.json"
+        log_path = work / "strict.log"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve().with_name("nbits_search_worker.py")),
+            "strict-parity",
+            "--model-dir",
+            str(model_dir),
+            "--lm-dir",
+            str(lm_dir),
+            "--speaker-model",
+            str(speaker_model),
+            "--output",
+            str(result_path),
+            "--log",
+            str(log_path),
+        ]
+        result = run_candidate_worker(
+            command,
+            output_path=result_path,
+            search_root=reports_root,
+            max_worker_rss_gib=max_worker_rss_gib,
+            max_search_disk_gib=max_search_disk_gib,
+            timeout_seconds=worker_timeout_seconds,
+            scratch_dir=work,
+            model_path=model_path,
+            fallback_data_path=fallback_data,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+        result["delta_manifest"] = delta.manifest_path.name
+        return result
+
+
+def finalist_eligible(row: dict[str, Any], size_budget_bytes: int) -> bool:
+    return (
+        tuple(_diagnostic_score(row)) == ZERO_DIAGNOSTIC_SCORE
+        and row.get("strict_delta_parity", {}).get("status") == "passed"
+        and int(row.get("bundle_bytes_estimate", 0)) <= size_budget_bytes
+    )
+
+
+def _strict_result_status(result: dict[str, Any]) -> str:
+    if result.get("status") == "passed":
+        return "strict_parity_passed"
+    if result.get("status") == "failed":
+        return "strict_parity_failed"
+    return "strict_parity_worker_failed"
+
+
+def _promote_finalist(
+    row: dict[str, Any],
+    baseline_bundle: Path,
+    output_root: Path,
+    reports_root: Path,
+    model_dir: Path,
+    *,
+    max_worker_rss_gib: float,
+    size_budget_bytes: int,
+    max_search_disk_gib: float,
+    worker_timeout_seconds: float,
+) -> dict[str, Any]:
+    if not finalist_eligible(row, size_budget_bytes):
+        raise ValueError("Finalist must have zero diagnostic score, strict parity pass, and fit the size budget")
+    candidate_id = row["candidate_key"][:12]
+    output_bundle = output_root / f"b4-bs64-a1-finalist-{candidate_id}"
+    report_dir = reports_root / "fallback" / f"finalist-{candidate_id}"
+    if output_bundle.exists():
+        raise FileExistsError(f"Finalist path already exists without a resumable record: {output_bundle}")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    result_path = report_dir / "materialization.json"
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve().with_name("nbits_search_worker.py")),
+        "build-finalist",
+        "--input-bundle",
+        str(baseline_bundle),
+        "--output-bundle",
+        str(output_bundle),
+        "--report-dir",
+        str(report_dir),
+        "--model-dir",
+        str(model_dir),
+        "--output",
+        str(result_path),
+    ]
+    for node in row["excluded_nodes"]:
+        command.extend(["--exclude-node", node])
+    build_result = run_candidate_worker(
+        command,
+        output_path=result_path,
+        search_root=output_root,
+        max_worker_rss_gib=max_worker_rss_gib,
+        max_search_disk_gib=max_search_disk_gib,
+        timeout_seconds=worker_timeout_seconds,
+        scratch_dir=output_bundle,
+        model_path=output_bundle / "lm" / "lm.onnx",
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    if build_result.get("status") != "materialized":
+        shutil.rmtree(output_bundle, ignore_errors=True)
+        return {"status": build_result.get("status", "materialization_failed"), "build": build_result}
+
+    strict_path = report_dir / "strict-final.json"
+    strict_log = report_dir / "strict-final.log"
+    strict_command = [
+        sys.executable,
+        str(Path(__file__).resolve().with_name("nbits_search_worker.py")),
+        "strict-parity",
+        "--model-dir",
+        str(model_dir),
+        "--lm-dir",
+        str(output_bundle / "lm"),
+        "--speaker-model",
+        str(output_bundle / "speaker" / "speaker.onnx"),
+        "--output",
+        str(strict_path),
+        "--log",
+        str(strict_log),
+    ]
+    strict_result = run_candidate_worker(
+        strict_command,
+        output_path=strict_path,
+        search_root=output_root,
+        max_worker_rss_gib=max_worker_rss_gib,
+        max_search_disk_gib=max_search_disk_gib,
+        timeout_seconds=worker_timeout_seconds,
+        scratch_dir=output_bundle,
+        model_path=output_bundle / "lm" / "lm.onnx",
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    return {
+        "status": "release_gates_passed"
+        if strict_result.get("status") == "passed"
+        else "final_strict_parity_failed",
+        "output_bundle": str(output_bundle),
+        "report_dir": str(report_dir),
+        "build": build_result,
+        "strict_parity": strict_result,
+    }
+
+
+def _run_beam_search(
+    evaluator: BoundedDeltaEvaluator,
+    seed_sets: list[list[str]],
+    ranked_nodes: list[str],
+    *,
+    beam_width: int,
+    strict_check: Callable[[dict[str, Any]], dict[str, Any]],
+    max_depth: int = 8,
+) -> dict[str, Any] | None:
+    evaluated: dict[str, dict[str, Any]] = {}
+    passing: dict[str, Any] | None = None
+
+    def check(row: dict[str, Any] | None) -> None:
+        nonlocal passing
+        if row is None or row.get("diagnostic_score") is None:
+            return
+        evaluated[row["candidate_key"]] = row
+        if row.get("status") == "strict_parity_passed":
+            passing = row
+            return
+        if row.get("strict_delta_parity") is not None:
+            if row.get("status") == "strict_parity_worker_failed":
+                strict = strict_check(row)
+                row["strict_delta_parity"] = strict
+                row["status"] = _strict_result_status(strict)
+                evaluator.on_update(evaluator.cache, evaluator.evaluation_count)
+                if row["status"] == "strict_parity_passed":
+                    passing = row
+            return
+        if tuple(_diagnostic_score(row)) != ZERO_DIAGNOSTIC_SCORE:
+            return
+        strict = strict_check(row)
+        row["strict_delta_parity"] = strict
+        row["status"] = _strict_result_status(strict)
+        evaluator.on_update(evaluator.cache, evaluator.evaluation_count)
+        if row["status"] == "strict_parity_passed":
+            passing = row
+
+    initial = []
+    seen: set[tuple[str, ...]] = set()
+    for nodes in [*seed_sets, *([node] for node in ranked_nodes[:beam_width])]:
+        normalized = tuple(sorted(set(nodes)))
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            initial.append(list(normalized))
+    for nodes in initial:
+        check(evaluator.evaluate(nodes, "legacy-seed" if nodes in seed_sets else "sensitivity-singleton"))
+        if passing or evaluator.stop_condition:
+            break
+
+    frontier = bounded_frontier(list(evaluated.values()), beam_width)
+    for depth in range(max_depth):
+        if passing or evaluator.stop_condition or not frontier:
+            break
+        level_rows = []
+        for nodes in beam_expansions(frontier, ranked_nodes):
+            row = evaluator.evaluate(nodes, f"beam-depth-{depth + 1}")
+            check(row)
+            if row is not None and row.get("diagnostic_score") is not None:
+                level_rows.append(row)
+            if passing or evaluator.stop_condition:
+                break
+        frontier = bounded_frontier(level_rows, beam_width)
+
+    if passing is None:
+        return None
+
+    current = passing
+    current_nodes = set(current["excluded_nodes"])
+    changed = True
+    while changed and not evaluator.stop_condition:
+        changed = False
+        for node in sorted(current_nodes):
+            trial_nodes = sorted(current_nodes - {node})
+            trial = evaluator.evaluate(trial_nodes, "minimize-remove-one-node")
+            if trial is None or trial.get("diagnostic_score") is None:
+                if evaluator.stop_condition:
+                    break
+                continue
+            if tuple(_diagnostic_score(trial)) == ZERO_DIAGNOSTIC_SCORE:
+                if trial.get("strict_delta_parity") is None:
+                    strict = strict_check(trial)
+                    trial["strict_delta_parity"] = strict
+                    trial["status"] = _strict_result_status(strict)
+                    evaluator.on_update(evaluator.cache, evaluator.evaluation_count)
+                if trial.get("status") == "strict_parity_passed":
+                    current = trial
+                    current_nodes = set(trial_nodes)
+                    changed = True
+                    break
+        if evaluator.stop_condition:
+            break
+    return current
+
+
+def _run_strict_delta_worker(
+    row: dict[str, Any],
+    parent_bundle: Path,
+    parent_model: Path,
+    baseline_model: Path,
+    inventory: dict[str, Any],
+    model_dir: Path,
+    reports_root: Path,
+    *,
+    max_worker_rss_gib: float,
+    max_search_disk_gib: float,
+    worker_timeout_seconds: float,
+) -> dict[str, Any]:
+    return _run_delta_strict_parity(
+        row["excluded_nodes"],
+        parent_bundle,
+        parent_model,
+        baseline_model,
+        inventory,
+        model_dir,
+        reports_root,
+        max_worker_rss_gib=max_worker_rss_gib,
+        max_search_disk_gib=max_search_disk_gib,
+        worker_timeout_seconds=worker_timeout_seconds,
+    )
 
 
 def run_fallback_search(
@@ -629,15 +1093,25 @@ def run_fallback_search(
     output_root: str | Path,
     reports_root: str | Path,
     *,
-    kernel_diagnostic_path: str | Path,
-    max_fallback_candidates: int = 140,
+    kernel_diagnostic_path: str | Path | None = None,
+    reference_path: str | Path = "build/reports/nbits-reference",
+    fixture_path: str | Path = "tests/fixtures/reference_bruno.npz",
+    max_fallback_candidates: int = 30,
+    beam_width: int = 4,
+    max_worker_rss_gib: float = 14.0,
+    max_search_disk_gib: float = 30.0,
+    worker_timeout_seconds: float = 5400.0,
+    max_worker_retries: int = 1,
 ) -> dict[str, Any]:
     baseline = Path(baseline_bundle).resolve()
     model = Path(model_dir).resolve()
     inventory_file = Path(inventory_path).resolve()
     output = Path(output_root).resolve()
     reports = Path(reports_root).resolve()
-    kernel_report = json.loads(Path(kernel_diagnostic_path).read_text(encoding="utf-8"))
+    reference_root = Path(reference_path).resolve()
+    fixture = Path(fixture_path).resolve()
+    if max_fallback_candidates <= 0 or beam_width <= 0 or max_worker_retries < 0:
+        raise ValueError("Evaluation budget and beam width must be positive, retries nonnegative")
     bundle, inventory = _load_inputs(baseline, inventory_file)
     exact_results_path = reports / "results.json"
     exact_results = json.loads(exact_results_path.read_text(encoding="utf-8"))
@@ -651,505 +1125,260 @@ def run_fallback_search(
         exact_results["decision"] != "all_exact_candidates_failed_strict_parity"
         and "fallback_search" not in exact_results
     ):
-        raise ValueError("Fallback search requires the exact sweep decision")
-    if max_fallback_candidates <= 0:
-        raise ValueError("max_fallback_candidates must be positive")
+        raise ValueError("Fallback search requires the completed exact-sweep failure decision")
 
-    candidates_by_block = {
-        row["configuration"]["block_size"]: row for row in exact_results["candidates"]
-    }
-    kernel_scores = {}
-    for block_size, candidate in candidates_by_block.items():
-        if candidate["strict_parity"]["status"] != "failed":
-            raise ValueError(f"Exact candidate {candidate['name']} has no strict parity failure")
-        comparisons = [
-            row
-            for row in kernel_report["results"]
-            if row["block_size"] == block_size and row["accuracy_level"] == 1
-        ]
-        if not comparisons:
-            raise ValueError(f"Kernel diagnostic has no level-1 results for block {block_size}")
-        kernel_scores[block_size] = {
-            "failed_operator_cases": sum(
-                row["outside_tolerance_count"] > 0 for row in comparisons
-            ),
-            "total_values_outside_tolerance": sum(
-                row["outside_tolerance_count"] for row in comparisons
-            ),
-            "max_relative_difference": max(
-                row["max_relative_difference"] for row in comparisons
-            ),
-            "max_absolute_difference": max(
-                row["max_absolute_difference"] for row in comparisons
-            ),
-        }
-    selected_block = min(
-        candidates_by_block,
-        key=lambda block: (
-            kernel_scores[block]["failed_operator_cases"],
-            kernel_scores[block]["total_values_outside_tolerance"],
-            kernel_scores[block]["max_relative_difference"],
-            kernel_scores[block]["max_absolute_difference"],
-            candidates_by_block[block]["bundle_bytes"],
+    parent = next(
+        (
+            candidate
+            for candidate in exact_candidates
+            if candidate["configuration"]["block_size"] == 64
+            and candidate["configuration"]["accuracy_level"] == 1
         ),
+        None,
     )
-    parent = candidates_by_block[selected_block]
-    configuration = parent["configuration"]
-    parent_bundle = Path(parent["bundle"])
-    parent_reports = Path(parent["reports"])
-    parent_diagnostic_path = parent_reports / "diagnostic-parity.json"
-    if parent_diagnostic_path.is_file():
-        parent_diagnostic = json.loads(parent_diagnostic_path.read_text(encoding="utf-8"))
-    else:
-        parent_diagnostic = _diagnose_candidate_parity(
-            parent_bundle, model, parent_diagnostic_path
-        )
-    parent["parity_diagnostic"] = _diagnostic_summary(parent_diagnostic)
-    _write_json(parent_reports / "search-result.json", parent)
-    _write_json(exact_results_path, exact_results)
-    parent_key = candidate_key(
-        bundle["files"], inventory["inventory_sha256"], configuration, ()
-    )
-    parent_result = {
-        "name": parent["name"],
-        "candidate_key": parent_key,
-        "configuration": configuration,
-        "excluded_nodes": [],
-        "status": "strict_parity_failed",
-        "bundle": str(parent_bundle),
-        "bundle_bytes": parent["bundle_bytes"],
-        "fallback_storage": parent["quantization"]["fallback_storage"],
-        "diagnostic": _diagnostic_summary(parent_diagnostic),
-        "diagnostic_score": parent_diagnostic["diagnostic_score"],
-        "strict_parity": parent["strict_parity"],
+    if parent is None:
+        raise ValueError("The required immutable block-64 exact NBits parent is missing")
+    parent_bundle = Path(parent["bundle"]).resolve()
+    parent_model = parent_bundle / "lm" / "lm.onnx"
+    baseline_model = baseline / "lm" / "lm.onnx"
+    if not parent_model.is_file():
+        raise FileNotFoundError(parent_model)
+
+    reference = load_reference_pack(reference_root)
+    if not reference.metadata.get("trusted"):
+        raise ValueError("Fallback search requires an accepted trusted parity reference")
+    validate_source_identity(reference, model, baseline, fixture)
+    reference_identity_sha256 = canonical_sha256(reference.metadata["source_identity"])
+    parent_graph_sha256 = parent.get("candidate_lm_graph_sha256") or sha256_file(parent_model)
+    parent_external = parent.get("candidate_lm_external_data", {})
+    if not parent_external:
+        parent_manifest = json.loads((parent_bundle / "bundle.json").read_text(encoding="utf-8"))
+        parent_external = {
+            name: digest
+            for name, digest in parent_manifest["files"].items()
+            if name.startswith("lm/") and name.endswith(".onnx.data")
+        }
+    identity = {
+        "diagnostic_version": DIAGNOSTIC_VERSION,
+        "diagnostic_format": "kitten2-onnx-nbits-candidate-diagnostic-v1",
+        "reference_pack_sha256": reference.metadata["pack_sha256"],
+        "reference_source_identity_sha256": reference_identity_sha256,
+        "parent_graph_sha256": parent_graph_sha256,
+        "parent_external_data_sha256": dict(sorted(parent_external.items())),
+        "baseline_graph_sha256": inventory["source_graph_sha256"],
+        "inventory_sha256": inventory["inventory_sha256"],
     }
-    fallback_output = output / "fallback"
+    identity_hash = canonical_sha256(identity)
     fallback_reports = reports / "fallback"
-    if fallback_output.exists() != fallback_reports.exists():
-        raise FileExistsError("Fallback output and report roots must either both exist or both be new")
-    fallback_results_path = fallback_reports / "results.json"
-    if fallback_output.exists():
-        if not fallback_results_path.is_file():
-            raise FileExistsError(f"Existing fallback reports have no cache: {fallback_results_path}")
-        search_record = json.loads(fallback_results_path.read_text(encoding="utf-8"))
-        if (
-            search_record["inventory_sha256"] != inventory["inventory_sha256"]
-            or search_record["baseline_bundle_files"] != bundle["files"]
-        ):
-            raise ValueError("Existing fallback cache belongs to a different source or inventory")
-        cache = search_record["cache"]
-        group_evaluations = search_record["group_evaluations"]
+    fallback_reports.mkdir(parents=True, exist_ok=True)
+    legacy_import = import_legacy_cache(
+        fallback_reports / "results.json",
+        baseline_bundle_files=bundle["files"],
+        inventory_sha256=inventory["inventory_sha256"],
+    )
+    result_path = fallback_reports / f"delta-search-{identity_hash[:16]}.json"
+    if result_path.is_file():
+        search_record = json.loads(result_path.read_text(encoding="utf-8"))
+        if search_record.get("cache_identity") != identity:
+            raise ValueError("Existing delta-search result has a different diagnostic cache identity")
+        cache = search_record.get("evaluations", {})
+        legacy_import = search_record.get("legacy_import", legacy_import)
     else:
-        fallback_output.mkdir(parents=True)
-        fallback_reports.mkdir(parents=True)
-        cache = {parent_key: parent_result}
-        group_evaluations = []
-        baseline_bytes = exact_results["baseline_bundle_bytes"]
+        cache = {}
         search_record = {
-            "format": "kitten2-onnx-ternary-nbits-fallback-search-v1",
-            "baseline_bundle": str(baseline),
-            "baseline_bundle_files": bundle["files"],
-            "inventory_sha256": inventory["inventory_sha256"],
+            "format": "kitten2-onnx-ternary-nbits-delta-search-v2",
+            "report_path": str(result_path),
+            "cache_identity": identity,
+            "legacy_import": legacy_import,
             "parent_candidate": parent["name"],
-            "parent_configuration": configuration,
-            "parent_selection": {
-                "basis": "minimum same-activation diagnostic score, then smallest measured bundle",
-                "kernel_diagnostic": str(Path(kernel_diagnostic_path).resolve()),
-                "per_block_scores": kernel_scores,
-                "selected_block_size": selected_block,
-            },
-            "fallback_size_budget_bytes": baseline_bytes // 2,
-            "preferred_bundle_bytes": 4_000_000_000,
-            "semantic_groups": _semantic_fallback_groups(inventory),
-            "group_evaluations": group_evaluations,
-            "cache": cache,
+            "parent_bundle": str(parent_bundle),
+            "parent_bundle_bytes": int(parent["bundle_bytes"]),
+            "fallback_size_budget_bytes": int(exact_results["baseline_bundle_bytes"]) // 2,
+            "beam_width": beam_width,
+            "max_evaluations": max_fallback_candidates,
+            "evaluations": cache,
+            "evaluation_count": 0,
             "decision": "fallback_search_in_progress",
         }
-        _write_json(fallback_reports / "inventory.json", inventory)
-        _write_json(fallback_results_path, search_record)
+    search_record["report_path"] = str(result_path)
+    search_record["max_evaluations"] = max_fallback_candidates
+    search_record["beam_width"] = beam_width
+    search_record["historical_kernel_diagnostic"] = (
+        str(Path(kernel_diagnostic_path).resolve()) if kernel_diagnostic_path is not None else None
+    )
 
-    expected_groups = _semantic_fallback_groups(inventory)
-    stored_groups = search_record["semantic_groups"]
-    stored_by_name = {group["name"]: group for group in stored_groups}
-    expected_by_name = {group["name"]: group for group in expected_groups}
-    for name, group in stored_by_name.items():
-        expected = expected_by_name.get(name)
-        if expected is not None and group["nodes"] != expected["nodes"]:
-            raise ValueError(f"Cached fallback group no longer matches inventory: {name}")
-    search_record["semantic_groups"] = stored_groups + [
-        group for group in expected_groups if group["name"] not in stored_by_name
-    ]
-    search_record["max_fallback_candidates"] = max_fallback_candidates
-    _write_json(fallback_results_path, search_record)
-    if not search_record["group_evaluations"]:
-        search_record["group_evaluations"] = group_evaluations
-    evaluation_by_name = {
-        row["group"]: row for row in search_record["group_evaluations"]
+    def save(current_cache: dict[str, dict[str, Any]], evaluation_count: int) -> None:
+        search_record["evaluations"] = {key: current_cache[key] for key in sorted(current_cache)}
+        search_record["evaluation_count"] = evaluation_count
+        search_record["candidate_count"] = sum(
+            bool(row.get("excluded_nodes")) for row in current_cache.values()
+        )
+        _write_json_atomic(result_path, search_record)
+
+    evaluator = BoundedDeltaEvaluator(
+        identity,
+        cache,
+        max_evaluations=max_fallback_candidates,
+        max_retries=max_worker_retries,
+        evaluate_one=_evaluate_delta_worker(
+            parent_model,
+            baseline_model,
+            inventory_file,
+            inventory,
+            reference_root,
+            reference_identity_sha256,
+            fallback_reports / ".scratch",
+            reports,
+            int(parent["bundle_bytes"]),
+            max_worker_rss_gib=max_worker_rss_gib,
+            max_search_disk_gib=max_search_disk_gib,
+            worker_timeout_seconds=worker_timeout_seconds,
+        ),
+        on_update=save,
+        evaluation_count=int(search_record.get("evaluation_count", 0)),
+    )
+    parent_row = evaluator.evaluate([], "exact-parent-preflight")
+    if parent_row is None or parent_row.get("status") != "diagnostic_complete":
+        search_record["decision"] = "parent_diagnostic_failed"
+        search_record["stop_condition"] = evaluator.stop_condition or {
+            "reason": parent_row.get("status") if parent_row else "evaluation_budget_exhausted"
+        }
+        save(evaluator.cache, evaluator.evaluation_count)
+        return search_record
+    if not _known_parent_mismatch(parent_row):
+        search_record["decision"] = "diagnostic_equivalence_failed"
+        search_record["stop_condition"] = {
+            "reason": "block-64 diagnostic did not reproduce the established prefill cache[24].value two-value mismatch",
+            "observed_first_divergence": parent_row.get("first_divergence"),
+        }
+        save(evaluator.cache, evaluator.evaluation_count)
+        return search_record
+    search_record["parent_diagnostic_equivalence"] = {
+        "passed": True,
+        "diagnostic_score": parent_row["diagnostic_score"],
+        "first_divergence": parent_row["first_divergence"],
     }
-    best_passing: dict[str, Any] | None = None
-    best_over_budget: dict[str, Any] | None = None
+    save(evaluator.cache, evaluator.evaluation_count)
 
-    def save_search() -> None:
-        search_record["cache"] = cache
-        _write_json(fallback_results_path, search_record)
+    sensitivity = _run_sensitivity_worker(
+        parent_model,
+        baseline_model,
+        inventory_file,
+        reference_root,
+        identity,
+        reports,
+        max_worker_rss_gib=max_worker_rss_gib,
+        max_search_disk_gib=max_search_disk_gib,
+        worker_timeout_seconds=worker_timeout_seconds,
+    )
+    search_record["sensitivity_report"] = str(
+        fallback_reports / f"sensitivity-{identity_hash[:16]}.json"
+    )
+    if sensitivity.get("status") != "sensitivity_complete" or len(
+        sensitivity.get("ranked_nodes", [])
+    ) != inventory["eligible_exact_ternary_matmul_count"]:
+        search_record["decision"] = "sensitivity_stage_failed"
+        search_record["stop_condition"] = {
+            "reason": sensitivity.get("status", "incomplete_sensitivity"),
+            "worker_output_tail": sensitivity.get("worker_output_tail"),
+        }
+        save(evaluator.cache, evaluator.evaluation_count)
+        return search_record
+    search_record["sensitivity_node_count"] = sensitivity["measured_node_count"]
+    ranked_nodes = [row["node"] for row in sensitivity["ranked_nodes"]]
+    seed_sets = _legacy_seed_sets(legacy_import, beam_width)
 
-    def evaluate(excluded_nodes: list[str] | tuple[str, ...], label: str) -> dict[str, Any]:
-        normalized_nodes = tuple(sorted(set(excluded_nodes)))
-        key = candidate_key(
-            bundle["files"], inventory["inventory_sha256"], configuration, normalized_nodes
+    def strict_check(row: dict[str, Any]) -> dict[str, Any]:
+        result = _run_strict_delta_worker(
+            row,
+            parent_bundle,
+            parent_model,
+            baseline_model,
+            inventory,
+            model,
+            reports,
+            max_worker_rss_gib=max_worker_rss_gib,
+            max_search_disk_gib=max_search_disk_gib,
+            worker_timeout_seconds=worker_timeout_seconds,
         )
-        existing = cache.get(key)
-        if existing is not None and existing["status"] != "build_started":
-            return existing
-        if existing is None and len(cache) - 1 >= max_fallback_candidates:
-            raise FallbackCandidateLimitReached(
-                f"Reached fallback candidate limit {max_fallback_candidates}"
-            )
-        name = f"b4-bs{configuration['block_size']}-a{configuration['accuracy_level']}-fallback-{key[:12]}"
-        candidate_bundle = fallback_output / name
-        candidate_reports = fallback_reports / name
-        if existing is None:
-            if candidate_bundle.exists() or candidate_reports.exists():
-                raise FileExistsError(f"Fallback candidate paths exist without a cache record: {name}")
-            row: dict[str, Any] = {
-                "name": name,
-                "candidate_key": key,
-                "configuration": configuration,
-                "excluded_nodes": list(normalized_nodes),
-                "semantic_label": label,
-                "bundle": str(candidate_bundle),
-                "reports": str(candidate_reports),
-                "status": "build_started",
+        row["strict_delta_parity"] = result
+        if result.get("status") not in {"passed", "failed"}:
+            evaluator.stop_condition = {
+                "reason": result.get("status", "strict_worker_failed"),
+                "candidate_key": row["candidate_key"],
+                "phase": "strict_delta_parity",
             }
-            cache[key] = row
-            save_search()
-        else:
-            row = existing
-            candidate_bundle = Path(row["bundle"])
-            candidate_reports = Path(row["reports"])
-        candidate_reports.mkdir(parents=True, exist_ok=True)
-        try:
-            optimization_path = candidate_reports / "optimization.json"
-            if candidate_bundle.exists():
-                if not optimization_path.is_file():
-                    raise FileExistsError(f"Existing fallback bundle has no optimization report: {name}")
-                optimization = json.loads(optimization_path.read_text(encoding="utf-8"))
-                quantization = optimization["quantization"]
-                if (
-                    optimization["lm_method"] != "ternary-nbits"
-                    or quantization["bits"] != configuration["bits"]
-                    or quantization["block_size"] != configuration["block_size"]
-                    or quantization["accuracy_level"] != configuration["accuracy_level"]
-                    or quantization["exclude_nodes"] != list(normalized_nodes)
-                    or optimization["validation"]["status"] != "passed"
-                ):
-                    raise ValueError(f"Existing fallback candidate does not match its key: {name}")
-            else:
-                optimization = optimize_bundle(
-                    baseline,
-                    candidate_bundle,
-                    lm_method="ternary-nbits",
-                    validate=True,
-                    report_dir=candidate_reports,
-                    nbits=configuration["bits"],
-                    nbits_block_size=configuration["block_size"],
-                    nbits_accuracy_level=configuration["accuracy_level"],
-                    exclude_matmul_nodes=normalized_nodes,
-                )
-            if optimization["validation"]["status"] != "passed":
-                raise ValueError("fallback candidate bundle validation did not pass")
-            row["bundle_bytes"] = optimization["output_bundle_bytes"]
-            row["size_report"] = optimization["size_report"]
-            row["fallback_storage"] = optimization["quantization"]["fallback_storage"]
-            row["transformed_matmul_count"] = optimization["quantization"][
-                "transformed_matmul_count"
-            ]
-            row["validation"] = optimization["validation"]
-            diagnostic_path = candidate_reports / "diagnostic-parity.json"
-            if diagnostic_path.is_file():
-                diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
-            else:
-                diagnostic = _diagnose_candidate_parity(candidate_bundle, model, diagnostic_path)
-            row["diagnostic"] = _diagnostic_summary(diagnostic)
-            row["diagnostic_score"] = diagnostic["diagnostic_score"]
-            row["size_budget_passed"] = (
-                row["bundle_bytes"] <= search_record["fallback_size_budget_bytes"]
-            )
-            row["preferred_size_passed"] = row["bundle_bytes"] < search_record[
-                "preferred_bundle_bytes"
-            ]
-            if diagnostic["diagnostic_score"][0] == 0 and diagnostic["test_completed"]:
-                parity = _strict_parity(
-                    candidate_bundle,
-                    model,
-                    candidate_reports / "strict-real-lm-parity.log",
-                )
-                row["strict_parity"] = parity
-                row["status"] = (
-                    "strict_parity_passed" if parity["status"] == "passed" else "strict_parity_failed"
-                )
-            else:
-                row["strict_parity"] = {"status": "not_run", "reason": "diagnostic score is non-zero"}
-                row["status"] = "diagnostic_complete"
-        except (OSError, RuntimeError, ValueError, KeyError, AssertionError) as error:
-            row["status"] = "build_or_diagnostic_failed"
-            row["error"] = f"{type(error).__name__}: {error}"
-        _write_json(candidate_reports / "search-result.json", row)
-        save_search()
-        return row
-
-    def test_group(label: str, nodes: list[str]) -> dict[str, Any]:
-        result = evaluate(nodes, label)
-        entry = evaluation_by_name.get(label)
-        if entry is None:
-            entry = {"group": label}
-            search_record["group_evaluations"].append(entry)
-            evaluation_by_name[label] = entry
-        entry.update(
-            {
-                "candidate_key": result["candidate_key"],
-                "nodes": sorted(set(nodes)),
-                "diagnostic_score": result.get("diagnostic_score"),
-                "status": result["status"],
-            }
-        )
-        save_search()
+        save(evaluator.cache, evaluator.evaluation_count)
         return result
 
-    candidate_limit_reached = False
-    try:
-        late_groups = [
-            group
-            for group in search_record["semantic_groups"]
-            if group.get("phase") not in {"earlier_layer", "earlier_projection"}
-        ]
-        for group in late_groups:
-            result = test_group(group["name"], group["nodes"])
-            if result["status"] == "strict_parity_passed":
-                if result["size_budget_passed"]:
-                    best_passing = result
-                    break
-                if best_over_budget is None or result["bundle_bytes"] < best_over_budget["bundle_bytes"]:
-                    best_over_budget = result
-
-        late_names = {group["name"] for group in late_groups}
-        late_improved = any(
-            entry["group"] in late_names
-            and entry["diagnostic_score"] is not None
-            and tuple(entry["diagnostic_score"]) < _diagnostic_score(parent_diagnostic)
-            for entry in search_record["group_evaluations"]
-        )
-        early_improved_layers = []
-        if best_passing is None and late_improved:
-            for group in search_record["semantic_groups"]:
-                if group.get("phase") != "earlier_layer":
-                    continue
-                result = test_group(group["name"], group["nodes"])
-                if (
-                    result.get("diagnostic_score") is not None
-                    and _diagnostic_score(result) < _diagnostic_score(parent_diagnostic)
-                ):
-                    early_improved_layers.append(int(group["name"].split("-")[1]))
-                if result["status"] == "strict_parity_passed":
-                    if result["size_budget_passed"]:
-                        best_passing = result
-                        break
-                    if best_over_budget is None or result["bundle_bytes"] < best_over_budget[
-                        "bundle_bytes"
-                    ]:
-                        best_over_budget = result
-
-        if best_passing is None:
-            module_names = (
-                "self_attn.q_proj",
-                "self_attn.k_proj",
-                "self_attn.v_proj",
-                "self_attn.o_proj",
-                "mlp.gate_proj",
-                "mlp.up_proj",
-                "mlp.down_proj",
-            )
-            existing_group_names = {
-                group["name"] for group in search_record["semantic_groups"]
-            }
-            for layer in sorted(set(early_improved_layers), reverse=True):
-                for module in module_names:
-                    nodes = sorted(
-                        row["node"]
-                        for row in inventory["nodes"]
-                        if row["eligible_exact_ternary"]
-                        and row["layer"] == layer
-                        and row["module"] == module
-                    )
-                    name = f"{module.replace('.', '-')}-layer-{layer}"
-                    group = {"name": name, "nodes": nodes, "phase": "earlier_projection"}
-                    if name not in existing_group_names:
-                        search_record["semantic_groups"].append(group)
-                        existing_group_names.add(name)
-                        save_search()
-                    result = test_group(name, nodes)
-                    if result["status"] == "strict_parity_passed":
-                        if result["size_budget_passed"]:
-                            best_passing = result
-                            break
-                        if best_over_budget is None or result["bundle_bytes"] < best_over_budget[
-                            "bundle_bytes"
-                        ]:
-                            best_over_budget = result
-                if best_passing is not None:
-                    break
-
-        def minimize_passing(seed: dict[str, Any]) -> dict[str, Any]:
-            current = seed
-            current_nodes = set(current["excluded_nodes"])
-            changed = True
-            while changed:
-                changed = False
-                for node in sorted(current_nodes):
-                    trial_nodes = sorted(current_nodes - {node})
-                    trial = evaluate(trial_nodes, "minimize-remove-one-node")
-                    if trial["status"] == "strict_parity_passed":
-                        current = trial
-                        current_nodes = set(trial_nodes)
-                        changed = True
-            return current
-
-        if best_passing is not None:
-            best_passing = minimize_passing(best_passing)
-
-        if best_passing is None:
-            semantic_names = {group["name"] for group in search_record["semantic_groups"]}
-            improved = [
-                group
-                for group in search_record["group_evaluations"]
-                if group["group"] in semantic_names
-                and group["diagnostic_score"] is not None
-                and tuple(group["diagnostic_score"]) < _diagnostic_score(parent_diagnostic)
-            ]
-            combined_nodes = sorted({node for group in improved for node in group["nodes"]})
-            if combined_nodes:
-                combined = test_group("combined-improving-semantic-groups", combined_nodes)
-                current_nodes = set(combined_nodes)
-                current = combined
-                if combined["status"] == "strict_parity_passed":
-                    if combined["size_budget_passed"]:
-                        best_passing = minimize_passing(combined)
-                    else:
-                        best_over_budget = combined
-                elif combined.get("diagnostic_score") is not None:
-                    changed = True
-                    while changed:
-                        changed = False
-                        for node in sorted(current_nodes):
-                            trial_nodes = sorted(current_nodes - {node})
-                            trial = evaluate(trial_nodes, "minimize-diagnostic-improving-set")
-                            if trial.get("diagnostic_score") is not None and _diagnostic_score(
-                                trial
-                            ) <= _diagnostic_score(current):
-                                current = trial
-                                current_nodes = set(trial_nodes)
-                                changed = True
-                            if trial["status"] == "strict_parity_passed":
-                                if trial["size_budget_passed"]:
-                                    best_passing = minimize_passing(trial)
-                                elif best_over_budget is None or trial["bundle_bytes"] < best_over_budget[
-                                    "bundle_bytes"
-                                ]:
-                                    best_over_budget = trial
-                            if best_passing is not None:
-                                break
-                        if best_passing is not None:
-                            break
-
-        if best_passing is None and best_over_budget is not None:
-            minimized = minimize_passing(best_over_budget)
-            if minimized["size_budget_passed"]:
-                best_passing = minimized
-            else:
-                best_over_budget = minimized
-    except FallbackCandidateLimitReached:
-        candidate_limit_reached = True
-    candidates = [row for key, row in cache.items() if key != parent_key and row.get("bundle_bytes")]
-    ranked = sorted(
-        candidates,
-        key=lambda row: (
-            row.get("status") != "strict_parity_passed",
-            row["bundle_bytes"],
-            row.get("fallback_storage", {}).get("fallback_initializer_count", 0),
-            row.get("diagnostic", {}).get("onnx_runtime_total_ms", float("inf")),
-        ),
+    finalist = _run_beam_search(
+        evaluator,
+        seed_sets,
+        ranked_nodes,
+        beam_width=beam_width,
+        strict_check=strict_check,
     )
-    search_record["candidate_ranking"] = [row["candidate_key"] for row in ranked]
-    diagnosed_candidates = [row for row in candidates if row.get("diagnostic_score") is not None]
-    search_record["best_diagnostic_candidate"] = (
-        min(diagnosed_candidates, key=_diagnostic_score)["candidate_key"]
-        if diagnosed_candidates
-        else None
-    )
-    search_record["pareto_frontier"] = [
+    search_record["beam_frontier"] = [
         row["candidate_key"]
-        for row in candidates
-        if not any(
-            other is not row
-            and other["bundle_bytes"] <= row["bundle_bytes"]
-            and other.get("fallback_storage", {}).get("fallback_initializer_count", 0)
-            <= row.get("fallback_storage", {}).get("fallback_initializer_count", 0)
-            and _diagnostic_score(other) <= _diagnostic_score(row)
-            and (
-                other["bundle_bytes"] < row["bundle_bytes"]
-                or other.get("fallback_storage", {}).get("fallback_initializer_count", 0)
-                < row.get("fallback_storage", {}).get("fallback_initializer_count", 0)
-                or _diagnostic_score(other) < _diagnostic_score(row)
-            )
-            for other in candidates
-            if other.get("diagnostic_score") is not None
-            and row.get("diagnostic_score") is not None
+        for row in bounded_frontier(
+            [
+                row
+                for row in evaluator.cache.values()
+                if row.get("excluded_nodes") and row.get("diagnostic_score") is not None
+            ],
+            beam_width,
         )
     ]
-    if not candidate_limit_reached:
-        search_record.pop("stop_condition", None)
-    search_record["candidate_count"] = len(cache) - 1
-    if candidate_limit_reached:
-        search_record["decision"] = "fallback_search_candidate_limit_reached"
-        search_record["stop_condition"] = {
-            "reason": "Fallback search reached its declared candidate cap before completing semantic refinement.",
-            "max_fallback_candidates": max_fallback_candidates,
-            "minimality_proven": False,
-            "strict_parity_tolerances_changed": False,
-        }
-        passing = best_passing or best_over_budget
-        if passing is not None:
-            search_record["best_parity_candidate_key"] = passing["candidate_key"]
-    elif best_passing is not None:
-        search_record["decision"] = "fallback_candidate_passed_within_size_budget"
-        search_record["accepted_candidate_key"] = best_passing["candidate_key"]
-        search_record["minimality_proven"] = True
-    elif best_over_budget is not None:
-        search_record["decision"] = "strict_parity_passed_over_size_budget"
-        search_record["best_parity_candidate_key"] = best_over_budget["candidate_key"]
-        search_record["minimality_proven"] = True
+    search_record["stop_condition"] = evaluator.stop_condition
+    if finalist is not None:
+        search_record["best_zero_diagnostic_candidate"] = finalist["candidate_key"]
+        if finalist_eligible(finalist, search_record["fallback_size_budget_bytes"]):
+            promotion = _promote_finalist(
+                finalist,
+                baseline,
+                output,
+                reports,
+                model,
+                size_budget_bytes=search_record["fallback_size_budget_bytes"],
+                max_worker_rss_gib=max_worker_rss_gib,
+                max_search_disk_gib=max_search_disk_gib,
+                worker_timeout_seconds=worker_timeout_seconds,
+            )
+            finalist["promotion"] = promotion
+            search_record["decision"] = promotion["status"]
+        else:
+            search_record["decision"] = "zero_diagnostic_strict_pass_over_size_budget"
+    elif evaluator.stop_condition:
+        search_record["decision"] = "fallback_search_stopped"
     else:
-        search_record["decision"] = "no_fallback_candidate_passed_strict_parity_within_budget"
+        search_record["decision"] = "no_zero_diagnostic_candidate"
         search_record["stop_condition"] = {
-            "reason": "No semantically searched fallback set passed unchanged strict parity within the declared 50-percent-reduction budget.",
-            "strict_parity_tolerances_changed": False,
+            "reason": "bounded beam found no zero-diagnostic candidate",
+            "minimality_proven": False,
         }
-        search_record["minimality_proven"] = False
-    save_search()
 
+    diagnosed = [
+        row
+        for row in evaluator.cache.values()
+        if row.get("excluded_nodes") and row.get("diagnostic_score") is not None
+    ]
+    search_record["best_diagnostic_candidate"] = (
+        min(diagnosed, key=_frontier_objective)["candidate_key"] if diagnosed else None
+    )
+    search_record["evaluation_count"] = evaluator.evaluation_count
+    search_record["candidate_count"] = len(diagnosed)
+    save(evaluator.cache, evaluator.evaluation_count)
     exact_results["fallback_search"] = {
-        "report": str(fallback_results_path),
+        "report": str(result_path),
         "decision": search_record["decision"],
-        "accepted_candidate_key": search_record.get("accepted_candidate_key"),
-        "size_budget_bytes": search_record["fallback_size_budget_bytes"],
         "candidate_count": search_record["candidate_count"],
-        "max_fallback_candidates": max_fallback_candidates,
-        "best_parity_candidate_key": search_record.get("best_parity_candidate_key"),
+        "evaluation_count": search_record["evaluation_count"],
+        "max_evaluations": max_fallback_candidates,
+        "best_zero_diagnostic_candidate": search_record.get("best_zero_diagnostic_candidate"),
     }
     exact_results["decision"] = search_record["decision"]
     _write_json(exact_results_path, exact_results)
     return search_record
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1163,7 +1392,14 @@ def main() -> None:
         type=Path,
         default=Path("build/reports/nbits-kernel-diagnostic-level0.json"),
     )
-    parser.add_argument("--max-fallback-candidates", type=int, default=140)
+    parser.add_argument("--reference", type=Path, default=Path("build/reports/nbits-reference"))
+    parser.add_argument("--fixture", type=Path, default=Path("tests/fixtures/reference_bruno.npz"))
+    parser.add_argument("--max-fallback-candidates", type=int, default=30)
+    parser.add_argument("--beam-width", type=int, default=4)
+    parser.add_argument("--max-worker-rss-gib", type=float, default=14.0)
+    parser.add_argument("--max-search-disk-gib", type=float, default=30.0)
+    parser.add_argument("--worker-timeout-seconds", type=float, default=5400.0)
+    parser.add_argument("--max-worker-retries", type=int, default=1)
     args = parser.parse_args()
     report = run_exact_search(
         args.baseline_bundle,
@@ -1173,12 +1409,13 @@ def main() -> None:
         args.reports_root,
     )
     fallback = None
+    terminal_decisions = {
+        "release_gates_passed",
+        "final_strict_parity_failed",
+        "zero_diagnostic_strict_pass_over_size_budget",
+    }
     if report["decision"] == "all_exact_candidates_failed_strict_parity" or (
-        report.get("fallback_search")
-        and report["decision"] not in {
-            "fallback_candidate_passed_within_size_budget",
-            "strict_parity_passed_over_size_budget",
-        }
+        report.get("fallback_search") and report["decision"] not in terminal_decisions
     ):
         fallback = run_fallback_search(
             args.baseline_bundle,
@@ -1187,7 +1424,14 @@ def main() -> None:
             args.output_root,
             args.reports_root,
             kernel_diagnostic_path=args.kernel_diagnostic,
+            reference_path=args.reference,
+            fixture_path=args.fixture,
             max_fallback_candidates=args.max_fallback_candidates,
+            beam_width=args.beam_width,
+            max_worker_rss_gib=args.max_worker_rss_gib,
+            max_search_disk_gib=args.max_search_disk_gib,
+            worker_timeout_seconds=args.worker_timeout_seconds,
+            max_worker_retries=args.max_worker_retries,
         )
     summary = {
         "decision": fallback["decision"] if fallback else report["decision"],
@@ -1199,7 +1443,7 @@ def main() -> None:
             }
             for candidate in report["candidates"]
         ],
-        "fallback_report": str(Path(args.reports_root) / "fallback/results.json")
+        "fallback_report": fallback.get("report_path")
         if fallback
         else report.get("fallback_search", {}).get("report"),
     }
