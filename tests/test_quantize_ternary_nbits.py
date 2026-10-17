@@ -10,6 +10,7 @@ from onnx import TensorProto, external_data_helper, helper, numpy_helper
 
 from kitten2_onnx.quantize_ternary_nbits import (
     BLOCK_SIZE,
+    TernaryNBitsConfig,
     pack_ternary_nbits4,
     quantize_ternary_matmuls_streaming,
     rewrite_matmul_to_nbits4,
@@ -63,8 +64,49 @@ def test_pack_unpack_preserves_exact_group_scales_and_values():
     np.testing.assert_array_equal(packed.zero_points[:, 1], 0x08)
 
 
+
+def test_pack_accepts_signed_zero_values():
+    weight = np.zeros((128, 1), dtype=np.float32)
+    weight[0, 0] = np.float32(-0.0)
+
+    reconstructed = unpack_ternary_nbits4(pack_ternary_nbits4(weight))
+
+    assert weight[0, 0] == reconstructed[0, 0] == 0
+    assert np.signbit(weight[0, 0])
+    assert not np.signbit(reconstructed[0, 0])
+
+
+@pytest.mark.parametrize("block_size", [16, 32, 64, 128])
+def test_pack_unpack_smaller_blocks_preserve_source_group_scales(block_size: int):
+    weight = _weight(256)
+    config = TernaryNBitsConfig(block_size=block_size)
+
+    packed = pack_ternary_nbits4(weight, config)
+    reconstructed = unpack_ternary_nbits4(packed)
+
+    np.testing.assert_array_equal(reconstructed.view(np.uint32), weight.view(np.uint32))
+    source_scales = np.abs(weight.reshape(2, BLOCK_SIZE, 3)).max(axis=1).T
+    expected_scales = np.repeat(source_scales, BLOCK_SIZE // block_size, axis=1)
+    np.testing.assert_array_equal(packed.scales, expected_scales)
+    assert packed.packed.shape == (3, 256 // block_size, block_size // 2)
+    assert packed.block_size == block_size
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"bits": 2}, "only 4-bit"),
+        ({"block_size": 8}, "block_size must be one of"),
+        ({"source_group_size": 64}, "source_group_size must remain 128"),
+        ({"accuracy_level": 2}, "accuracy_level must be 0 or 1"),
+    ],
+)
+def test_nbits_config_rejects_unsupported_settings(kwargs: dict, message: str):
+    with pytest.raises(ValueError, match=message):
+        TernaryNBitsConfig(**kwargs)
+
 def test_pack_rejects_unsupported_weights():
-    with pytest.raises(ValueError, match="divisible by 128"):
+    with pytest.raises(ValueError, match="divisible by source_group_size 128"):
         pack_ternary_nbits4(np.zeros((127, 2), dtype=np.float32))
     with pytest.raises(ValueError, match="exactly ternary"):
         pack_ternary_nbits4(_nonternary_weight())
@@ -82,15 +124,27 @@ def test_unpack_rejects_codes_outside_the_ternary_encoding():
     with pytest.raises(ValueError, match="outside the exact ternary encoding"):
         unpack_ternary_nbits4(replace(packed, packed=invalid_codes))
 
-
-@pytest.mark.parametrize("k", [128, 384])
-def test_rewritten_matmul_executes_on_ort_cpu_and_matches_fp32(k: int):
+@pytest.mark.parametrize(
+    ("k", "block_size", "accuracy_level"),
+    [
+        (128, block_size, accuracy_level)
+        for block_size in (16, 32, 64, 128)
+        for accuracy_level in (0, 1)
+    ]
+    + [(384, 128, 1)],
+)
+def test_rewritten_matmul_executes_on_ort_cpu_and_matches_fp32(
+    k: int, block_size: int, accuracy_level: int
+):
     rng = np.random.default_rng(2026 + k)
     weight = _weight(k)
     activation = rng.normal(size=(3, k)).astype(np.float32)
     source = _matmul_model(weight)
 
-    rewritten = rewrite_matmul_to_nbits4(source)
+    rewritten = rewrite_matmul_to_nbits4(
+        source,
+        config=TernaryNBitsConfig(block_size=block_size, accuracy_level=accuracy_level),
+    )
 
     onnx.checker.check_model(rewritten)
     assert [node.op_type for node in source.graph.node] == ["MatMul"]
@@ -102,8 +156,8 @@ def test_rewritten_matmul_executes_on_ort_cpu_and_matches_fp32(k: int):
         "K": k,
         "N": weight.shape[1],
         "bits": 4,
-        "block_size": 128,
-        "accuracy_level": 1,
+        "block_size": block_size,
+        "accuracy_level": accuracy_level,
     }
 
     session = ort.InferenceSession(
@@ -143,7 +197,8 @@ def _external_initializer(name: str, weight: np.ndarray, location: str, offset: 
     return tensor
 
 
-def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path):
+@pytest.mark.parametrize("block_size", [16, 32, 64, 128])
+def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path, block_size: int):
     k = 256
     ternary = _weight(k, 3)
     dense = np.zeros((k, 2), dtype=np.float32)
@@ -189,13 +244,24 @@ def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path):
     original_graph_bytes = source_path.read_bytes()
     original_data_bytes = external_path.read_bytes()
 
+    mismatch_output = tmp_path / "mismatch" / "lm.onnx"
+    with pytest.raises(ValueError, match="Expected 2 source-eligible ternary MatMuls, found 1"):
+        quantize_ternary_matmuls_streaming(
+            source_path,
+            mismatch_output,
+            output_external_data="lm.nbits4.onnx.data",
+            expected_source_ternary_matmul_count=2,
+        )
+    assert not mismatch_output.exists()
+
     output_dir = tmp_path / "output"
     output_path = output_dir / "lm.onnx"
     report = quantize_ternary_matmuls_streaming(
         source_path,
         output_path,
         output_external_data="lm.nbits4.onnx.data",
-        expected_matmul_count=1,
+        config=TernaryNBitsConfig(block_size=block_size),
+        expected_source_ternary_matmul_count=1,
         column_chunk=2,
     )
 
@@ -210,9 +276,10 @@ def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path):
     assert tensor_report["source_initializer"] == "W_ternary"
     assert tensor_report["source_shape"] == [k, 3]
     assert tensor_report["exact_reconstruction"]
-    assert tensor_report["packed_code_bytes"] == 3 * 2 * 64
-    assert tensor_report["scale_bytes"] == 3 * 2 * 4
-    assert tensor_report["zero_point_bytes"] == 3
+    assert tensor_report["packed_code_bytes"] == 3 * (k // block_size) * (block_size // 2)
+    assert tensor_report["scale_bytes"] == 3 * (k // block_size) * 4
+    assert tensor_report["zero_point_bytes"] == 3 * ((k // block_size + 1) // 2)
+    assert tensor_report["block_size"] == block_size
 
     rewritten = onnx.load(str(output_path), load_external_data=False)
     assert [node.op_type for node in rewritten.graph.node] == ["MatMulNBits", "MatMul", "MatMul"]

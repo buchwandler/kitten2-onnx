@@ -321,11 +321,23 @@ def _quantize_lm_chunked(
 def _quantize_lm_ternary_nbits4(
     bundle_dir: Path,
     bundle: dict[str, Any],
+    *,
+    bits: int,
+    block_size: int,
+    accuracy_level: int,
+    exclude_nodes: Sequence[str] = (),
+    exclude_initializers: Sequence[str] = (),
 ) -> dict[str, Any]:
+    import platform
+    import subprocess
+
     import onnx
     import onnxruntime as ort
 
-    from kitten2_onnx.quantize_ternary_nbits import quantize_ternary_matmuls_streaming
+    from kitten2_onnx.quantize_ternary_nbits import (
+        TernaryNBitsConfig,
+        quantize_ternary_matmuls_streaming,
+    )
 
     lm_entry = bundle["lm"]
     lm_meta_path = _bundle_path(bundle_dir, lm_entry["metadata"])
@@ -360,7 +372,14 @@ def _quantize_lm_ternary_nbits4(
             lm_model_path,
             temporary_graph,
             output_external_data=external_location,
-            expected_matmul_count=196,
+            config=TernaryNBitsConfig(
+                bits=bits,
+                block_size=block_size,
+                accuracy_level=accuracy_level,
+            ),
+            expected_source_ternary_matmul_count=196,
+            exclude_nodes=exclude_nodes,
+            exclude_initializers=exclude_initializers,
         )
         quantized_graph = onnx.load(str(temporary_graph), load_external_data=False)
         quantized_locations = _all_external_locations(quantized_graph)
@@ -384,13 +403,28 @@ def _quantize_lm_ternary_nbits4(
 
     metadata["external_data"] = bool(quantized_locations)
     metadata["external_data_files"] = sorted(quantized_locations)
+    repository_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    provenance = {
+        "onnx_version": onnx.__version__,
+        "onnxruntime_version": ort.__version__,
+        "python_version": platform.python_version(),
+        "cpu_architecture": platform.machine(),
+        "source_model_revision": bundle.get("revisions", {}).get(
+            "source_model_revision", metadata.get("source_model_revision")
+        ),
+        "repository_commit": repository_commit,
+    }
     metadata["quantization"] = {
         **transformation,
-        "method": "ternary-nbits4",
+        "method": "ternary-nbits",
         "backend": "streaming",
-        "bits": 4,
-        "block_size": 128,
-
+        "provenance": provenance,
         "external_data_files": sorted(quantized_locations),
         "source_graph_sha256": source_hash,
         "source_external_data_sha256": source_external_hashes,
@@ -421,6 +455,9 @@ def optimize_bundle(
     corpus_path: str | Path | None = None,
     report_dir: str | Path | None = None,
     chunk_rows: int = 64,
+    nbits: int = 4,
+    nbits_block_size: int = 128,
+    nbits_accuracy_level: int = 1,
     exclude_matmul_nodes: Sequence[str] = (),
     exclude_matmul_initializers: Sequence[str] = (),
 ) -> dict[str, Any]:
@@ -446,10 +483,20 @@ def optimize_bundle(
     )
     report_root.mkdir(parents=True, exist_ok=True)
     output_root.parent.mkdir(parents=True, exist_ok=True)
-    if lm_method not in ("int8-dynamic", "int8-dynamic-chunked", "ternary-nbits4"):
+    ternary_nbits = lm_method in ("ternary-nbits", "ternary-nbits4")
+    if lm_method not in (
+        "int8-dynamic",
+        "int8-dynamic-chunked",
+        "ternary-nbits",
+        "ternary-nbits4",
+    ):
         raise ValueError(f"Unsupported LM optimization method: {lm_method!r}")
-    if lm_method != "int8-dynamic-chunked" and (exclude_matmul_nodes or exclude_matmul_initializers):
-        raise ValueError("MatMul exclusions are supported only by int8-dynamic-chunked")
+    if (
+        lm_method != "int8-dynamic-chunked"
+        and not ternary_nbits
+        and (exclude_matmul_nodes or exclude_matmul_initializers)
+    ):
+        raise ValueError("MatMul exclusions require a streaming optimization method")
 
     input_bundle_path = input_root / "bundle.json"
     bundle = json.loads(input_bundle_path.read_text(encoding="utf-8"))
@@ -471,7 +518,15 @@ def optimize_bundle(
             chunk_rows=chunk_rows,
         )
     else:
-        quantization = _quantize_lm_ternary_nbits4(output_root, bundle)
+        quantization = _quantize_lm_ternary_nbits4(
+            output_root,
+            bundle,
+            bits=nbits,
+            block_size=nbits_block_size,
+            accuracy_level=nbits_accuracy_level,
+            exclude_nodes=exclude_matmul_nodes,
+            exclude_initializers=exclude_matmul_initializers,
+        )
     export_metadata = bundle.get("export")
     if not isinstance(export_metadata, dict):
         raise TypeError("Bundle export metadata must be an object")
@@ -539,11 +594,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_bundle", type=Path)
     parser.add_argument("output_bundle", type=Path)
-    parser.add_argument("--lm", choices=("int8-dynamic", "int8-dynamic-chunked", "ternary-nbits4"), required=True)
+    parser.add_argument(
+        "--lm",
+        "--lm-method",
+        dest="lm",
+        choices=(
+            "int8-dynamic",
+            "int8-dynamic-chunked",
+            "ternary-nbits",
+            "ternary-nbits4",
+        ),
+        required=True,
+    )
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--corpus", type=Path)
     parser.add_argument("--report-dir", type=Path)
+    parser.add_argument("--nbits", type=int, default=4)
+    parser.add_argument("--nbits-block-size", type=int, default=128)
+    parser.add_argument("--nbits-accuracy-level", type=int, default=1)
     parser.add_argument("--chunk-rows", type=int, default=64)
     parser.add_argument("--exclude-matmul-node", action="append", default=[])
     parser.add_argument("--exclude-matmul-initializer", action="append", default=[])
@@ -557,6 +626,9 @@ def main() -> None:
         corpus_path=args.corpus,
         report_dir=args.report_dir,
         chunk_rows=args.chunk_rows,
+        nbits=args.nbits,
+        nbits_block_size=args.nbits_block_size,
+        nbits_accuracy_level=args.nbits_accuracy_level,
         exclude_matmul_nodes=args.exclude_matmul_node,
         exclude_matmul_initializers=args.exclude_matmul_initializer,
     )

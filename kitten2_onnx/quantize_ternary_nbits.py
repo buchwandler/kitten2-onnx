@@ -7,6 +7,7 @@ import hashlib
 import os
 import uuid
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,37 @@ from kitten2_onnx.external_data import (
 )
 from kitten2_onnx.quantize_int8_streaming import ExternalDataWriter
 
-BLOCK_SIZE = 128
+SOURCE_GROUP_SIZE = 128
+BLOCK_SIZE = SOURCE_GROUP_SIZE  # Backwards-compatible name for the exact source group.
 BITS = 4
 ZERO_POINT = 8
+SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128)
+
+
+@dataclass(frozen=True)
+class TernaryNBitsConfig:
+    bits: int = 4
+    block_size: int = 128
+    source_group_size: int = SOURCE_GROUP_SIZE
+    accuracy_level: int = 1
+
+    def __post_init__(self) -> None:
+        if self.bits != 4:
+            raise ValueError(f"only 4-bit ternary NBits is supported, found {self.bits}")
+        if self.source_group_size != SOURCE_GROUP_SIZE:
+            raise ValueError(
+                f"source_group_size must remain {SOURCE_GROUP_SIZE}, found {self.source_group_size}"
+            )
+        if self.block_size not in SUPPORTED_BLOCK_SIZES:
+            raise ValueError(
+                f"block_size must be one of {SUPPORTED_BLOCK_SIZES}, found {self.block_size}"
+            )
+        if self.source_group_size % self.block_size:
+            raise ValueError(
+                f"source_group_size {self.source_group_size} must be divisible by block_size {self.block_size}"
+            )
+        if self.accuracy_level not in (0, 1):
+            raise ValueError(f"accuracy_level must be 0 or 1, found {self.accuracy_level}")
 
 
 @dataclass(frozen=True)
@@ -37,32 +66,47 @@ class PackedTernaryNBits4:
     scales: np.ndarray
     zero_points: np.ndarray
     shape: tuple[int, int]
+    block_size: int = SOURCE_GROUP_SIZE
 
 
-def pack_ternary_nbits4(weight: np.ndarray) -> PackedTernaryNBits4:
-    """Pack an exact group-128 ternary FP32 MatMul weight without requantizing scales."""
+def pack_ternary_nbits4(
+    weight: np.ndarray,
+    config: TernaryNBitsConfig | None = None,
+) -> PackedTernaryNBits4:
+    """Pack exact source-group ternary weights into the configured NBits blocks."""
+    config = config or TernaryNBitsConfig()
     weight = np.asarray(weight)
     if weight.dtype != np.float32:
         raise TypeError(f"weight must have dtype float32, found {weight.dtype}")
     if weight.ndim != 2 or any(dimension <= 0 for dimension in weight.shape):
         raise ValueError(f"weight must have two positive dimensions [K, N], found {weight.shape}")
     k, n = weight.shape
-    if k % BLOCK_SIZE:
-        raise ValueError(f"weight K dimension must be divisible by {BLOCK_SIZE}, found {k}")
+    if k % config.source_group_size:
+        raise ValueError(
+            f"weight K dimension must be divisible by source_group_size {config.source_group_size}, found {k}"
+        )
     if not np.isfinite(weight).all():
         raise ValueError("weight values must be finite")
 
-    block_count = k // BLOCK_SIZE
-    blocks = weight.reshape(block_count, BLOCK_SIZE, n).transpose(2, 0, 1)
-    magnitudes = np.abs(blocks)
-    scales = magnitudes.max(axis=2)
-    if np.any((magnitudes != 0) & (magnitudes != scales[..., None])):
-        raise ValueError("weight is not exactly ternary within every group of 128")
+    source_groups = weight.reshape(k // config.source_group_size, config.source_group_size, n)
+    source_magnitudes = np.abs(source_groups)
+    source_scales = source_magnitudes.max(axis=1)
+    if np.any((source_magnitudes != 0) & (source_magnitudes != source_scales[:, None, :])):
+        raise ValueError(
+            f"weight is not exactly ternary within every group of {config.source_group_size}"
+        )
 
+    block_count = k // config.block_size
+    blocks = weight.reshape(block_count, config.block_size, n).transpose(2, 0, 1)
     codes = np.where(blocks < 0, ZERO_POINT - 1, np.where(blocks > 0, ZERO_POINT + 1, ZERO_POINT))
     codes = codes.astype(np.uint8, copy=False)
     packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
 
+    scales = np.repeat(
+        source_scales.T,
+        config.source_group_size // config.block_size,
+        axis=1,
+    )
     packed_zero_points = np.zeros((n, (block_count + 1) // 2), dtype=np.uint8)
     for block in range(block_count):
         packed_zero_points[:, block // 2] |= np.uint8(ZERO_POINT << (4 * (block % 2)))
@@ -72,16 +116,19 @@ def pack_ternary_nbits4(weight: np.ndarray) -> PackedTernaryNBits4:
         scales=np.ascontiguousarray(scales, dtype=np.float32),
         zero_points=packed_zero_points,
         shape=(k, n),
+        block_size=config.block_size,
     )
 
 
 def unpack_ternary_nbits4(packed: PackedTernaryNBits4) -> np.ndarray:
     """Reconstruct the FP32 source matrix from its exact-scale NBits4 encoding."""
     k, n = packed.shape
-    if k <= 0 or n <= 0 or k % BLOCK_SIZE:
+    block_size = packed.block_size
+    config = TernaryNBitsConfig(block_size=block_size)
+    if k <= 0 or n <= 0 or k % config.source_group_size:
         raise ValueError(f"invalid source shape {packed.shape}")
-    block_count = k // BLOCK_SIZE
-    expected_codes_shape = (n, block_count, BLOCK_SIZE // 2)
+    block_count = k // block_size
+    expected_codes_shape = (n, block_count, block_size // 2)
     expected_scales_shape = (n, block_count)
     expected_zero_points_shape = (n, (block_count + 1) // 2)
     if packed.packed.dtype != np.uint8 or packed.packed.shape != expected_codes_shape:
@@ -93,7 +140,7 @@ def unpack_ternary_nbits4(packed: PackedTernaryNBits4) -> np.ndarray:
 
     low = packed.packed & 0x0F
     high = packed.packed >> 4
-    codes = np.empty((n, block_count, BLOCK_SIZE), dtype=np.uint8)
+    codes = np.empty((n, block_count, block_size), dtype=np.uint8)
     codes[..., 0::2] = low
     codes[..., 1::2] = high
     if np.any((codes != ZERO_POINT - 1) & (codes != ZERO_POINT) & (codes != ZERO_POINT + 1)):
@@ -109,13 +156,14 @@ def unpack_ternary_nbits4(packed: PackedTernaryNBits4) -> np.ndarray:
     values *= packed.scales[..., None]
     return values.transpose(1, 2, 0).reshape(k, n)
 
-
 def rewrite_matmul_to_nbits4(
     model: onnx.ModelProto,
     *,
+    config: TernaryNBitsConfig | None = None,
     node_name: str | None = None,
 ) -> onnx.ModelProto:
     """Return a copy of a tiny model with one constant FP32 MatMul rewritten to NBits4."""
+    config = config or TernaryNBitsConfig()
     rewritten = copy.deepcopy(model)
     matmuls = [node for node in rewritten.graph.node if node.op_type == "MatMul"]
     if node_name is not None:
@@ -137,7 +185,7 @@ def rewrite_matmul_to_nbits4(
     if weight_tensor.data_type != TensorProto.FLOAT:
         raise TypeError("target MatMul weight initializer must be float32")
 
-    packed = pack_ternary_nbits4(numpy_helper.to_array(weight_tensor))
+    packed = pack_ternary_nbits4(numpy_helper.to_array(weight_tensor), config)
     used_names = {
         name
         for graph_node in rewritten.graph.node
@@ -181,9 +229,9 @@ def rewrite_matmul_to_nbits4(
         domain="com.microsoft",
         K=k,
         N=n,
-        bits=BITS,
-        block_size=BLOCK_SIZE,
-        accuracy_level=1,
+        bits=config.bits,
+        block_size=config.block_size,
+        accuracy_level=config.accuracy_level,
     )
     node_index = next(index for index, candidate in enumerate(rewritten.graph.node) if candidate is node)
     rewritten.graph.node.remove(node)
@@ -307,9 +355,12 @@ def _encode_weight_to_external(
     external_location: str,
     column_chunk: int,
     source_sha256: str,
+    config: TernaryNBitsConfig,
 ) -> tuple[list[TensorProto], dict[str, Any]]:
     k, n = weight.shape
-    block_count = k // BLOCK_SIZE
+    block_count = k // config.block_size
+    blocks_per_source_group = config.source_group_size // config.block_size
+    packed_block_bytes = config.block_size * config.bits // 8
     packed_name, scales_name, zero_points_name = names
     code_digest = hashlib.sha256()
     scale_digest = hashlib.sha256()
@@ -320,33 +371,41 @@ def _encode_weight_to_external(
     code_offset = writer.start_tensor()
     for n_start in range(0, n, column_chunk):
         n_end = min(n, n_start + column_chunk)
-        packed_columns = np.empty((n_end - n_start, block_count, BLOCK_SIZE // 2), dtype=np.uint8)
-        for block_index, k_start in enumerate(range(0, k, BLOCK_SIZE)):
-            source_group = np.asarray(weight[k_start : k_start + BLOCK_SIZE, n_start:n_end]).T
+        packed_columns = np.empty(
+            (n_end - n_start, block_count, packed_block_bytes), dtype=np.uint8
+        )
+        for source_group_index, k_start in enumerate(range(0, k, config.source_group_size)):
+            source_group = np.asarray(
+                weight[k_start : k_start + config.source_group_size, n_start:n_end]
+            ).T
             magnitude = np.abs(source_group)
             group_scales = magnitude.max(axis=1)
             if not np.isfinite(source_group).all() or np.any(
                 (magnitude != 0) & (magnitude != group_scales[:, None])
             ):
                 raise ValueError(f"Source weight changed or is not ternary: {weight_name}")
-            codes = np.where(
-                source_group < 0,
-                ZERO_POINT - 1,
-                np.where(source_group > 0, ZERO_POINT + 1, ZERO_POINT),
-            ).astype(np.uint8, copy=False)
-            packed_columns[:, block_index, :] = codes[:, 0::2] | (codes[:, 1::2] << 4)
-            scales[n_start:n_end, block_index] = group_scales
-            reconstructed = (codes.astype(np.int8) - ZERO_POINT).astype(np.float32)
-            reconstructed *= group_scales[:, None]
-            if not np.array_equal(reconstructed, source_group):
-                raise ValueError(f"NBits4 weight reconstruction differs from source: {weight_name}")
-            signed_zero_differences += int(
-                np.count_nonzero(
-                    (source_group == 0)
-                    & (reconstructed == 0)
-                    & (np.signbit(source_group) != np.signbit(reconstructed))
+            for subblock in range(blocks_per_source_group):
+                block_index = source_group_index * blocks_per_source_group + subblock
+                block_start = subblock * config.block_size
+                source_block = source_group[:, block_start : block_start + config.block_size]
+                codes = np.where(
+                    source_block < 0,
+                    ZERO_POINT - 1,
+                    np.where(source_block > 0, ZERO_POINT + 1, ZERO_POINT),
+                ).astype(np.uint8, copy=False)
+                packed_columns[:, block_index, :] = codes[:, 0::2] | (codes[:, 1::2] << 4)
+                scales[n_start:n_end, block_index] = group_scales
+                reconstructed = (codes.astype(np.int8) - ZERO_POINT).astype(np.float32)
+                reconstructed *= group_scales[:, None]
+                if not np.array_equal(reconstructed, source_block):
+                    raise ValueError(f"NBits4 weight reconstruction differs from source: {weight_name}")
+                signed_zero_differences += int(
+                    np.count_nonzero(
+                        (source_block == 0)
+                        & (reconstructed == 0)
+                        & (np.signbit(source_block) != np.signbit(reconstructed))
+                    )
                 )
-            )
         code_bytes = memoryview(packed_columns).cast("B")
         writer.write(code_bytes)
         code_digest.update(code_bytes)
@@ -371,7 +430,7 @@ def _encode_weight_to_external(
         make_external_tensor(
             packed_name,
             TensorProto.UINT8,
-            (n, block_count, BLOCK_SIZE // 2),
+            (n, block_count, packed_block_bytes),
             external_location,
             code_offset,
             code_length,
@@ -397,6 +456,10 @@ def _encode_weight_to_external(
         "source_initializer": weight_name,
         "source_shape": [k, n],
         "source_sha256": source_sha256,
+        "bits": config.bits,
+        "block_size": config.block_size,
+        "source_group_size": config.source_group_size,
+        "accuracy_level": config.accuracy_level,
         "packed_initializer": packed_name,
         "packed_code_bytes": code_length,
         "packed_code_sha256": code_digest.hexdigest(),
@@ -411,16 +474,19 @@ def _encode_weight_to_external(
     }
     return tensors, report
 
-
 def quantize_ternary_matmuls_streaming(
     input_model: str | Path,
     output_model: str | Path,
     *,
     output_external_data: str,
-    expected_matmul_count: int | None = None,
+    config: TernaryNBitsConfig | None = None,
+    expected_source_ternary_matmul_count: int | None = None,
+    exclude_nodes: Sequence[str] = (),
+    exclude_initializers: Sequence[str] = (),
     column_chunk: int = 64,
 ) -> dict[str, Any]:
     """Rewrite exact ternary constant-B MatMuls without materializing external weights."""
+    config = config or TernaryNBitsConfig()
     source_path = Path(input_model).resolve()
     output_path = Path(output_model).resolve()
     if source_path == output_path:
@@ -450,16 +516,28 @@ def quantize_ternary_matmuls_streaming(
     skipped_matmuls: list[dict[str, str]] = []
     non_ternary_initializer_count = 0
     matmul_count = 0
+    source_eligible_matmul_count = 0
+    excluded_matmuls: list[dict[str, str]] = []
+    exclude_node_names = set(exclude_nodes)
+    exclude_initializer_names = set(exclude_initializers)
+    matched_exclude_nodes: set[str] = set()
+    matched_exclude_initializers: set[str] = set()
 
     for index, node in enumerate(model.graph.node):
         if node.op_type != "MatMul":
             continue
         matmul_count += 1
         node_label = node.name or f"MatMul#{index}"
+        if node_label in exclude_node_names:
+            matched_exclude_nodes.add(node_label)
+        if node.name and node.name in exclude_node_names:
+            matched_exclude_nodes.add(node.name)
         if len(node.input) != 2 or not node.input[1]:
             skipped_matmuls.append({"node": node_label, "reason": "MatMul B input is absent or unsupported"})
             continue
         weight_name = node.input[1]
+        if weight_name in exclude_initializer_names:
+            matched_exclude_initializers.add(weight_name)
         if weight_name not in initializer_by_name:
             skipped_matmuls.append({"node": node_label, "reason": "MatMul B is not a direct initializer"})
             continue
@@ -489,15 +567,82 @@ def quantize_ternary_matmuls_streaming(
             if not any(row["node"] == node_label for row in skipped_matmuls):
                 skipped_matmuls.append({"node": node_label, "reason": "shared MatMul B is not a ternary target"})
             continue
+        source_eligible_matmul_count += 1
+        reasons = []
+        if node_label in exclude_node_names or node.name in exclude_node_names:
+            reasons.append("node exclusion")
+        if weight_name in exclude_initializer_names:
+            reasons.append("initializer exclusion")
+        if reasons:
+            reason = "explicitly excluded by " + " and ".join(reasons)
+            weight_info = weight_cache[weight_name]
+            excluded_matmuls.append(
+                {
+                    "node": node_label,
+                    "initializer": weight_name,
+                    "reason": reason,
+                    "source_shape": [weight_info.k, weight_info.n],
+                    "source_sha256": weight_info.source_sha256,
+                }
+            )
+            skipped_matmuls.append({"node": node_label, "reason": reason})
+            continue
         targets_by_weight[weight_name].append((index, node))
+    unknown_nodes = exclude_node_names - matched_exclude_nodes
+    unknown_initializers = exclude_initializer_names - matched_exclude_initializers
+    if unknown_nodes:
+        raise ValueError(f"Unknown NBits MatMul node exclusions: {sorted(unknown_nodes)}")
+    if unknown_initializers:
+        raise ValueError(f"Unknown NBits MatMul initializer exclusions: {sorted(unknown_initializers)}")
 
     transformed_matmul_count = sum(len(nodes) for nodes in targets_by_weight.values())
-    if not transformed_matmul_count:
-        raise ValueError("No exact group-128 ternary constant-B MatMuls were found")
-    if expected_matmul_count is not None and transformed_matmul_count != expected_matmul_count:
+    if expected_source_ternary_matmul_count is not None and (
+        source_eligible_matmul_count != expected_source_ternary_matmul_count
+    ):
         raise ValueError(
-            f"Expected {expected_matmul_count} ternary MatMuls, found {transformed_matmul_count}"
+            "Expected "
+            f"{expected_source_ternary_matmul_count} source-eligible ternary MatMuls, "
+            f"found {source_eligible_matmul_count}"
         )
+    if not source_eligible_matmul_count:
+        raise ValueError("No exact group-128 ternary constant-B MatMuls were found")
+
+    fallback_initializers: dict[str, dict[str, Any]] = {}
+    for exclusion in excluded_matmuls:
+        name = exclusion["initializer"]
+        if name in fallback_initializers:
+            continue
+        k, n = exclusion["source_shape"]
+        block_count = k // config.block_size
+        nbits_bytes_if_quantized = (
+            n * block_count * (config.block_size * config.bits // 8)
+            + n * block_count * np.dtype(np.float32).itemsize
+            + n * ((block_count + 1) // 2)
+        )
+        nbits_bytes_removed = 0 if name in targets_by_weight else nbits_bytes_if_quantized
+        fallback_fp32_bytes = k * n * np.dtype(np.float32).itemsize
+        fallback_initializers[name] = {
+            "initializer": name,
+            "source_shape": [k, n],
+            "source_sha256": exclusion["source_sha256"],
+            "fallback_fp32_bytes": fallback_fp32_bytes,
+            "nbits_bytes_if_quantized": nbits_bytes_if_quantized,
+            "nbits_bytes_removed": nbits_bytes_removed,
+            "net_bundle_byte_cost": fallback_fp32_bytes - nbits_bytes_removed,
+        }
+    fallback_storage = {
+        "fallback_initializer_count": len(fallback_initializers),
+        "fallback_fp32_bytes": sum(
+            item["fallback_fp32_bytes"] for item in fallback_initializers.values()
+        ),
+        "nbits_bytes_removed": sum(
+            item["nbits_bytes_removed"] for item in fallback_initializers.values()
+        ),
+        "net_bundle_byte_cost": sum(
+            item["net_bundle_byte_cost"] for item in fallback_initializers.values()
+        ),
+        "initializers": list(fallback_initializers.values()),
+    }
 
     used_names = _graph_names(model.graph)
     quantized_names = {
@@ -556,6 +701,7 @@ def quantize_ternary_matmuls_streaming(
                         external_location=external_location,
                         column_chunk=column_chunk,
                         source_sha256=weight_info.source_sha256,
+                        config=config,
                     )
                 finally:
                     _close_memmap(weight, is_memmap)
@@ -582,9 +728,9 @@ def quantize_ternary_matmuls_streaming(
                 domain="com.microsoft",
                 K=weight_info.k,
                 N=weight_info.n,
-                bits=BITS,
-                block_size=BLOCK_SIZE,
-                accuracy_level=1,
+                bits=config.bits,
+                block_size=config.block_size,
+                accuracy_level=config.accuracy_level,
             )
             new_nodes.append(replacement)
             node_reports.append(
@@ -614,7 +760,11 @@ def quantize_ternary_matmuls_streaming(
         raise
 
     return {
-        "method": "ternary-nbits4",
+        "method": "ternary-nbits",
+        "bits": config.bits,
+        "block_size": config.block_size,
+        "source_group_size": config.source_group_size,
+        "accuracy_level": config.accuracy_level,
         "source_graph_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
         "output_graph_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
         "external_data_file": external_location,
@@ -623,6 +773,12 @@ def quantize_ternary_matmuls_streaming(
         "non_ternary_initializer_count": non_ternary_initializer_count,
         "accidentally_transformed_non_ternary_count": 0,
         "matmul_count": matmul_count,
+        "source_eligible_matmul_count": source_eligible_matmul_count,
+        "excluded_matmul_count": len(excluded_matmuls),
+        "exclude_nodes": sorted(exclude_node_names),
+        "exclude_initializers": sorted(exclude_initializer_names),
+        "excluded_matmuls": excluded_matmuls,
+        "fallback_storage": fallback_storage,
         "transformed_nodes": node_reports,
         "transformed_tensors": [tensor_reports[name] for name in targets_by_weight],
         "skipped_matmuls": skipped_matmuls,

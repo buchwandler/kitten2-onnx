@@ -105,6 +105,15 @@ def test_bundle_audit_reports_exact_files_initializers_operators_and_vocabulary(
         == (bundle / "lm/embed_tokens.npy").stat().st_size
     )
     assert graph["vocabulary"]["total_bytes_attributable_to_vocabulary"] > 0
+    storage = report["storage_breakdown"]
+    assert storage["lm_bytes"] == report["directories"]["lm"]
+    assert storage["non_lm_bytes"] == report["bundle_bytes"] - storage["lm_bytes"]
+    assert storage["vocabulary_initializer_storage_bytes"] == graph["vocabulary"][
+        "initializer_storage_bytes"
+    ]
+    assert storage["embedding_file_bytes"] == graph["vocabulary"]["embedding_file"][
+        "file_bytes"
+    ]
 
 
 def test_checkpoint_audit_reports_byte_weighted_ternary_fraction(tmp_path):
@@ -162,7 +171,9 @@ def test_size_audit_reports_matmul_nbits4_storage_by_operand_role(tmp_path):
     model.ir_version = min(model.ir_version, 10)
     onnx.save_model(model, str(graph_path))
 
-    report = _graph_size_report(graph_path)["matmul_nbits4"]
+    graph_report = _graph_size_report(graph_path)
+    report = graph_report["matmul_nbits"]
+    assert graph_report["matmul_nbits4"] == report
 
     assert report["node_count"] == 1
     assert report["initializer_count"] == 3
@@ -173,3 +184,129 @@ def test_size_audit_reports_matmul_nbits4_storage_by_operand_role(tmp_path):
     }
     assert report["total_storage_bytes"] == 274
     assert report["nodes"][0]["node"] == "ternary_projection"
+    configurations = report["configurations"]
+    assert len(configurations) == 1
+    assert {
+        key: configurations[0][key]
+        for key in (
+            "bits",
+            "block_size",
+            "accuracy_level",
+            "node_count",
+            "initializer_count",
+            "storage_bytes_by_role",
+            "total_storage_bytes",
+        )
+    } == {
+        "bits": 4,
+        "block_size": 128,
+        "accuracy_level": 1,
+        "node_count": 1,
+        "initializer_count": 3,
+        "storage_bytes_by_role": {
+            "packed_codes": 256,
+            "scales": 16,
+            "zero_points": 2,
+        },
+        "total_storage_bytes": 274,
+    }
+    assert report["nodes"][0]["accuracy_level"] == 1
+    assert report["nodes"][0]["packed_code_bytes"] == 256
+    assert report["nodes"][0]["scale_bytes"] == 16
+    assert report["nodes"][0]["zero_point_bytes"] == 2
+
+
+
+def test_size_audit_groups_nbits_storage_by_configuration(tmp_path):
+    graph_path = tmp_path / "lm.onnx"
+    initializers = [
+        onnx.numpy_helper.from_array(np.zeros((2, 2, 32), dtype=np.uint8), "codes_64"),
+        onnx.numpy_helper.from_array(np.ones((4,), dtype=np.float32), "scales_64"),
+        onnx.numpy_helper.from_array(np.full((2,), 0x88, dtype=np.uint8), "zeros_64"),
+        onnx.numpy_helper.from_array(np.zeros((2, 4, 16), dtype=np.uint8), "codes_32"),
+        onnx.numpy_helper.from_array(np.ones((8,), dtype=np.float32), "scales_32"),
+        onnx.numpy_helper.from_array(np.full((4,), 0x88, dtype=np.uint8), "zeros_32"),
+    ]
+    nodes = [
+        helper.make_node(
+            "MatMulNBits",
+            ["A", "codes_64", "scales_64", "zeros_64"],
+            ["Y64"],
+            name="projection_64",
+            domain="com.microsoft",
+            K=128,
+            N=2,
+            bits=4,
+            block_size=64,
+            accuracy_level=1,
+        ),
+        helper.make_node(
+            "MatMulNBits",
+            ["A", "codes_32", "scales_32", "zeros_32"],
+            ["Y32"],
+            name="projection_32",
+            domain="com.microsoft",
+            K=128,
+            N=2,
+            bits=4,
+            block_size=32,
+            accuracy_level=0,
+        ),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "nbits-config-audit",
+        [helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 128])],
+        [
+            helper.make_tensor_value_info("Y64", TensorProto.FLOAT, [1, 2]),
+            helper.make_tensor_value_info("Y32", TensorProto.FLOAT, [1, 2]),
+        ],
+        initializers,
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 18), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = min(model.ir_version, 10)
+    onnx.save_model(model, str(graph_path))
+
+    report = _graph_size_report(graph_path)["matmul_nbits"]
+
+    assert report["node_count"] == 2
+    assert report["storage_bytes_by_role"] == {
+        "packed_codes": 256,
+        "scales": 48,
+        "zero_points": 6,
+    }
+    assert [
+        (row["bits"], row["block_size"], row["accuracy_level"], row["total_storage_bytes"])
+        for row in report["configurations"]
+    ] == [(4, 32, 0, 164), (4, 64, 1, 146)]
+    assert report["nodes"][0]["packed_code_bytes"] == 128
+    assert report["nodes"][0]["scale_bytes"] == 16
+    assert report["nodes"][0]["zero_point_bytes"] == 2
+
+
+def test_size_audit_exposes_fallback_storage_and_provenance(tmp_path):
+    bundle = _write_tiny_bundle(tmp_path)
+    metadata_path = bundle / "lm/lm.meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    fallback_storage = {
+        "fallback_initializer_count": 1,
+        "fallback_fp32_bytes": 1024,
+        "nbits_bytes_removed": 164,
+        "net_bundle_byte_cost": 860,
+    }
+    provenance = {"onnx_version": "test", "cpu_architecture": "test-cpu"}
+    metadata["quantization"] = {
+        "fallback_storage": fallback_storage,
+        "provenance": provenance,
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    graph = _graph_size_report(bundle / "lm/lm.onnx")
+    report = audit_bundle(bundle)
+
+    assert graph["fallback_storage"] == fallback_storage
+    assert graph["quantization_provenance"] == provenance
+    assert report["storage_breakdown"]["fallback_storage"] == fallback_storage

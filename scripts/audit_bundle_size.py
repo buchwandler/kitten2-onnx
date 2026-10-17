@@ -93,16 +93,20 @@ def _tensor_hash(
 
 
 
-def _matmul_nbits4_size_report(
+def _matmul_nbits_size_report(
     graph: Any,
     initializer_details: list[dict[str, Any]],
 ) -> dict[str, Any]:
     initializers = {item["name"]: item for item in initializer_details}
-    roles: dict[str, set[str]] = {
+    role_names: dict[str, set[str]] = {
         "packed_codes": set(),
         "scales": set(),
         "zero_points": set(),
     }
+    grouped_nodes: dict[tuple[int, int, int | None], list[dict[str, Any]]] = defaultdict(list)
+    grouped_roles: dict[tuple[int, int, int | None], dict[str, set[str]]] = defaultdict(
+        lambda: {role: set() for role in role_names}
+    )
     nodes = []
     for node_index, node in enumerate(graph.node):
         if node.op_type != "MatMulNBits":
@@ -111,53 +115,98 @@ def _matmul_nbits4_size_report(
             attribute.name: onnx.helper.get_attribute_value(attribute)
             for attribute in node.attribute
         }
-        if attributes.get("bits") != 4:
+        bits = attributes.get("bits")
+        block_size = attributes.get("block_size")
+        if bits is None or block_size is None:
             continue
+        bits = int(bits)
+        block_size = int(block_size)
+        accuracy_level = attributes.get("accuracy_level")
+        if accuracy_level is not None:
+            accuracy_level = int(accuracy_level)
+        configuration = (bits, block_size, accuracy_level)
         input_names = {
             "packed_codes": node.input[1] if len(node.input) > 1 else "",
             "scales": node.input[2] if len(node.input) > 2 else "",
             "zero_points": node.input[3] if len(node.input) > 3 else "",
         }
+        operand_bytes = {}
         for role, name in input_names.items():
             if name in initializers:
-                roles[role].add(name)
-        nodes.append(
+                role_names[role].add(name)
+                grouped_roles[configuration][role].add(name)
+                operand_bytes[role] = initializers[name]["storage_bytes"]
+            else:
+                operand_bytes[role] = 0
+        row = {
+            "node": node.name or f"MatMulNBits#{node_index}",
+            "K": attributes.get("K"),
+            "N": attributes.get("N"),
+            "bits": bits,
+            "block_size": block_size,
+            "accuracy_level": accuracy_level,
+            "packed_code_bytes": operand_bytes["packed_codes"],
+            "scale_bytes": operand_bytes["scales"],
+            "zero_point_bytes": operand_bytes["zero_points"],
+            "initializers": input_names,
+        }
+        nodes.append(row)
+        grouped_nodes[configuration].append(row)
+
+    def role_details(names_by_role: dict[str, set[str]]) -> dict[str, list[dict[str, Any]]]:
+        return {
+            role: [
+                {
+                    "name": name,
+                    "dtype": initializers[name]["dtype"],
+                    "shape": initializers[name]["shape"],
+                    "logical_bytes": initializers[name]["logical_bytes"],
+                    "storage_bytes": initializers[name]["storage_bytes"],
+                }
+                for name in sorted(names)
+            ]
+            for role, names in names_by_role.items()
+        }
+
+    storage_bytes_by_role = {
+        role: sum(initializers[name]["storage_bytes"] for name in names)
+        for role, names in role_names.items()
+    }
+    all_names = set().union(*role_names.values())
+    configurations = []
+    for bits, block_size, accuracy_level in sorted(
+        grouped_nodes,
+        key=lambda key: (key[0], key[1], -1 if key[2] is None else key[2]),
+    ):
+        config_roles = grouped_roles[(bits, block_size, accuracy_level)]
+        config_storage = {
+            role: sum(initializers[name]["storage_bytes"] for name in names)
+            for role, names in config_roles.items()
+        }
+        config_names = set().union(*config_roles.values())
+        configurations.append(
             {
-                "node": node.name or f"MatMulNBits#{node_index}",
-                "K": attributes.get("K"),
-                "N": attributes.get("N"),
-                "bits": attributes["bits"],
-                "block_size": attributes.get("block_size"),
-                "initializers": input_names,
+                "bits": bits,
+                "block_size": block_size,
+                "accuracy_level": accuracy_level,
+                "node_count": len(grouped_nodes[(bits, block_size, accuracy_level)]),
+                "initializer_count": len(config_names),
+                "storage_bytes_by_role": config_storage,
+                "total_storage_bytes": sum(config_storage.values()),
+                "initializer_roles": role_details(config_roles),
             }
         )
 
-    initializer_roles = {
-        role: [
-            {
-                "name": name,
-                "dtype": initializers[name]["dtype"],
-                "shape": initializers[name]["shape"],
-                "logical_bytes": initializers[name]["logical_bytes"],
-                "storage_bytes": initializers[name]["storage_bytes"],
-            }
-            for name in sorted(names)
-        ]
-        for role, names in roles.items()
-    }
-    storage_bytes_by_role = {
-        role: sum(initializers[name]["storage_bytes"] for name in names)
-        for role, names in roles.items()
-    }
-    all_names = set().union(*roles.values())
     return {
         "node_count": len(nodes),
         "initializer_count": len(all_names),
         "storage_bytes_by_role": storage_bytes_by_role,
         "total_storage_bytes": sum(initializers[name]["storage_bytes"] for name in all_names),
-        "initializer_roles": initializer_roles,
+        "initializer_roles": role_details(role_names),
+        "configurations": configurations,
         "nodes": nodes,
     }
+
 def _graph_size_report(graph_path: Path) -> dict[str, Any]:
     model = onnx.load(str(graph_path), load_external_data=False)
     graph = model.graph
@@ -221,6 +270,7 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         for digest, names in sorted(hash_groups.items())
         if len(names) > 1
     ]
+    matmul_nbits = _matmul_nbits_size_report(graph, initializer_details)
     report: dict[str, Any] = {
         "graph": graph_path.name,
         "graph_bytes": graph_path.stat().st_size,
@@ -235,8 +285,8 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         )[:20],
         "duplicate_initializer_groups": duplicate_groups,
         "node_type_counts": dict(sorted(node_type_counts.items())),
-
-        "matmul_nbits4": _matmul_nbits4_size_report(graph, initializer_details),
+        "matmul_nbits": matmul_nbits,
+        "matmul_nbits4": matmul_nbits,
         "initializer_consumers": consumer_rows,
     }
 
@@ -245,6 +295,9 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         metadata = (
             json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
         )
+        quantization = metadata.get("quantization", {})
+        report["fallback_storage"] = quantization.get("fallback_storage", {})
+        report["quantization_provenance"] = quantization.get("provenance", {})
         vocab_size = metadata.get("vocab_size")
         hidden_size = metadata.get("hidden_size")
         candidates: list[dict[str, Any]] = []
@@ -346,14 +399,31 @@ def audit_bundle(
         }.get(relative, relative.removesuffix(".onnx"))
         graphs[graph_key] = _graph_size_report(graph_path)
 
+    bundle_bytes = sum(files.values())
+    lm_bytes = directory_bytes.get("lm", 0)
+    vocabulary = graphs.get("lm", {}).get("vocabulary", {})
+    embedding = vocabulary.get("embedding_file") or {}
     report: dict[str, Any] = {
         "format": "kitten2-onnx-size-audit-v1",
         "bundle_dir": str(root.resolve()),
         "runtime_profile": bundle_manifest.get("export", {}).get("runtime_profile"),
-        "bundle_bytes": sum(files.values()),
+        "bundle_bytes": bundle_bytes,
         "directories": directory_bytes,
         "files": files,
         "onnx": graphs,
+        "storage_breakdown": {
+            "lm_bytes": lm_bytes,
+            "non_lm_bytes": bundle_bytes - lm_bytes,
+            "decoder_bytes": directory_bytes.get("decoder", 0),
+            "vocabulary_initializer_storage_bytes": vocabulary.get(
+                "initializer_storage_bytes", 0
+            ),
+            "embedding_file_bytes": embedding.get("file_bytes", 0),
+            "vocabulary_total_bytes": vocabulary.get(
+                "total_bytes_attributable_to_vocabulary", 0
+            ),
+            "fallback_storage": graphs.get("lm", {}).get("fallback_storage", {}),
+        },
     }
     if checkpoint is not None:
         report["checkpoint"] = audit_checkpoint(checkpoint)

@@ -353,6 +353,53 @@ def test_optimize_cli_exposes_chunked_mode_without_removing_legacy_mode(monkeypa
     assert "ternary-nbits4" in help_output
     assert "--chunk-rows" in help_output
     assert "--exclude-matmul-initializer" in help_output
+    assert "--lm-method" in help_output
+    assert "--nbits-block-size" in help_output
+    assert "--nbits-accuracy-level" in help_output
+
+
+
+def test_optimize_cli_passes_nbits_configuration_and_exclusions(monkeypatch, capsys):
+    import scripts.optimize_bundle as optimize_module
+
+    calls = {}
+
+    def fake_optimize_bundle(input_bundle, output_bundle, **kwargs):
+        calls.update(input_bundle=input_bundle, output_bundle=output_bundle, **kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(optimize_module, "optimize_bundle", fake_optimize_bundle)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "optimize_bundle",
+            "source",
+            "output",
+            "--lm-method",
+            "ternary-nbits",
+            "--nbits",
+            "4",
+            "--nbits-block-size",
+            "32",
+            "--nbits-accuracy-level",
+            "0",
+            "--exclude-matmul-node",
+            "node-1",
+            "--exclude-matmul-initializer",
+            "weight-1",
+        ],
+    )
+
+    main()
+    capsys.readouterr()
+
+    assert calls["lm_method"] == "ternary-nbits"
+    assert calls["nbits"] == 4
+    assert calls["nbits_block_size"] == 32
+    assert calls["nbits_accuracy_level"] == 0
+    assert calls["exclude_matmul_nodes"] == ["node-1"]
+    assert calls["exclude_matmul_initializers"] == ["weight-1"]
 
 
 
@@ -402,10 +449,19 @@ def test_optimize_bundle_ternary_nbits4_reports_size_and_preserves_source(tmp_pa
     graph = onnx.load(str(graph_path), load_external_data=False)
     quantization = metadata["quantization"]
     assert bundle["export"]["lm_optimization"] == "ternary-nbits4"
-    assert quantization["method"] == "ternary-nbits4"
+    assert quantization["method"] == "ternary-nbits"
     assert quantization["bits"] == 4
     assert quantization["block_size"] == 128
+    assert quantization["source_group_size"] == 128
+    assert quantization["accuracy_level"] == 1
+    assert quantization["fallback_storage"]["fallback_initializer_count"] == 0
+    assert quantization["fallback_storage"]["net_bundle_byte_cost"] == 0
+    assert quantization["provenance"]["onnx_version"]
+    assert quantization["provenance"]["onnxruntime_version"]
+    assert quantization["provenance"]["repository_commit"]
     assert quantization["transformed_matmul_count"] == 196
+    assert quantization["source_eligible_matmul_count"] == 196
+    assert quantization["excluded_matmul_count"] == 0
     assert quantization["transformed_initializer_count"] == 1
     assert quantization["accidentally_transformed_non_ternary_count"] == 0
     assert len(quantization["transformed_nodes"]) == 196
@@ -423,8 +479,12 @@ def test_optimize_bundle_ternary_nbits4_reports_size_and_preserves_source(tmp_pa
     )
 
     size_report = json.loads((reports / "size-report.json").read_text(encoding="utf-8"))
-    nbits4 = size_report["onnx"]["lm"]["matmul_nbits4"]
+    nbits4 = size_report["onnx"]["lm"]["matmul_nbits"]
     assert nbits4["node_count"] == 196
+    assert size_report["storage_breakdown"]["fallback_storage"] == quantization[
+        "fallback_storage"
+    ]
+    assert nbits4["configurations"][0]["accuracy_level"] == 1
     assert nbits4["storage_bytes_by_role"] == {
         "packed_codes": 128,
         "scales": 8,
@@ -449,6 +509,86 @@ def test_optimize_bundle_ternary_nbits4_reports_size_and_preserves_source(tmp_pa
         for relative_path in [path.relative_to(source).as_posix()]
     } == source_files
 
+
+def test_optimize_ternary_nbits_excluded_node_preserves_shared_initializer(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_ternary_tiny_bundle(source)
+    source_graph = (source / "lm/lm.onnx").read_bytes()
+    source_data = (source / "lm/lm.onnx.data").read_bytes()
+    output = tmp_path / "optimized"
+
+    report = optimize_bundle(
+        source,
+        output,
+        lm_method="ternary-nbits",
+        nbits_block_size=32,
+        exclude_matmul_nodes=("ternary_matmul_0",),
+    )
+
+    quantization = report["quantization"]
+    graph = onnx.load(str(output / "lm/lm.onnx"), load_external_data=False)
+    assert quantization["source_eligible_matmul_count"] == 196
+    assert quantization["transformed_matmul_count"] == 195
+    assert quantization["excluded_matmul_count"] == 1
+    assert quantization["block_size"] == 32
+    excluded = quantization["excluded_matmuls"]
+    assert len(excluded) == 1
+    assert {
+        key: excluded[0][key] for key in ("node", "initializer", "reason")
+    } == {
+        "node": "ternary_matmul_0",
+        "initializer": "weight",
+        "reason": "explicitly excluded by node exclusion",
+    }
+    assert excluded[0]["source_shape"] == [128, 2]
+    assert len(excluded[0]["source_sha256"]) == 64
+    assert quantization["fallback_storage"]["fallback_fp32_bytes"] == 1024
+    assert quantization["fallback_storage"]["nbits_bytes_removed"] == 0
+    assert quantization["fallback_storage"]["net_bundle_byte_cost"] == 1024
+    provenance = quantization["provenance"]
+    assert provenance["onnx_version"]
+    assert provenance["onnxruntime_version"]
+    assert provenance["python_version"]
+    assert provenance["cpu_architecture"]
+    assert len(provenance["repository_commit"]) == 40
+    assert graph.graph.node[0].op_type == "MatMul"
+    assert all(node.op_type == "MatMulNBits" for node in graph.graph.node[1:])
+    assert any(tensor.name == "weight" for tensor in graph.graph.initializer)
+    excluded_weight = next(tensor for tensor in graph.graph.initializer if tensor.name == "weight")
+    assert excluded_weight.data_location == TensorProto.EXTERNAL
+    external_location = next(
+        entry.value for entry in excluded_weight.external_data if entry.key == "location"
+    )
+    assert (output / "lm" / external_location).is_file()
+    assert (source / "lm/lm.onnx").read_bytes() == source_graph
+    assert (source / "lm/lm.onnx.data").read_bytes() == source_data
+
+
+def test_optimize_ternary_nbits_excluded_initializer_keeps_all_matmuls(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_ternary_tiny_bundle(source)
+    output = tmp_path / "optimized"
+
+    report = optimize_bundle(
+        source,
+        output,
+        lm_method="ternary-nbits",
+        exclude_matmul_initializers=("weight",),
+    )
+
+    quantization = report["quantization"]
+    graph = onnx.load(str(output / "lm/lm.onnx"), load_external_data=False)
+    assert quantization["source_eligible_matmul_count"] == 196
+    assert quantization["transformed_matmul_count"] == 0
+    assert quantization["excluded_matmul_count"] == 196
+    assert quantization["fallback_storage"]["fallback_fp32_bytes"] == 1024
+    assert quantization["fallback_storage"]["nbits_bytes_removed"] == 138
+    assert quantization["fallback_storage"]["net_bundle_byte_cost"] == 886
+    assert all(node.op_type == "MatMul" for node in graph.graph.node)
+
+    assert any(tensor.name == "weight" for tensor in graph.graph.initializer)
 
 def test_optimize_bundle_ternary_nbits4_cleans_failed_external_output(tmp_path, monkeypatch):
     import onnxruntime as ort
