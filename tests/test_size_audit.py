@@ -4,6 +4,7 @@ import json
 
 import numpy as np
 import onnx
+import pytest
 import torch
 from onnx import TensorProto, helper
 from safetensors.torch import save_file
@@ -310,3 +311,73 @@ def test_size_audit_exposes_fallback_storage_and_provenance(tmp_path):
     assert graph["fallback_storage"] == fallback_storage
     assert graph["quantization_provenance"] == provenance
     assert report["storage_breakdown"]["fallback_storage"] == fallback_storage
+
+
+@pytest.mark.parametrize(
+    ("signed_zero_encoding", "encoding_version", "reconstruction"),
+    [(False, 1, None), (True, 2, "where")],
+)
+def test_size_audit_recognizes_legacy_and_signed_zero_exact_storage(
+    tmp_path, signed_zero_encoding, encoding_version, reconstruction
+):
+    graph_path = tmp_path / "lm.onnx"
+    initializers = [
+        onnx.numpy_helper.from_array(np.zeros((1, 128, 2), dtype=np.int8), "codes"),
+        onnx.numpy_helper.from_array(np.ones((1, 1, 2), dtype=np.float32), "scales"),
+        onnx.numpy_helper.from_array(np.asarray([128, 2], dtype=np.int64), "shape"),
+    ]
+    nodes = []
+    product_name = "scaled_codes"
+    if signed_zero_encoding:
+        initializers.extend(
+            [
+                onnx.numpy_helper.from_array(np.asarray(-2, dtype=np.int8), "marker"),
+                onnx.numpy_helper.from_array(np.asarray(-0.0, dtype=np.float32), "negative_zero"),
+            ]
+        )
+        nodes.append(helper.make_node("Equal", ["codes", "marker"], ["negative_zero_mask"]))
+    nodes.extend(
+        [
+            helper.make_node("Cast", ["codes"], ["float_codes"], to=TensorProto.FLOAT),
+            helper.make_node("Mul", ["float_codes", "scales"], [product_name]),
+        ]
+    )
+    if signed_zero_encoding:
+        nodes.append(
+            helper.make_node(
+                "Where",
+                ["negative_zero_mask", "negative_zero", product_name],
+                ["signed_zero_codes"],
+            )
+        )
+        product_name = "signed_zero_codes"
+    nodes.extend(
+        [
+            helper.make_node("Reshape", [product_name, "shape"], ["weight"]),
+            helper.make_node("MatMul", ["A", "weight"], ["Y"], name="exact_matmul"),
+        ]
+    )
+    graph = helper.make_graph(
+        nodes,
+        "exact-storage-audit",
+        [helper.make_tensor_value_info("A", TensorProto.FLOAT, [1, 128])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 2])],
+        initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+    model.ir_version = min(model.ir_version, 10)
+    onnx.save_model(model, str(graph_path))
+
+    report = _graph_size_report(graph_path)["ternary_exact_int8"]
+
+    assert report["node_count"] == 1
+    assert report["encoding_versions"] == [encoding_version]
+    assert report["negative_zero_code"] == (-2 if signed_zero_encoding else None)
+    assert report["negative_zero_preserved"] is signed_zero_encoding
+    assert report["negative_zero_reconstruction"] == reconstruction
+    assert report["initializer_count"] == 2
+    assert report["storage_bytes_by_role"] == {"int8_codes": 256, "float32_scales": 8}
+    assert report["total_storage_bytes"] == 264
+    assert report["source_fp32_bytes_replaced"] == 1024
+    assert report["storage_reduction_bytes"] == 760
+    assert report["exact_storage_ratio"] == 264 / 1024

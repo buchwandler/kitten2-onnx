@@ -68,12 +68,16 @@ def _write_tiny_bundle(root: Path) -> None:
 
 
 
-def _write_ternary_tiny_bundle(root: Path, matmul_count: int = 196) -> np.ndarray:
+def _write_ternary_tiny_bundle(
+    root: Path, matmul_count: int = 196, *, signed_zero: bool = False
+) -> np.ndarray:
     _write_tiny_bundle(root)
     lm_dir = root / "lm"
     weight = np.zeros((128, 2), dtype=np.float32)
     weight[0] = [0.5, -0.25]
     weight[1] = [-0.5, 0.25]
+    if signed_zero:
+        weight[2, 0] = np.float32(-0.0)
     output_names = [f"logits_{index}" for index in range(matmul_count)]
     graph = helper.make_graph(
         [
@@ -654,7 +658,7 @@ def test_optimize_bundle_ternary_nbits4_cleans_failed_external_output(tmp_path, 
 def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
-    weight = _write_ternary_tiny_bundle(source)
+    weight = _write_ternary_tiny_bundle(source, signed_zero=True)
     source_files = {
         path.relative_to(source).as_posix(): path.read_bytes()
         for path in source.rglob("*")
@@ -683,6 +687,11 @@ def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source
     assert quantization["group_size"] == 128
     assert quantization["code_dtype"] == "int8"
     assert quantization["scale_dtype"] == "float32"
+    assert quantization["encoding_version"] == 2
+    assert quantization["code_values"] == [-2, -1, 0, 1]
+    assert quantization["negative_zero_code"] == -2
+    assert quantization["negative_zero_count"] == 1
+    assert quantization["negative_zero_preserved"] is True
     assert quantization["exact_reconstruction"] is True
     assert quantization["transformed_matmul_count"] == 196
     assert quantization["transformed_initializer_count"] == 1
@@ -694,7 +703,10 @@ def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source
     assert metadata["quantization"] == quantization
     assert quantization["external_data_files"] == ["lm.ternary-exact-int8.onnx.data"]
     assert not (output / "lm/lm.onnx.data").exists()
-    assert all(node.op_type in {"Cast", "Mul", "Reshape", "MatMul"} for node in graph.graph.node)
+    assert all(
+        node.op_type in {"Equal", "Cast", "Mul", "Add", "Sub", "Reshape", "MatMul"}
+        for node in graph.graph.node
+    )
     assert sum(node.op_type == "MatMul" for node in graph.graph.node) == 196
 
     import onnxruntime as ort
@@ -709,6 +721,10 @@ def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source
     size_report = json.loads((reports / "size-report.json").read_text(encoding="utf-8"))
     exact_storage = size_report["onnx"]["lm"]["ternary_exact_int8"]
     assert exact_storage["node_count"] == 196
+    assert exact_storage["encoding_versions"] == [2]
+    assert exact_storage["negative_zero_code"] == -2
+    assert exact_storage["negative_zero_preserved"] is True
+    assert exact_storage["negative_zero_reconstruction"] == "arithmetic"
     assert exact_storage["storage_bytes_by_role"] == {
         "int8_codes": 256,
         "float32_scales": 8,
@@ -784,7 +800,7 @@ def test_optimize_bundle_ternary_exact_int8_include_selects_only_requested_nodes
     assert quantization["transformed_matmul_count"] == 1
     assert quantization["excluded_nodes"] == ["ternary_matmul_0", "ternary_matmul_2"]
     assert sum(node.op_type == "MatMul" for node in graph.graph.node) == 3
-    assert sum(node.op_type == "Cast" for node in graph.graph.node) == 1
+    assert sum(node.op_type == "Cast" for node in graph.graph.node) == 2
     assert any(tensor.name == "weight" for tensor in graph.graph.initializer)
     assert (source / "lm/lm.onnx").read_bytes() == source_graph
     size_report = json.loads(Path(report["size_report"]).read_text(encoding="utf-8"))

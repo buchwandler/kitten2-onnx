@@ -212,49 +212,143 @@ def _ternary_exact_int8_size_report(
     initializer_details: list[dict[str, Any]],
 ) -> dict[str, Any]:
     initializers = {item["name"]: item for item in initializer_details}
-    cast_outputs: dict[str, str] = {}
-    for node in graph.node:
-        if node.op_type != "Cast" or not node.input or not node.output:
+    scalar_values: dict[str, Any] = {}
+    for tensor in graph.initializer:
+        if tensor.dims or tensor.data_location == TensorProto.EXTERNAL or tensor.external_data:
             continue
-        code = initializers.get(node.input[0])
-        casts_to_float = any(
+        if tensor.data_type in {TensorProto.INT8, TensorProto.FLOAT}:
+            value = np.asarray(onnx.numpy_helper.to_array(tensor))
+            if value.size == 1:
+                scalar_values[tensor.name] = value.item()
+
+    producers = {
+        output: node
+        for node in graph.node
+        for output in node.output
+        if output
+    }
+
+    def casts_to_float(node: Any) -> bool:
+        return any(
             attribute.name == "to"
             and onnx.helper.get_attribute_value(attribute) == TensorProto.FLOAT
             for attribute in node.attribute
         )
-        if (
-            code
-            and code["dtype"] == "INT8"
-            and len(code["shape"]) == 3
-            and code["shape"][1] == 128
-            and casts_to_float
-        ):
-            cast_outputs[node.output[0]] = node.input[0]
 
-    reconstructed: dict[str, tuple[str, str]] = {}
+    code_casts: dict[str, str] = {}
+    float_cast_inputs: dict[str, str] = {}
+    for node in graph.node:
+        if node.op_type != "Cast" or not node.input or not node.output or not casts_to_float(node):
+            continue
+        source = initializers.get(node.input[0])
+        if (
+            source
+            and source["dtype"] == "INT8"
+            and len(source["shape"]) == 3
+            and source["shape"][1] == 128
+        ):
+            code_casts[node.output[0]] = node.input[0]
+        else:
+            float_cast_inputs[node.output[0]] = node.input[0]
+
+    def scale_for(inputs: list[str], code_name: str) -> str | None:
+        code_shape = initializers[code_name]["shape"]
+        for name in inputs:
+            scale = initializers.get(name)
+            if (
+                scale
+                and scale["dtype"] == "FLOAT"
+                and len(scale["shape"]) == 3
+                and scale["shape"][1] == 1
+                and code_shape[0] == scale["shape"][0]
+                and code_shape[2] == scale["shape"][2]
+            ):
+                return name
+        return None
+
+    def is_marker_equal(output: str, code_name: str) -> bool:
+        node = producers.get(output)
+        if node is None or node.op_type != "Equal" or len(node.input) != 2:
+            return False
+        return any(
+            name == code_name and scalar_values.get(other) == -2
+            for name, other in ((node.input[0], node.input[1]), (node.input[1], node.input[0]))
+        )
+
+    reconstructed: dict[str, tuple[str, str, int, str]] = {}
     for node in graph.node:
         if node.op_type != "Mul" or not node.output:
             continue
-        code_name = next((cast_outputs[name] for name in node.input if name in cast_outputs), None)
-        scale_name = next(
-            (
-                name
-                for name in node.input
-                if name in initializers
-                and initializers[name]["dtype"] == "FLOAT"
-                and len(initializers[name]["shape"]) == 3
-                and initializers[name]["shape"][1] == 1
-            ),
-            None,
-        )
-        if code_name is None or scale_name is None:
+        code_name = next((code_casts[name] for name in node.input if name in code_casts), None)
+        if code_name is None:
             continue
-        code_shape = initializers[code_name]["shape"]
-        scale_shape = initializers[scale_name]["shape"]
-        if code_shape[0] == scale_shape[0] and code_shape[2] == scale_shape[2]:
-            reconstructed[node.output[0]] = (code_name, scale_name)
+        scale_name = scale_for(list(node.input), code_name)
+        if scale_name is not None:
+            reconstructed[node.output[0]] = (code_name, scale_name, 1, "direct")
 
-    reshaped: dict[str, tuple[str, str]] = {}
+    for node in graph.node:
+        if node.op_type != "Where" or len(node.input) != 3 or not node.output:
+            continue
+        pair = reconstructed.get(node.input[2])
+        if pair is None:
+            continue
+        code_name, scale_name, _, _ = pair
+        if (
+            is_marker_equal(node.input[0], code_name)
+            and node.input[1] in scalar_values
+            and float(scalar_values[node.input[1]]) == 0.0
+            and np.signbit(np.float32(scalar_values[node.input[1]]))
+        ):
+            reconstructed[node.output[0]] = (code_name, scale_name, 2, "where")
+
+    for node in graph.node:
+        if node.op_type != "Mul" or len(node.input) != 2 or not node.output:
+            continue
+        for scaled_output, sign_output in (node.input, node.input[::-1]):
+            scaled = producers.get(scaled_output)
+            sign = producers.get(sign_output)
+            if scaled is None or scaled.op_type != "Mul" or sign is None or sign.op_type != "Sub":
+                continue
+            add_output = next(
+                (name for name in scaled.input if name not in initializers), None
+            )
+            add = producers.get(add_output) if add_output else None
+            if add is None or add.op_type != "Add":
+                continue
+            code_float = next((name for name in add.input if name in code_casts), None)
+            if code_float is None:
+                continue
+            code_name = code_casts[code_float]
+            scale_name = scale_for(list(scaled.input), code_name)
+            if scale_name is None:
+                continue
+            offset_output = next(
+                (name for name in add.input if name != code_float), None
+            )
+            offset = producers.get(offset_output) if offset_output else None
+            if offset is None or offset.op_type != "Mul" or len(offset.input) != 2:
+                continue
+            mask_float = next(
+                (name for name in offset.input if name in float_cast_inputs), None
+            )
+            if mask_float is None or scalar_values.get(next(
+                (name for name in offset.input if name != mask_float), ""
+            )) != 2.0:
+                continue
+            mask_output = float_cast_inputs[mask_float]
+            sign_uses_offset = offset_output in sign.input
+            sign_uses_one = any(
+                name != offset_output and scalar_values.get(name) == 1.0 for name in sign.input
+            )
+            if (
+                sign_uses_offset
+                and sign_uses_one
+                and is_marker_equal(mask_output, code_name)
+            ):
+                reconstructed[node.output[0]] = (code_name, scale_name, 2, "arithmetic")
+                break
+
+    reshaped: dict[str, tuple[str, str, int, str]] = {}
     for node in graph.node:
         if node.op_type == "Reshape" and node.input and node.output:
             pair = reconstructed.get(node.input[0])
@@ -270,7 +364,7 @@ def _ternary_exact_int8_size_report(
         pair = reshaped.get(node.input[1])
         if pair is None:
             continue
-        code_name, scale_name = pair
+        code_name, scale_name, encoding_version, reconstruction = pair
         code_names.add(code_name)
         scale_names.add(scale_name)
         matched_nodes.append(
@@ -278,6 +372,9 @@ def _ternary_exact_int8_size_report(
                 "node": node.name or f"MatMul#{index}",
                 "code_initializer": code_name,
                 "scale_initializer": scale_name,
+                "encoding_version": encoding_version,
+                "negative_zero_preserved": encoding_version == 2,
+                "reconstruction": reconstruction,
             }
         )
 
@@ -287,10 +384,20 @@ def _ternary_exact_int8_size_report(
         int(np.prod(initializers[name]["shape"], dtype=np.int64)) * 4 for name in code_names
     )
     stored_bytes = code_bytes + scale_bytes
+    encoding_versions = sorted({row["encoding_version"] for row in matched_nodes})
+    reconstructions = sorted({row["reconstruction"] for row in matched_nodes})
     return {
         "group_size": 128,
         "code_dtype": "int8",
         "scale_dtype": "float32",
+        "encoding_versions": encoding_versions,
+        "negative_zero_code": -2 if 2 in encoding_versions else None,
+        "negative_zero_preserved": 2 in encoding_versions,
+        "negative_zero_reconstruction": (
+            reconstructions[0] if len(reconstructions) == 1 and 2 in encoding_versions
+            else "mixed" if 2 in encoding_versions
+            else None
+        ),
         "node_count": len(matched_nodes),
         "initializer_count": len(code_names | scale_names),
         "storage_bytes_by_role": {
@@ -303,6 +410,7 @@ def _ternary_exact_int8_size_report(
         "exact_storage_ratio": stored_bytes / source_fp32_bytes if source_fp32_bytes else None,
         "nodes": matched_nodes,
     }
+
 
 
 def _graph_size_report(graph_path: Path) -> dict[str, Any]:

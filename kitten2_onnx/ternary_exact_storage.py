@@ -29,6 +29,27 @@ from kitten2_onnx.quantize_ternary_nbits import (
     _unique_graph_name,
 )
 
+TERNARY_NEGATIVE_ZERO_CODE = np.int8(-2)
+TERNARY_NEGATIVE_CODE = np.int8(-1)
+TERNARY_POSITIVE_ZERO_CODE = np.int8(0)
+TERNARY_POSITIVE_CODE = np.int8(1)
+TERNARY_CODE_VALUES = (-2, -1, 0, 1)
+TERNARY_ENCODING_VERSION = 2
+
+def _reconstruction_constants(
+    used_names: set[str],
+) -> tuple[str, str, str, list[onnx.TensorProto]]:
+    marker_name = _unique_graph_name("ternary_exact_negative_zero_marker", used_names)
+    one_name = _unique_graph_name("ternary_exact_one", used_names)
+    two_name = _unique_graph_name("ternary_exact_two", used_names)
+    return marker_name, one_name, two_name, [
+        numpy_helper.from_array(
+            np.asarray(TERNARY_NEGATIVE_ZERO_CODE, dtype=np.int8), name=marker_name
+        ),
+        numpy_helper.from_array(np.asarray(1.0, dtype=np.float32), name=one_name),
+        numpy_helper.from_array(np.asarray(2.0, dtype=np.float32), name=two_name),
+    ]
+
 
 @dataclass(frozen=True)
 class TernaryExactStorageConfig:
@@ -50,18 +71,35 @@ def _encode_group(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if group.ndim != 2 or group.shape[0] != 128:
         raise ValueError(f"ternary group must have shape [128, N], found {group.shape}")
-    if np.any((group == 0) & np.signbit(group)):
-        raise ValueError("negative zero cannot be represented by ternary INT8 codes and scales")
 
+    negative_zero = (group == 0) & np.signbit(group)
     scales = np.abs(group).max(axis=0).astype(np.float32, copy=False)
-    codes = np.where(group < 0, -1, np.where(group > 0, 1, 0)).astype(np.int8)
+    codes = np.where(
+        negative_zero,
+        TERNARY_NEGATIVE_ZERO_CODE,
+        np.where(
+            group < 0,
+            TERNARY_NEGATIVE_CODE,
+            np.where(
+                group > 0,
+                TERNARY_POSITIVE_CODE,
+                TERNARY_POSITIVE_ZERO_CODE,
+            ),
+        ),
+    ).astype(np.int8)
     reconstructed = codes.astype(np.float32) * scales[None, :]
+    reconstructed = np.where(
+        codes == TERNARY_NEGATIVE_ZERO_CODE,
+        np.float32(-0.0),
+        reconstructed,
+    ).astype(np.float32, copy=False)
     if not np.array_equal(
         np.ascontiguousarray(reconstructed).view(np.uint32),
         np.ascontiguousarray(group).view(np.uint32),
     ):
         raise ValueError("ternary INT8 reconstruction is not bit-identical to the source group")
     return codes, scales, reconstructed
+
 
 
 def _encode_weight(weight: np.ndarray, config: TernaryExactStorageConfig) -> tuple[np.ndarray, np.ndarray]:
@@ -93,31 +131,78 @@ def _reconstruction_nodes(
     scale_name: str,
     shape_name: str,
     reconstructed_name: str,
+    marker_name: str,
+    one_name: str,
+    two_name: str,
     used_names: set[str],
 ) -> list[onnx.NodeProto]:
-    cast_name = _unique_graph_name(f"{weight_name}_ternary_exact_float", used_names)
-    product_name = _unique_graph_name(f"{weight_name}_ternary_exact_scaled", used_names)
+    mask_name = _unique_graph_name(f"{weight_name}_ternary_exact_negative_zero_mask", used_names)
+    code_float_name = _unique_graph_name(f"{weight_name}_ternary_exact_float", used_names)
+    mask_float_name = _unique_graph_name(f"{weight_name}_ternary_exact_mask_float", used_names)
+    offset_name = _unique_graph_name(f"{weight_name}_ternary_exact_marker_offset", used_names)
+    adjusted_code_name = _unique_graph_name(f"{weight_name}_ternary_exact_adjusted_code", used_names)
+    scaled_name = _unique_graph_name(f"{weight_name}_ternary_exact_scaled", used_names)
+    sign_name = _unique_graph_name(f"{weight_name}_ternary_exact_sign", used_names)
+    value_name = _unique_graph_name(f"{weight_name}_ternary_exact_value", used_names)
     return [
+        helper.make_node(
+            "Equal",
+            [code_name, marker_name],
+            [mask_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_equal", used_names),
+        ),
         helper.make_node(
             "Cast",
             [code_name],
-            [cast_name],
-            name=_unique_graph_name(f"{node_name}_ternary_exact_cast", used_names),
+            [code_float_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_code_cast", used_names),
+            to=TensorProto.FLOAT,
+        ),
+        helper.make_node(
+            "Cast",
+            [mask_name],
+            [mask_float_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_mask_cast", used_names),
             to=TensorProto.FLOAT,
         ),
         helper.make_node(
             "Mul",
-            [cast_name, scale_name],
-            [product_name],
-            name=_unique_graph_name(f"{node_name}_ternary_exact_mul", used_names),
+            [mask_float_name, two_name],
+            [offset_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_marker_offset", used_names),
+        ),
+        helper.make_node(
+            "Add",
+            [code_float_name, offset_name],
+            [adjusted_code_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_adjust_code", used_names),
+        ),
+        helper.make_node(
+            "Mul",
+            [adjusted_code_name, scale_name],
+            [scaled_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_scale", used_names),
+        ),
+        helper.make_node(
+            "Sub",
+            [one_name, offset_name],
+            [sign_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_sign", used_names),
+        ),
+        helper.make_node(
+            "Mul",
+            [scaled_name, sign_name],
+            [value_name],
+            name=_unique_graph_name(f"{node_name}_ternary_exact_signed_zero", used_names),
         ),
         helper.make_node(
             "Reshape",
-            [product_name, shape_name],
+            [value_name, shape_name],
             [reconstructed_name],
             name=_unique_graph_name(f"{node_name}_ternary_exact_reshape", used_names),
         ),
     ]
+
 
 
 def rewrite_matmul_to_exact_ternary_storage(
@@ -154,6 +239,9 @@ def rewrite_matmul_to_exact_ternary_storage(
     codes, scales = _encode_weight(weight, config)
     k, n = weight.shape
     used_names = _graph_names(rewritten.graph)
+    marker_name, one_name, two_name, reconstruction_initializers = _reconstruction_constants(
+        used_names
+    )
     code_name = _unique_graph_name(f"{weight_name}_ternary_exact_codes", used_names)
     scale_name = _unique_graph_name(f"{weight_name}_ternary_exact_scales", used_names)
     shape_name = _unique_graph_name(f"{weight_name}_ternary_exact_shape", used_names)
@@ -162,6 +250,7 @@ def rewrite_matmul_to_exact_ternary_storage(
     )
     rewritten.graph.initializer.extend(
         [
+            *reconstruction_initializers,
             numpy_helper.from_array(codes, name=code_name),
             numpy_helper.from_array(scales, name=scale_name),
             numpy_helper.from_array(np.asarray([k, n], dtype=np.int64), name=shape_name),
@@ -177,6 +266,9 @@ def rewrite_matmul_to_exact_ternary_storage(
         scale_name,
         shape_name,
         reconstructed_name,
+        marker_name,
+        one_name,
+        two_name,
         used_names,
     )
     for offset, added_node in enumerate(additions):
@@ -289,10 +381,12 @@ def _write_exact_weight(
     code_offset = writer.start_tensor()
     code_digest = hashlib.sha256()
     code_bytes = 0
+    negative_zero_count = 0
     try:
         for start in range(0, k, config.group_size):
             group = np.asarray(weight[start : start + config.group_size])
             codes, _, _ = _encode_group(group)
+            negative_zero_count += int(np.count_nonzero(codes == TERNARY_NEGATIVE_ZERO_CODE))
             code_block = np.ascontiguousarray(codes)
             code_payload = memoryview(code_block).cast("B")
             writer.write(code_payload)
@@ -352,6 +446,11 @@ def _write_exact_weight(
         "scale_initializer": scale_name,
         "scale_bytes": scale_bytes,
         "scale_sha256": scale_digest.hexdigest(),
+        "encoding_version": TERNARY_ENCODING_VERSION,
+        "code_values": list(TERNARY_CODE_VALUES),
+        "negative_zero_code": int(TERNARY_NEGATIVE_ZERO_CODE),
+        "negative_zero_count": negative_zero_count,
+        "negative_zero_preserved": True,
         "exact_reconstruction": True,
     }
 
@@ -449,6 +548,9 @@ def compress_ternary_matmuls_streaming(
             source_shapes[initializer_name] = (k, n)
 
         used_names = _graph_names(model.graph)
+        marker_name, one_name, two_name, reconstruction_initializers = _reconstruction_constants(
+            used_names
+        )
         names_by_weight: dict[str, tuple[str, str, str, str]] = {}
         for initializer_name in targets_by_weight:
             names_by_weight[initializer_name] = (
@@ -477,6 +579,7 @@ def compress_ternary_matmuls_streaming(
         external_location = temporary_data.name
         new_initializers: list[onnx.TensorProto] = []
         new_nodes_by_index: dict[int, list[onnx.NodeProto]] = defaultdict(list)
+        new_initializers.extend(reconstruction_initializers)
         initializer_reports: list[dict[str, Any]] = []
         source_fp32_bytes_replaced = 0
 
@@ -530,9 +633,12 @@ def compress_ternary_matmuls_streaming(
                         scale_name,
                         shape_name,
                         reconstructed_name,
+                        marker_name,
+                        one_name,
+                        two_name,
                         used_names,
                     )
-                )
+)
                 for _, _, node in rows:
                     node.input[1] = reconstructed_name
                 if initializer_name in removed_weights:
@@ -577,8 +683,14 @@ def compress_ternary_matmuls_streaming(
         ]
         code_bytes = sum(row["code_bytes"] for row in initializer_reports)
         scale_bytes = sum(row["scale_bytes"] for row in initializer_reports)
+        negative_zero_count = sum(row["negative_zero_count"] for row in initializer_reports)
         report = {
-            "format": "kitten2-onnx-ternary-exact-storage-v1",
+            "format": "kitten2-onnx-ternary-exact-storage-v2",
+            "encoding_version": TERNARY_ENCODING_VERSION,
+            "code_values": list(TERNARY_CODE_VALUES),
+            "negative_zero_code": int(TERNARY_NEGATIVE_ZERO_CODE),
+            "negative_zero_count": negative_zero_count,
+            "negative_zero_preserved": True,
             "source_graph_sha256": source_graph_sha256,
             "source_external_data_sha256": source_external_data_sha256,
             "output_graph_sha256": _sha256_file(temporary_graph),

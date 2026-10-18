@@ -28,6 +28,22 @@ def _weight(k: int, n: int) -> np.ndarray:
     return (signs * scales[:, None, :]).reshape(k, n)
 
 
+
+def _weight_with_signed_zeros() -> np.ndarray:
+    weight = _weight(256, 4)
+    weight[:, 0] = np.float32(0.0)
+    weight[0, 0] = np.float32(-0.0)
+    weight[1, 0] = np.float32(0.0)
+    weight[2, 0] = np.float32(0.5)
+    weight[3, 0] = np.float32(-0.5)
+    weight[128, 0] = np.float32(-0.0)
+    weight[129, 0] = np.float32(0.0)
+    weight[130, 0] = np.float32(0.125)
+    weight[131, 0] = np.float32(-0.125)
+    weight[:, 1] = np.float32(0.0)
+    weight[::2, 1] = np.float32(-0.0)
+    return weight
+
 def _matmul_model(weight: np.ndarray, *, extra_consumer: bool = False) -> onnx.ModelProto:
     k, n = weight.shape
     nodes = [helper.make_node("MatMul", ["A", "W"], ["Y"], name="tiny_matmul")]
@@ -88,7 +104,7 @@ def test_encode_exact_ternary_weight_is_bit_identical(shape: tuple[int, int]):
 
     assert codes.shape == (shape[0] // 128, 128, shape[1])
     assert scales.shape == (shape[0] // 128, 1, shape[1])
-    assert set(np.unique(codes)) <= {-1, 0, 1}
+    assert set(np.unique(codes)) <= {-2, -1, 0, 1}
     np.testing.assert_array_equal(
         reconstructed.reshape(shape).view(np.uint32), weight.view(np.uint32)
     )
@@ -105,16 +121,32 @@ def test_config_rejects_non_group_128_and_other_dtypes():
         TernaryExactStorageConfig(scale_dtype="float16")
 
 
-def test_encode_rejects_nonternary_and_negative_zero():
+def test_encode_rejects_nonternary_values():
     nonternary = np.zeros((128, 2), dtype=np.float32)
     nonternary[:2, 0] = [0.5, 0.625]
     with pytest.raises(ValueError, match="not exact group-128 ternary"):
         _encode_weight(nonternary, TernaryExactStorageConfig())
 
-    negative_zero = _weight(128, 2)
-    negative_zero[3, 0] = np.float32(-0.0)
-    with pytest.raises(ValueError, match="negative zero"):
-        _encode_weight(negative_zero, TernaryExactStorageConfig())
+
+def test_encode_preserves_signed_zero_and_nonzero_codes_bit_exactly():
+    weight = _weight_with_signed_zeros()
+    codes, scales = _encode_weight(weight, TernaryExactStorageConfig())
+    reconstructed = codes.astype(np.float32) * scales
+    negative_zero_codes = codes == -2
+    reconstructed = np.where(negative_zero_codes, np.float32(-0.0), reconstructed)
+
+    assert set(np.unique(codes)) <= {-2, -1, 0, 1}
+    np.testing.assert_array_equal(
+        codes.reshape(weight.shape)[(weight == 0) & np.signbit(weight)], -2
+    )
+    np.testing.assert_array_equal(
+        codes.reshape(weight.shape)[(weight == 0) & ~np.signbit(weight)], 0
+    )
+    np.testing.assert_array_equal(codes.reshape(weight.shape)[weight < 0], -1)
+    np.testing.assert_array_equal(codes.reshape(weight.shape)[weight > 0], 1)
+    np.testing.assert_array_equal(reconstructed.reshape(weight.shape).view(np.uint32), weight.view(np.uint32))
+    assert np.all(scales[0, 0, 1] == 0)
+    assert set(np.unique(codes[0, :, 1])) == {-2, 0}
 
 
 def test_rewrite_matmul_uses_primitive_ops_and_matches_baseline():
@@ -129,7 +161,13 @@ def test_rewrite_matmul_uses_primitive_ops_and_matches_baseline():
     assert [node.op_type for node in source.graph.node] == ["MatMul"]
     assert source.SerializeToString() == source_bytes
     assert [node.op_type for node in rewritten.graph.node] == [
+        "Equal",
         "Cast",
+        "Cast",
+        "Mul",
+        "Add",
+        "Mul",
+        "Sub",
         "Mul",
         "Reshape",
         "MatMul",
@@ -144,6 +182,38 @@ def test_rewrite_matmul_uses_primitive_ops_and_matches_baseline():
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
+
+def test_rewrite_preserves_signed_zero_weight_bits_in_ort():
+    weight = _weight_with_signed_zeros()
+    activation = np.random.default_rng(2028).normal(size=(2, 256)).astype(np.float32)
+    rewritten = rewrite_matmul_to_exact_ternary_storage(
+        _matmul_model(weight), node_name="tiny_matmul"
+    )
+    matmul = next(node for node in rewritten.graph.node if node.name == "tiny_matmul")
+    reconstructed_name = matmul.input[1]
+    rewritten.graph.output.append(
+        helper.make_tensor_value_info(reconstructed_name, TensorProto.FLOAT, list(weight.shape))
+    )
+    onnx.checker.check_model(rewritten)
+    assert "Where" not in {node.op_type for node in rewritten.graph.node}
+
+    marker_name = next(
+        node.input[1] for node in rewritten.graph.node if node.op_type == "Equal"
+    )
+    marker = next(
+        tensor for tensor in rewritten.graph.initializer if tensor.name == marker_name
+    )
+    assert numpy_helper.to_array(marker).item() == -2
+
+    session = ort.InferenceSession(
+        rewritten.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    actual, actual_weight = session.run(None, {"A": activation})
+    expected = activation @ weight
+    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+    np.testing.assert_array_equal(actual_weight.view(np.uint32), weight.view(np.uint32))
+    assert np.any((actual_weight == 0) & np.signbit(actual_weight))
+
 def test_rewrite_retains_initializer_with_other_consumer():
     weight = _weight(128, 3)
     rewritten = rewrite_matmul_to_exact_ternary_storage(
@@ -154,7 +224,7 @@ def test_rewrite_retains_initializer_with_other_consumer():
 
 
 def test_streaming_external_candidate_is_atomic_and_preserves_source(tmp_path):
-    weight = _weight(256, 16)
+    weight = _weight_with_signed_zeros()
     source_path = tmp_path / "source" / "lm.onnx"
     source_data_before = _external_model(source_path, weight)
     source_graph_before = source_path.read_bytes()
@@ -188,6 +258,13 @@ def test_streaming_external_candidate_is_atomic_and_preserves_source(tmp_path):
     assert report["transformed_matmul_count"] == 1
     assert report["transformed_nodes"] == ["tiny_matmul"]
     assert report["exact_reconstruction"] is True
+    assert report["format"] == "kitten2-onnx-ternary-exact-storage-v2"
+    assert report["encoding_version"] == 2
+    assert report["code_values"] == [-2, -1, 0, 1]
+    assert report["negative_zero_code"] == -2
+    assert report["negative_zero_count"] == int(np.count_nonzero((weight == 0) & np.signbit(weight)))
+    assert report["initializer_reports"][0]["negative_zero_count"] == report["negative_zero_count"]
+    assert report["negative_zero_preserved"] is True
     assert report["source_graph_sha256"] == hashlib.sha256(source_graph_before).hexdigest()
     assert report["inventory_sha256"] == inventory["inventory_sha256"]
     assert report["code_bytes"] == weight.size
@@ -207,12 +284,12 @@ def test_streaming_external_candidate_is_atomic_and_preserves_source(tmp_path):
 
 def test_streaming_failure_cleans_candidate_and_preserves_source(tmp_path):
     weight = _weight(128, 4)
-    weight[4, 0] = np.float32(-0.0)
+    weight[4, 0] = np.float32(0.625)
     source_path = tmp_path / "source" / "lm.onnx"
     source_data_before = _external_model(source_path, weight)
     source_graph_before = source_path.read_bytes()
     is_ternary, source_sha256 = _is_exact_ternary_weight(weight)
-    assert is_ternary
+    assert not is_ternary
     inventory = {
         "eligible_exact_ternary_matmul_count": 1,
         "nodes": [
@@ -228,7 +305,7 @@ def test_streaming_failure_cleans_candidate_and_preserves_source(tmp_path):
     output_path = tmp_path / "candidate" / "lm.onnx"
     output_data = tmp_path / "candidate" / "lm.onnx.data"
 
-    with pytest.raises(ValueError, match="negative zero"):
+    with pytest.raises(ValueError, match="not exact group-128 ternary"):
         compress_ternary_matmuls_streaming(
             source_path,
             output_path,
