@@ -207,6 +207,104 @@ def _matmul_nbits_size_report(
         "nodes": nodes,
     }
 
+def _ternary_exact_int8_size_report(
+    graph: Any,
+    initializer_details: list[dict[str, Any]],
+) -> dict[str, Any]:
+    initializers = {item["name"]: item for item in initializer_details}
+    cast_outputs: dict[str, str] = {}
+    for node in graph.node:
+        if node.op_type != "Cast" or not node.input or not node.output:
+            continue
+        code = initializers.get(node.input[0])
+        casts_to_float = any(
+            attribute.name == "to"
+            and onnx.helper.get_attribute_value(attribute) == TensorProto.FLOAT
+            for attribute in node.attribute
+        )
+        if (
+            code
+            and code["dtype"] == "INT8"
+            and len(code["shape"]) == 3
+            and code["shape"][1] == 128
+            and casts_to_float
+        ):
+            cast_outputs[node.output[0]] = node.input[0]
+
+    reconstructed: dict[str, tuple[str, str]] = {}
+    for node in graph.node:
+        if node.op_type != "Mul" or not node.output:
+            continue
+        code_name = next((cast_outputs[name] for name in node.input if name in cast_outputs), None)
+        scale_name = next(
+            (
+                name
+                for name in node.input
+                if name in initializers
+                and initializers[name]["dtype"] == "FLOAT"
+                and len(initializers[name]["shape"]) == 3
+                and initializers[name]["shape"][1] == 1
+            ),
+            None,
+        )
+        if code_name is None or scale_name is None:
+            continue
+        code_shape = initializers[code_name]["shape"]
+        scale_shape = initializers[scale_name]["shape"]
+        if code_shape[0] == scale_shape[0] and code_shape[2] == scale_shape[2]:
+            reconstructed[node.output[0]] = (code_name, scale_name)
+
+    reshaped: dict[str, tuple[str, str]] = {}
+    for node in graph.node:
+        if node.op_type == "Reshape" and node.input and node.output:
+            pair = reconstructed.get(node.input[0])
+            if pair is not None:
+                reshaped[node.output[0]] = pair
+
+    matched_nodes: list[dict[str, Any]] = []
+    code_names: set[str] = set()
+    scale_names: set[str] = set()
+    for index, node in enumerate(graph.node):
+        if node.op_type != "MatMul" or len(node.input) < 2:
+            continue
+        pair = reshaped.get(node.input[1])
+        if pair is None:
+            continue
+        code_name, scale_name = pair
+        code_names.add(code_name)
+        scale_names.add(scale_name)
+        matched_nodes.append(
+            {
+                "node": node.name or f"MatMul#{index}",
+                "code_initializer": code_name,
+                "scale_initializer": scale_name,
+            }
+        )
+
+    code_bytes = sum(initializers[name]["storage_bytes"] for name in code_names)
+    scale_bytes = sum(initializers[name]["storage_bytes"] for name in scale_names)
+    source_fp32_bytes = sum(
+        int(np.prod(initializers[name]["shape"], dtype=np.int64)) * 4 for name in code_names
+    )
+    stored_bytes = code_bytes + scale_bytes
+    return {
+        "group_size": 128,
+        "code_dtype": "int8",
+        "scale_dtype": "float32",
+        "node_count": len(matched_nodes),
+        "initializer_count": len(code_names | scale_names),
+        "storage_bytes_by_role": {
+            "int8_codes": code_bytes,
+            "float32_scales": scale_bytes,
+        },
+        "total_storage_bytes": stored_bytes,
+        "source_fp32_bytes_replaced": source_fp32_bytes,
+        "storage_reduction_bytes": source_fp32_bytes - stored_bytes,
+        "exact_storage_ratio": stored_bytes / source_fp32_bytes if source_fp32_bytes else None,
+        "nodes": matched_nodes,
+    }
+
+
 def _graph_size_report(graph_path: Path) -> dict[str, Any]:
     model = onnx.load(str(graph_path), load_external_data=False)
     graph = model.graph
@@ -271,6 +369,7 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         if len(names) > 1
     ]
     matmul_nbits = _matmul_nbits_size_report(graph, initializer_details)
+    ternary_exact_int8 = _ternary_exact_int8_size_report(graph, initializer_details)
     report: dict[str, Any] = {
         "graph": graph_path.name,
         "graph_bytes": graph_path.stat().st_size,
@@ -287,6 +386,7 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         "node_type_counts": dict(sorted(node_type_counts.items())),
         "matmul_nbits": matmul_nbits,
         "matmul_nbits4": matmul_nbits,
+        "ternary_exact_int8": ternary_exact_int8,
         "initializer_consumers": consumer_rows,
     }
 
@@ -298,6 +398,23 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         quantization = metadata.get("quantization", {})
         report["fallback_storage"] = quantization.get("fallback_storage", {})
         report["quantization_provenance"] = quantization.get("provenance", {})
+        if quantization.get("method") == "ternary-exact-int8":
+            exact_storage = report["ternary_exact_int8"]
+            source_fp32_bytes = int(
+                quantization.get(
+                    "source_fp32_bytes_replaced",
+                    exact_storage["source_fp32_bytes_replaced"],
+                )
+            )
+            exact_storage["source_fp32_bytes_replaced"] = source_fp32_bytes
+            exact_storage["storage_reduction_bytes"] = (
+                source_fp32_bytes - exact_storage["total_storage_bytes"]
+            )
+            exact_storage["exact_storage_ratio"] = (
+                exact_storage["total_storage_bytes"] / source_fp32_bytes
+                if source_fp32_bytes
+                else None
+            )
         vocab_size = metadata.get("vocab_size")
         hidden_size = metadata.get("hidden_size")
         candidates: list[dict[str, Any]] = []
@@ -423,6 +540,7 @@ def audit_bundle(
                 "total_bytes_attributable_to_vocabulary", 0
             ),
             "fallback_storage": graphs.get("lm", {}).get("fallback_storage", {}),
+            "ternary_exact_int8": graphs.get("lm", {}).get("ternary_exact_int8", {}),
         },
     }
     if checkpoint is not None:

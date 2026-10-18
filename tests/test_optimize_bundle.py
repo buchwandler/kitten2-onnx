@@ -114,6 +114,41 @@ def _write_ternary_tiny_bundle(root: Path, matmul_count: int = 196) -> np.ndarra
     bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
     return weight
 
+
+
+def _write_exact_ternary_inventory(
+    path: Path,
+    bundle: Path,
+    weight: np.ndarray,
+    matmul_count: int,
+) -> Path:
+    from kitten2_onnx.quantize_ternary_nbits import _is_exact_ternary_weight
+
+    _, source_hash = _is_exact_ternary_weight(weight)
+    rows = [
+        {
+            "node": f"ternary_matmul_{index}",
+            "initializer": "weight",
+            "eligible_exact_ternary": True,
+            "shape": list(weight.shape),
+            "source_sha256": source_hash,
+        }
+        for index in range(matmul_count)
+    ]
+    inventory = {
+        "format": "kitten2-onnx-exact-ternary-inventory-v1",
+        "inventory_sha256": hashlib.sha256(
+            json.dumps(rows, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "source_graph_sha256": hashlib.sha256((bundle / "lm/lm.onnx").read_bytes()).hexdigest(),
+        "eligible_exact_ternary_matmul_count": matmul_count,
+        "nodes": rows,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(inventory), encoding="utf-8")
+    return path
+
+
 def test_optimize_bundle_relocates_quantized_external_data(tmp_path, monkeypatch):
     from onnxruntime import quantization
 
@@ -613,3 +648,147 @@ def test_optimize_bundle_ternary_nbits4_cleans_failed_external_output(tmp_path, 
     assert (output / "lm/lm.onnx.data").is_file()
     assert not (output / "lm/lm.nbits4.onnx.data").exists()
     assert not list((output / "lm").glob(".lm.nbits4-*.tmp.onnx"))
+
+
+
+def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    weight = _write_ternary_tiny_bundle(source)
+    source_files = {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    inventory = _write_exact_ternary_inventory(
+        tmp_path / "inventory.json", source, weight, matmul_count=196
+    )
+    output = tmp_path / "optimized"
+    reports = tmp_path / "reports"
+
+    report = optimize_bundle(
+        source,
+        output,
+        lm_method="ternary-exact-int8",
+        ternary_inventory_path=inventory,
+        report_dir=reports,
+    )
+
+    quantization = report["quantization"]
+    metadata = json.loads((output / "lm/lm.meta.json").read_text(encoding="utf-8"))
+    bundle = json.loads((output / "bundle.json").read_text(encoding="utf-8"))
+    graph = onnx.load(str(output / "lm/lm.onnx"), load_external_data=False)
+    assert bundle["export"]["lm_optimization"] == "ternary-exact-int8"
+    assert quantization["method"] == "ternary-exact-int8"
+    assert quantization["group_size"] == 128
+    assert quantization["code_dtype"] == "int8"
+    assert quantization["scale_dtype"] == "float32"
+    assert quantization["exact_reconstruction"] is True
+    assert quantization["transformed_matmul_count"] == 196
+    assert quantization["transformed_initializer_count"] == 1
+    assert quantization["code_bytes"] == 256
+    assert quantization["scale_bytes"] == 8
+    assert quantization["source_fp32_bytes_replaced"] == 1024
+    assert quantization["operand_storage_reduction_bytes"] == 760
+    assert quantization["exact_storage_ratio"] == pytest.approx(264 / 1024)
+    assert metadata["quantization"] == quantization
+    assert quantization["external_data_files"] == ["lm.ternary-exact-int8.onnx.data"]
+    assert not (output / "lm/lm.onnx.data").exists()
+    assert all(node.op_type in {"Cast", "Mul", "Reshape", "MatMul"} for node in graph.graph.node)
+    assert sum(node.op_type == "MatMul" for node in graph.graph.node) == 196
+
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(output / "lm/lm.onnx"), providers=["CPUExecutionProvider"])
+    activation = np.arange(128, dtype=np.float32).reshape(1, 128) / 128
+    actual = session.run(None, {"inputs_embeds": activation})
+    assert len(actual) == 196
+    for result in actual:
+        np.testing.assert_array_equal(result, activation @ weight)
+
+    size_report = json.loads((reports / "size-report.json").read_text(encoding="utf-8"))
+    exact_storage = size_report["onnx"]["lm"]["ternary_exact_int8"]
+    assert exact_storage["node_count"] == 196
+    assert exact_storage["storage_bytes_by_role"] == {
+        "int8_codes": 256,
+        "float32_scales": 8,
+    }
+    assert exact_storage["source_fp32_bytes_replaced"] == 1024
+    assert exact_storage["storage_reduction_bytes"] == 760
+    assert size_report["storage_breakdown"]["ternary_exact_int8"] == exact_storage
+    assert report["output_bundle_bytes"] == size_report["bundle_bytes"]
+    assert {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    } == source_files
+
+
+def test_optimize_bundle_ternary_exact_int8_cleans_failed_external_output(
+    tmp_path, monkeypatch
+):
+    import onnxruntime as ort
+
+    source = tmp_path / "source"
+    source.mkdir()
+    weight = _write_ternary_tiny_bundle(source)
+    inventory = _write_exact_ternary_inventory(
+        tmp_path / "inventory.json", source, weight, matmul_count=196
+    )
+    source_graph = (source / "lm/lm.onnx").read_bytes()
+    source_data = (source / "lm/lm.onnx.data").read_bytes()
+    output = tmp_path / "optimized"
+
+    def fail_session(*args, **kwargs):
+        raise RuntimeError("injected exact ternary CPU session failure")
+
+    monkeypatch.setattr(ort, "InferenceSession", fail_session)
+    with pytest.raises(RuntimeError, match="injected exact ternary CPU session failure"):
+        optimize_bundle(
+            source,
+            output,
+            lm_method="ternary-exact-int8",
+            ternary_inventory_path=inventory,
+        )
+
+    assert (source / "lm/lm.onnx").read_bytes() == source_graph
+    assert (source / "lm/lm.onnx.data").read_bytes() == source_data
+    assert (output / "lm/lm.onnx").read_bytes() == source_graph
+    assert (output / "lm/lm.onnx.data").read_bytes() == source_data
+    assert not (output / "lm/lm.ternary-exact-int8.onnx.data").exists()
+    assert not list((output / "lm").glob(".lm.ternary-exact-int8-*.tmp.onnx"))
+
+
+
+def test_optimize_bundle_ternary_exact_int8_include_selects_only_requested_nodes(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    weight = _write_ternary_tiny_bundle(source, matmul_count=3)
+    inventory = _write_exact_ternary_inventory(
+        tmp_path / "inventory.json", source, weight, matmul_count=3
+    )
+    source_graph = (source / "lm/lm.onnx").read_bytes()
+    output = tmp_path / "one-node"
+
+    report = optimize_bundle(
+        source,
+        output,
+        lm_method="ternary-exact-int8",
+        ternary_inventory_path=inventory,
+        include_matmul_nodes=("ternary_matmul_1",),
+    )
+
+    quantization = report["quantization"]
+    graph = onnx.load(str(output / "lm/lm.onnx"), load_external_data=False)
+    assert quantization["transformed_nodes"] == ["ternary_matmul_1"]
+    assert quantization["transformed_matmul_count"] == 1
+    assert quantization["excluded_nodes"] == ["ternary_matmul_0", "ternary_matmul_2"]
+    assert sum(node.op_type == "MatMul" for node in graph.graph.node) == 3
+    assert sum(node.op_type == "Cast" for node in graph.graph.node) == 1
+    assert any(tensor.name == "weight" for tensor in graph.graph.initializer)
+    assert (source / "lm/lm.onnx").read_bytes() == source_graph
+    size_report = json.loads(Path(report["size_report"]).read_text(encoding="utf-8"))
+    exact_storage = size_report["onnx"]["lm"]["ternary_exact_int8"]
+    assert exact_storage["node_count"] == 1
+    assert exact_storage["source_fp32_bytes_replaced"] == 0
+    assert exact_storage["storage_reduction_bytes"] == -264

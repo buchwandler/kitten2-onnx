@@ -221,6 +221,27 @@ def _ternary_external_location(
         return location, path, stale_candidates
     raise FileExistsError("Could not allocate an unreferenced NBits4 external-data path")
 
+
+
+def _exact_ternary_external_location(
+    lm_model_path: Path,
+    referenced_paths: set[Path],
+) -> tuple[str, Path, list[Path]]:
+    stale_candidates: list[Path] = []
+    for index in range(1000):
+        location = (
+            "lm.ternary-exact-int8.onnx.data"
+            if index == 0
+            else f"lm.ternary-exact-int8-{index}.onnx.data"
+        )
+        path = _bundle_path(lm_model_path.parent, location)
+        if path in referenced_paths:
+            continue
+        if path.exists():
+            stale_candidates.append(path)
+            continue
+        return location, path, stale_candidates
+    raise FileExistsError("Could not allocate exact ternary INT8 external-data path")
 def _quantize_lm_chunked(
     bundle_dir: Path,
     bundle: dict[str, Any],
@@ -440,6 +461,170 @@ def _quantize_lm_ternary_nbits4(
     )
     return metadata["quantization"]
 
+def _quantize_lm_ternary_exact_int8(
+    bundle_dir: Path,
+    bundle: dict[str, Any],
+    *,
+    inventory_path: str | Path | None = None,
+    exclude_nodes: Sequence[str] = (),
+    exclude_initializers: Sequence[str] = (),
+    include_nodes: Sequence[str] = (),
+) -> dict[str, Any]:
+    import platform
+    import subprocess
+
+    import onnx
+
+    from kitten2_onnx.ternary_exact_storage import compress_ternary_matmuls_streaming
+
+    project_root = Path(__file__).resolve().parents[1]
+    inventory_file = (
+        Path(inventory_path).resolve()
+        if inventory_path is not None
+        else project_root / "build/reports/dev-fp32-current-ternary-nbits-inventory.json"
+    )
+    inventory = json.loads(inventory_file.read_text(encoding="utf-8"))
+    inventory_rows = {
+        row["node"]: row
+        for row in inventory.get("nodes", [])
+        if row.get("eligible_exact_ternary")
+    }
+    if len(inventory_rows) != int(inventory.get("eligible_exact_ternary_matmul_count", -1)):
+        raise ValueError("ternary inventory eligible count does not match its node rows")
+    included = set(include_nodes)
+    if included and (exclude_nodes or exclude_initializers):
+        raise ValueError("MatMul inclusion cannot be combined with exclusions")
+    unknown_includes = included - inventory_rows.keys()
+    if unknown_includes:
+        raise ValueError(f"unknown eligible MatMul inclusions: {sorted(unknown_includes)}")
+    excluded = set(inventory_rows) - included if included else set(exclude_nodes)
+    initializer_exclusions = set(exclude_initializers)
+    if initializer_exclusions:
+        known_initializers = {
+            row["initializer"] for row in inventory_rows.values() if row.get("initializer")
+        }
+        unknown_initializers = initializer_exclusions - known_initializers
+        if unknown_initializers:
+            raise ValueError(f"unknown eligible initializer exclusions: {sorted(unknown_initializers)}")
+        excluded.update(
+            name
+            for name, row in inventory_rows.items()
+            if row.get("initializer") in initializer_exclusions
+        )
+    unknown_nodes = excluded - inventory_rows.keys()
+    if unknown_nodes:
+        raise ValueError(f"unknown eligible MatMul exclusions: {sorted(unknown_nodes)}")
+
+    lm_entry = bundle["lm"]
+    lm_meta_path = _bundle_path(bundle_dir, lm_entry["metadata"])
+    lm_model_path = _bundle_path(bundle_dir, lm_entry["model"])
+    metadata = json.loads(lm_meta_path.read_text(encoding="utf-8"))
+    if metadata.get("runtime_provider") != "CPUExecutionProvider":
+        raise ValueError("Exact ternary INT8 LM optimization requires a CPU deployment bundle")
+    if metadata.get("io_dtype") != "float32":
+        raise ValueError("Exact ternary INT8 LM optimization requires float32 graph I/O")
+
+    source_hash = _sha256(lm_model_path)
+    source_graph = onnx.load(str(lm_model_path), load_external_data=False)
+    source_locations = _all_external_locations(source_graph)
+    source_paths = {_bundle_path(lm_model_path.parent, location) for location in source_locations}
+    source_external_hashes = {
+        location: _sha256(_bundle_path(lm_model_path.parent, location))
+        for location in sorted(source_locations)
+    }
+    referenced_before = _bundle_external_paths(bundle_dir)
+    _, external_path, stale_candidates = _exact_ternary_external_location(
+        lm_model_path,
+        referenced_before,
+    )
+    candidate_graph = lm_model_path.with_name(
+        f".lm.ternary-exact-int8-{uuid.uuid4().hex}.tmp.onnx"
+    )
+
+    try:
+        transformation = compress_ternary_matmuls_streaming(
+            lm_model_path,
+            candidate_graph,
+            external_path,
+            inventory=inventory,
+            exclude_nodes=excluded,
+        )
+        candidate_model = onnx.load(str(candidate_graph), load_external_data=False)
+        external_locations = _all_external_locations(candidate_model)
+        for location in external_locations:
+            external_file = _bundle_path(lm_model_path.parent, location)
+            if not external_file.is_file():
+                raise FileNotFoundError(f"Exact ternary INT8 external data is missing: {external_file}")
+        onnx.checker.check_model(str(candidate_graph))
+        os.replace(candidate_graph, lm_model_path)
+    except BaseException:
+        candidate_graph.unlink(missing_ok=True)
+        external_path.unlink(missing_ok=True)
+        raise
+
+    referenced_after = _bundle_external_paths(bundle_dir)
+    stale_paths = (source_paths | set(stale_candidates)) - referenced_after
+    for stale_path in sorted(stale_paths):
+        if stale_path.is_file():
+            stale_path.unlink()
+
+    repository_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    code_bytes = transformation["code_bytes"]
+    scale_bytes = transformation["scale_bytes"]
+    source_fp32_bytes = transformation["source_fp32_bytes_replaced"]
+    stored_bytes = code_bytes + scale_bytes
+    metadata["external_data"] = bool(external_locations)
+    metadata["external_data_files"] = sorted(external_locations)
+    metadata["quantization"] = {
+        "method": "ternary-exact-int8",
+        "backend": "streaming",
+        "group_size": 128,
+        "code_dtype": "int8",
+        "scale_dtype": "float32",
+        "transformed_matmul_count": transformation["transformed_matmul_count"],
+        "transformed_initializer_count": len(transformation["source_hashes"]),
+        "transformed_nodes": transformation["transformed_nodes"],
+        "exact_reconstruction": transformation["exact_reconstruction"],
+        "source_initializer_hashes": transformation["source_hashes"],
+        "code_bytes": code_bytes,
+        "scale_bytes": scale_bytes,
+        "source_fp32_bytes_replaced": source_fp32_bytes,
+        "operand_storage_reduction_bytes": source_fp32_bytes - stored_bytes,
+        "exact_storage_ratio": stored_bytes / source_fp32_bytes if source_fp32_bytes else None,
+        "inventory_sha256": transformation["inventory_sha256"],
+        "source_graph_sha256": source_hash,
+        "source_external_data_sha256": source_external_hashes,
+        "graph_sha256": _sha256(lm_model_path),
+        "compact_external_data_sha256": transformation[
+            "compact_external_data_sha256"
+        ],
+        "external_data_files": sorted(external_locations),
+        "external_data_sha256": {
+            location: _sha256(_bundle_path(lm_model_path.parent, location))
+            for location in sorted(external_locations)
+        },
+        "excluded_nodes": sorted(excluded),
+        "initializer_reports": transformation["initializer_reports"],
+        "provenance": {
+            "onnx_version": onnx.__version__,
+            "python_version": platform.python_version(),
+            "cpu_architecture": platform.machine(),
+            "repository_commit": repository_commit,
+        },
+    }
+    lm_meta_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return metadata["quantization"]
+
+
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -460,6 +645,8 @@ def optimize_bundle(
     nbits_accuracy_level: int = 1,
     exclude_matmul_nodes: Sequence[str] = (),
     exclude_matmul_initializers: Sequence[str] = (),
+    ternary_inventory_path: str | Path | None = None,
+    include_matmul_nodes: Sequence[str] = (),
 ) -> dict[str, Any]:
     from kitten2_onnx.validate_bundle import validate_bundle
     from scripts.audit_bundle_size import audit_bundle
@@ -483,20 +670,28 @@ def optimize_bundle(
     )
     report_root.mkdir(parents=True, exist_ok=True)
     output_root.parent.mkdir(parents=True, exist_ok=True)
-    ternary_nbits = lm_method in ("ternary-nbits", "ternary-nbits4")
     if lm_method not in (
         "int8-dynamic",
         "int8-dynamic-chunked",
         "ternary-nbits",
         "ternary-nbits4",
+        "ternary-exact-int8",
     ):
         raise ValueError(f"Unsupported LM optimization method: {lm_method!r}")
     if (
-        lm_method != "int8-dynamic-chunked"
-        and not ternary_nbits
+        lm_method not in (
+            "int8-dynamic-chunked",
+            "ternary-nbits",
+            "ternary-nbits4",
+            "ternary-exact-int8",
+        )
         and (exclude_matmul_nodes or exclude_matmul_initializers)
     ):
         raise ValueError("MatMul exclusions require a streaming optimization method")
+    if include_matmul_nodes and lm_method != "ternary-exact-int8":
+        raise ValueError("MatMul inclusion requires the ternary-exact-int8 method")
+    if include_matmul_nodes and (exclude_matmul_nodes or exclude_matmul_initializers):
+        raise ValueError("MatMul inclusion cannot be combined with exclusions")
 
     input_bundle_path = input_root / "bundle.json"
     bundle = json.loads(input_bundle_path.read_text(encoding="utf-8"))
@@ -516,6 +711,15 @@ def optimize_bundle(
             exclude_nodes=exclude_matmul_nodes,
             exclude_initializers=exclude_matmul_initializers,
             chunk_rows=chunk_rows,
+        )
+    elif lm_method == "ternary-exact-int8":
+        quantization = _quantize_lm_ternary_exact_int8(
+            output_root,
+            bundle,
+            inventory_path=ternary_inventory_path,
+            exclude_nodes=exclude_matmul_nodes,
+            exclude_initializers=exclude_matmul_initializers,
+            include_nodes=include_matmul_nodes,
         )
     else:
         quantization = _quantize_lm_ternary_nbits4(
@@ -603,6 +807,7 @@ def main() -> None:
             "int8-dynamic-chunked",
             "ternary-nbits",
             "ternary-nbits4",
+            "ternary-exact-int8",
         ),
         required=True,
     )
@@ -610,12 +815,14 @@ def main() -> None:
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--corpus", type=Path)
     parser.add_argument("--report-dir", type=Path)
+    parser.add_argument("--ternary-inventory", type=Path)
     parser.add_argument("--nbits", type=int, default=4)
     parser.add_argument("--nbits-block-size", type=int, default=128)
     parser.add_argument("--nbits-accuracy-level", type=int, default=1)
     parser.add_argument("--chunk-rows", type=int, default=64)
     parser.add_argument("--exclude-matmul-node", action="append", default=[])
     parser.add_argument("--exclude-matmul-initializer", action="append", default=[])
+    parser.add_argument("--include-matmul-node", action="append", default=[])
     args = parser.parse_args()
     report = optimize_bundle(
         args.input_bundle,
@@ -631,6 +838,8 @@ def main() -> None:
         nbits_accuracy_level=args.nbits_accuracy_level,
         exclude_matmul_nodes=args.exclude_matmul_node,
         exclude_matmul_initializers=args.exclude_matmul_initializer,
+        ternary_inventory_path=args.ternary_inventory,
+        include_matmul_nodes=args.include_matmul_node,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 
