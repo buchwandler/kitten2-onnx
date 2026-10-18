@@ -10,7 +10,7 @@ import torch
 
 from kitten2_onnx.export_lm import RUNTIME_PROFILES, _io_names, load_hf_lm
 from kitten2_onnx.reference import _load_speaker_projection, load_reference_artifacts
-from kitten2_onnx.runtime import Kitten2OnnxLM
+from kitten2_onnx.runtime import Kitten2OnnxLM, _cpu_session_options
 from kitten2_onnx.sampling import SamplingSettings
 
 
@@ -148,8 +148,7 @@ def test_real_bruno_prompt_injection_and_32_step_lm_parity(monkeypatch):
             use_cache=True,
             return_dict=True,
         )
-    session_options = ort.SessionOptions()
-    session_options.intra_op_num_threads = 4
+    session_options = _cpu_session_options("low-memory-exact-ternary")
     session = ort.InferenceSession(
         str(onnx_dir / "lm.onnx"),
         sess_options=session_options,

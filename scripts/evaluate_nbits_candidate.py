@@ -56,6 +56,12 @@ def evaluate_candidate(
     source_model_dir: Path | None = None,
     baseline_bundle: Path | None = None,
     fixture_path: Path | None = None,
+    intra_op_threads: int = 4,
+    inter_op_threads: int = 0,
+    graph_optimization: str = "all",
+    disable_memory_pattern: bool = False,
+    disable_cpu_arena: bool = False,
+    sequential: bool = False,
 ) -> dict[str, Any]:
     reference = load_reference_pack(reference_path)
     if not reference.metadata.get("trusted"):
@@ -74,8 +80,30 @@ def evaluate_candidate(
     lm_metadata = reference.metadata["lm_metadata"]
     input_mode = lm_metadata.get("input_mode", "inputs_embeds")
     past_names = [name for name in lm_metadata["input_names"] if name.startswith("past_")]
+    graph_levels = {
+        "disable": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
+        "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
+        "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
+        "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+    }
+    if graph_optimization not in graph_levels:
+        raise ValueError(f"unsupported graph optimization level: {graph_optimization}")
     session_options = ort.SessionOptions()
-    session_options.intra_op_num_threads = 4
+    session_options.intra_op_num_threads = intra_op_threads
+    session_options.inter_op_num_threads = inter_op_threads
+    session_options.enable_mem_pattern = not disable_memory_pattern
+    session_options.enable_cpu_mem_arena = not disable_cpu_arena
+    session_options.graph_optimization_level = graph_levels[graph_optimization]
+    if sequential:
+        session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    runtime_options = {
+        "intra_op_threads": intra_op_threads,
+        "inter_op_threads": inter_op_threads,
+        "execution_mode": "sequential" if sequential else "parallel",
+        "graph_optimization": graph_optimization,
+        "enable_memory_pattern": not disable_memory_pattern,
+        "enable_cpu_arena": not disable_cpu_arena,
+    }
     session = ort.InferenceSession(
         str(model_path),
         sess_options=session_options,
@@ -193,6 +221,7 @@ def evaluate_candidate(
         max_absolute,
     ]
     diagnostic = {
+        "runtime_options": runtime_options,
         "test_completed": True,
         "failure": None,
         "comparison_count": comparison_count,
@@ -210,6 +239,7 @@ def evaluate_candidate(
         "format": "kitten2-onnx-nbits-candidate-diagnostic-v1",
         "status": "diagnostic_complete",
         "model": str(model_path.resolve()),
+        "runtime_options": runtime_options,
         "model_sha256": sha256_file(model_path),
         "reference": str(reference.root),
         "reference_pack_sha256": reference.metadata["pack_sha256"],
@@ -243,6 +273,14 @@ def main() -> None:
     parser.add_argument("--source-model-dir", type=Path)
     parser.add_argument("--baseline-bundle", type=Path)
     parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--intra-op-threads", type=int, default=4)
+    parser.add_argument("--inter-op-threads", type=int, default=0)
+    parser.add_argument(
+        "--graph-optimization", choices=("disable", "basic", "extended", "all"), default="all"
+    )
+    parser.add_argument("--disable-memory-pattern", action="store_true")
+    parser.add_argument("--disable-cpu-arena", action="store_true")
+    parser.add_argument("--sequential", action="store_true")
     args = parser.parse_args()
     started = time.perf_counter()
     result = evaluate_candidate(
@@ -252,6 +290,12 @@ def main() -> None:
         source_model_dir=args.source_model_dir,
         baseline_bundle=args.baseline_bundle,
         fixture_path=args.fixture,
+        intra_op_threads=args.intra_op_threads,
+        inter_op_threads=args.inter_op_threads,
+        graph_optimization=args.graph_optimization,
+        disable_memory_pattern=args.disable_memory_pattern,
+        disable_cpu_arena=args.disable_cpu_arena,
+        sequential=args.sequential,
     )
     result["elapsed_seconds"] = time.perf_counter() - started
     _write_json_atomic(args.output, result)

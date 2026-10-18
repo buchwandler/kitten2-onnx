@@ -260,6 +260,63 @@ def test_check_graph_validates_input_ids_types(tmp_path, monkeypatch):
     assert "LM input_ids graph input must be int64" in errors
     assert "LM speaker_hidden type differs from io_dtype metadata" in errors
 
+def test_check_graph_uses_low_memory_profile_for_exact_ternary_lm(tmp_path, monkeypatch):
+    import onnxruntime as ort
+
+    from kitten2_onnx.validate_bundle import _check_graph
+
+    graph_path = tmp_path / "lm.onnx"
+    graph_path.write_bytes(b"graph")
+    session = SimpleNamespace(
+        get_inputs=lambda: [
+            SimpleNamespace(name="input_ids", type="tensor(int64)", shape=[1, 3]),
+            SimpleNamespace(name="speaker_hidden", type="tensor(float)", shape=[1, 4]),
+        ],
+        get_outputs=lambda: [SimpleNamespace(name="logits", type="tensor(float)", shape=[1, 8])],
+        get_providers=lambda: ["CPUExecutionProvider"],
+    )
+    captured = {}
+
+    def create_session(path, *, sess_options, providers):
+        captured.update(path=path, sess_options=sess_options, providers=providers)
+        return session
+
+    monkeypatch.setitem(
+        sys.modules,
+        "onnx",
+        SimpleNamespace(checker=SimpleNamespace(ValidationError=ValueError, check_model=lambda path: None)),
+    )
+    monkeypatch.setattr(ort, "InferenceSession", create_session)
+    errors = []
+
+    result = _check_graph(
+        root=tmp_path,
+        label="lm",
+        graph_path=graph_path,
+        metadata={
+            "input_mode": "input_ids",
+            "io_dtype": "float32",
+            "runtime_memory_profile": "low-memory-exact-ternary",
+        },
+        providers=["CPUExecutionProvider"],
+        expected_inputs=["input_ids", "speaker_hidden"],
+        expected_outputs=["logits"],
+        input_shapes=None,
+        output_shape=None,
+        errors=errors,
+    )
+
+    options = captured["sess_options"]
+    assert result is not None
+    assert not errors
+    assert options.intra_op_num_threads == 1
+    assert options.inter_op_num_threads == 1
+    assert options.execution_mode == ort.ExecutionMode.ORT_SEQUENTIAL
+    assert not options.enable_mem_pattern
+    assert not options.enable_cpu_mem_arena
+    assert options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+
+
 
 @pytest.mark.parametrize("failure", ["checker", "runtime"])
 def test_check_graph_reports_checker_and_session_failures(tmp_path, monkeypatch, failure):

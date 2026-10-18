@@ -158,6 +158,15 @@ def test_candidate_worker_runs_onnx_only_and_matches_tiny_reference(tmp_path):
             str(reference),
             "--output",
             str(output_path),
+            "--intra-op-threads",
+            "1",
+            "--inter-op-threads",
+            "1",
+            "--graph-optimization",
+            "disable",
+            "--disable-memory-pattern",
+            "--disable-cpu-arena",
+            "--sequential",
         ],
         cwd=project_root,
         check=False,
@@ -171,6 +180,14 @@ def test_candidate_worker_runs_onnx_only_and_matches_tiny_reference(tmp_path):
     assert result["candidate_token_ids"] == [2, 1]
     assert result["onnx_runtime_calls"] == 3
     assert result["heavy_ml_imports_loaded"] == []
+    assert result["runtime_options"] == {
+        "intra_op_threads": 1,
+        "inter_op_threads": 1,
+        "execution_mode": "sequential",
+        "graph_optimization": "disable",
+        "enable_memory_pattern": False,
+        "enable_cpu_arena": False,
+    }
 
 
 def test_candidate_worker_refuses_wrong_reference_source_identity(tmp_path):

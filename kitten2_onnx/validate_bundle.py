@@ -73,8 +73,27 @@ def _check_graph(
         errors.append(f"{label} ONNX checker failed: {error}")
         return None
 
+    session_options = None
+    if label == "lm":
+        memory_profile = metadata.get("runtime_memory_profile", "default")
+        if memory_profile == "low-memory-exact-ternary":
+            if providers != ["CPUExecutionProvider"]:
+                errors.append("Low-memory exact-ternary profile requires CPUExecutionProvider")
+                return None
+            from kitten2_onnx.runtime import _cpu_session_options
+
+            session_options = _cpu_session_options(memory_profile)
+        elif memory_profile != "default":
+            errors.append(f"Unsupported runtime memory profile: {memory_profile!r}")
+            return None
+
     try:
-        session = ort.InferenceSession(str(graph_path), providers=providers)
+        if session_options is None:
+            session = ort.InferenceSession(str(graph_path), providers=providers)
+        else:
+            session = ort.InferenceSession(
+                str(graph_path), sess_options=session_options, providers=providers
+            )
     except (ValueError, OSError, RuntimeError) as error:
         errors.append(f"{label} ONNX Runtime session failed: {error}")
         return None

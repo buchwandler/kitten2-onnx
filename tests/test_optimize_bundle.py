@@ -356,7 +356,7 @@ def test_optimize_bundle_chunked_removes_only_proven_stale_external_data(tmp_pat
     )
 
 
-def test_optimize_bundle_chunked_keeps_final_graph_on_validation_failure(tmp_path, monkeypatch):
+def test_optimize_bundle_chunked_does_not_publish_on_validation_failure(tmp_path, monkeypatch):
     import onnxruntime as ort
 
     source = tmp_path / "source"
@@ -372,12 +372,9 @@ def test_optimize_bundle_chunked_keeps_final_graph_on_validation_failure(tmp_pat
     with pytest.raises(RuntimeError, match="injected ORT validation failure"):
         optimize_bundle(source, output, lm_method="int8-dynamic-chunked")
 
-    assert (output / "lm/lm.onnx").read_bytes() == original_graph
-    assert (output / "lm/lm.onnx.data").is_file()
-    assert not (output / "lm/lm.int8.onnx.data").exists()
-    assert not list((output / "lm").glob(".lm.chunked-*.tmp.onnx"))
+    assert not output.exists()
+    assert not list(tmp_path.glob(".optimized.*.partial"))
     assert (source / "lm/lm.onnx").read_bytes() == original_graph
-
 
 def test_optimize_cli_exposes_chunked_mode_without_removing_legacy_mode(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["optimize_bundle", "--help"])
@@ -446,7 +443,6 @@ def test_optimize_bundle_chunked_accepts_initializer_exclusions(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     _write_tiny_bundle(source)
-    source_graph = (source / "lm/lm.onnx").read_bytes()
     output = tmp_path / "optimized"
 
     with pytest.raises(ValueError, match="no supported constant-B MatMul nodes"):
@@ -457,10 +453,8 @@ def test_optimize_bundle_chunked_accepts_initializer_exclusions(tmp_path):
             exclude_matmul_initializers=("weight",),
         )
 
-    assert (output / "lm/lm.onnx").read_bytes() == source_graph
-    assert (output / "lm/lm.onnx.data").is_file()
-    assert not (output / "lm/lm.int8.onnx.data").exists()
-
+    assert not output.exists()
+    assert not list(tmp_path.glob(".optimized.*.partial"))
 
 
 def test_optimize_bundle_ternary_nbits4_reports_size_and_preserves_source(tmp_path):
@@ -648,11 +642,8 @@ def test_optimize_bundle_ternary_nbits4_cleans_failed_external_output(tmp_path, 
 
     assert (source / "lm/lm.onnx").read_bytes() == source_graph
     assert (source / "lm/lm.onnx.data").read_bytes() == source_data
-    assert (output / "lm/lm.onnx").read_bytes() == source_graph
-    assert (output / "lm/lm.onnx.data").is_file()
-    assert not (output / "lm/lm.nbits4.onnx.data").exists()
-    assert not list((output / "lm").glob(".lm.nbits4-*.tmp.onnx"))
-
+    assert not output.exists()
+    assert not list(tmp_path.glob(".optimized.*.partial"))
 
 
 def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source(tmp_path):
@@ -687,6 +678,16 @@ def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source
     assert quantization["group_size"] == 128
     assert quantization["code_dtype"] == "int8"
     assert quantization["scale_dtype"] == "float32"
+    assert metadata["runtime_memory_profile"] == "low-memory-exact-ternary"
+    assert quantization["runtime_memory_profile"] == metadata["runtime_memory_profile"]
+    assert metadata["runtime_options"] == {
+        "intra_op_threads": 1,
+        "inter_op_threads": 1,
+        "execution_mode": "sequential",
+        "enable_mem_pattern": False,
+        "enable_cpu_mem_arena": False,
+        "graph_optimization_level": "ORT_DISABLE_ALL",
+    }
     assert quantization["encoding_version"] == 2
     assert quantization["code_values"] == [-2, -1, 0, 1]
     assert quantization["negative_zero_code"] == -2
@@ -740,9 +741,23 @@ def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source
     } == source_files
 
 
-def test_optimize_bundle_ternary_exact_int8_cleans_failed_external_output(
-    tmp_path, monkeypatch
-):
+def test_optimize_bundle_preserves_existing_output(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_tiny_bundle(source)
+    output = tmp_path / "optimized"
+    output.mkdir()
+    sentinel = output / "previous-success"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        optimize_bundle(source, output, lm_method="int8-dynamic")
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not list(tmp_path.glob(".optimized.*.partial"))
+
+
+def test_optimize_bundle_ternary_exact_int8_does_not_create_runtime_session(tmp_path, monkeypatch):
     import onnxruntime as ort
 
     source = tmp_path / "source"
@@ -756,10 +771,76 @@ def test_optimize_bundle_ternary_exact_int8_cleans_failed_external_output(
     output = tmp_path / "optimized"
 
     def fail_session(*args, **kwargs):
-        raise RuntimeError("injected exact ternary CPU session failure")
+        pytest.fail("exact ternary optimization must not create an ONNX Runtime session")
 
     monkeypatch.setattr(ort, "InferenceSession", fail_session)
-    with pytest.raises(RuntimeError, match="injected exact ternary CPU session failure"):
+    report = optimize_bundle(
+        source,
+        output,
+        lm_method="ternary-exact-int8",
+        ternary_inventory_path=inventory,
+    )
+
+    assert report["output_bundle"] == str(output)
+    assert output.is_dir()
+    progress = Path(report["build_progress"])
+    stages = [json.loads(line)["stage"] for line in progress.read_text().splitlines()]
+    assert "scan_weight_001_of_001" in stages
+    assert "encode_weight_001_of_001" in stages
+    assert "onnx_checker" in stages
+    assert stages[-1] == "complete"
+    assert (output / "lm/lm.onnx").is_file()
+    assert (source / "lm/lm.onnx").read_bytes() == source_graph
+    assert (source / "lm/lm.onnx.data").read_bytes() == source_data
+    assert not list(tmp_path.glob(".optimized.*.partial"))
+
+@pytest.mark.parametrize(
+    "failure_point", ["scan", "encode", "graph_save", "checker", "size_audit", "after_size_audit"]
+)
+def test_optimize_bundle_failure_does_not_publish_or_mutate_source(
+    tmp_path, monkeypatch, failure_point
+):
+    import scripts.optimize_bundle as optimize_module
+    from kitten2_onnx import ternary_exact_storage
+    from scripts import audit_bundle_size
+
+    source = tmp_path / "source"
+    source.mkdir()
+    weight = _write_ternary_tiny_bundle(source)
+    inventory = _write_exact_ternary_inventory(
+        tmp_path / "inventory.json", source, weight, matmul_count=196
+    )
+    source_files = {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    output = tmp_path / "optimized"
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(f"injected {failure_point} failure")
+
+    if failure_point == "scan":
+        monkeypatch.setattr(ternary_exact_storage, "_weight_info", fail)
+    elif failure_point == "encode":
+        monkeypatch.setattr(ternary_exact_storage, "_write_exact_weight", fail)
+    elif failure_point == "graph_save":
+        monkeypatch.setattr(onnx, "save_model", fail)
+    elif failure_point == "checker":
+        monkeypatch.setattr(onnx.checker, "check_model", fail)
+    elif failure_point == "size_audit":
+        monkeypatch.setattr(audit_bundle_size, "audit_bundle", fail)
+    else:
+        original_write_json = optimize_module._write_json
+
+        def fail_after_size_report(path, value):
+            original_write_json(path, value)
+            if Path(path).name == "size-report.json":
+                raise RuntimeError("injected after_size_audit failure")
+
+        monkeypatch.setattr(optimize_module, "_write_json", fail_after_size_report)
+
+    with pytest.raises(RuntimeError, match=f"injected {failure_point} failure"):
         optimize_bundle(
             source,
             output,
@@ -767,13 +848,13 @@ def test_optimize_bundle_ternary_exact_int8_cleans_failed_external_output(
             ternary_inventory_path=inventory,
         )
 
-    assert (source / "lm/lm.onnx").read_bytes() == source_graph
-    assert (source / "lm/lm.onnx.data").read_bytes() == source_data
-    assert (output / "lm/lm.onnx").read_bytes() == source_graph
-    assert (output / "lm/lm.onnx.data").read_bytes() == source_data
-    assert not (output / "lm/lm.ternary-exact-int8.onnx.data").exists()
-    assert not list((output / "lm").glob(".lm.ternary-exact-int8-*.tmp.onnx"))
-
+    assert not output.exists()
+    assert not list(tmp_path.glob(".optimized.*.partial"))
+    assert {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    } == source_files
 
 
 def test_optimize_bundle_ternary_exact_int8_include_selects_only_requested_nodes(tmp_path):

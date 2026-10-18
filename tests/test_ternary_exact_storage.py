@@ -321,11 +321,10 @@ def test_streaming_failure_cleans_candidate_and_preserves_source(tmp_path):
 
 
 
-def test_session_creation_failure_cleans_candidate_outputs(tmp_path, monkeypatch):
-    weight = _weight(128, 4)
+def test_streaming_compressor_does_not_create_runtime_session(tmp_path, monkeypatch):
+    weight = _weight_with_signed_zeros()
     source_path = tmp_path / "source" / "lm.onnx"
     _external_model(source_path, weight)
-    source_graph_before = source_path.read_bytes()
     source_model = onnx.load(str(source_path), load_external_data=False)
     _, source_sha256 = _is_exact_ternary_weight(weight)
     inventory = {
@@ -344,18 +343,16 @@ def test_session_creation_failure_cleans_candidate_outputs(tmp_path, monkeypatch
     output_data = tmp_path / "candidate" / "lm.onnx.data"
 
     def fail_session(*args, **kwargs):
-        raise RuntimeError("session creation failed")
+        pytest.fail("streaming compressor must not create an ONNX Runtime session")
 
     monkeypatch.setattr(ort, "InferenceSession", fail_session)
-    with pytest.raises(RuntimeError, match="session creation failed"):
-        compress_ternary_matmuls_streaming(
-            source_path,
-            output_path,
-            output_data,
-            inventory=inventory,
-        )
+    report = compress_ternary_matmuls_streaming(
+        source_path,
+        output_path,
+        output_data,
+        inventory=inventory,
+    )
 
-    assert not output_path.exists()
-    assert not output_data.exists()
-    assert not list(output_path.parent.glob(".*.tmp"))
-    assert source_path.read_bytes() == source_graph_before
+    assert report["exact_reconstruction"] is True
+    assert output_path.is_file()
+    assert output_data.is_file()

@@ -20,11 +20,13 @@ from kitten2_onnx.runtime import Kitten2OnnxLM
         "expected_type",
         "expected_numpy_dtype",
         "provider",
+        "runtime_memory_profile",
     ),
     [
-        (4, 1, 1, "float32", "tensor(float)", np.float32, "CPUExecutionProvider"),
-        (4, 1, 1, "float16", "tensor(float16)", np.float16, "CUDAExecutionProvider"),
-        (1024, 8, 128, "float32", "tensor(float)", np.float32, "CPUExecutionProvider"),
+        (4, 1, 1, "float32", "tensor(float)", np.float32, "CPUExecutionProvider", "default"),
+        (4, 1, 1, "float16", "tensor(float16)", np.float16, "CUDAExecutionProvider", "default"),
+        (1024, 8, 128, "float32", "tensor(float)", np.float32, "CPUExecutionProvider", "default"),
+        (4, 1, 1, "float32", "tensor(float)", np.float32, "CPUExecutionProvider", "low-memory-exact-ternary"),
     ],
 )
 def test_input_ids_runtime_projects_speaker_only_during_prefill(
@@ -37,12 +39,14 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
     expected_type,
     expected_numpy_dtype,
     provider,
+    runtime_memory_profile,
 ):
 
     class FakeSession:
-        def __init__(self, path, providers):
+        def __init__(self, path, providers, sess_options=None):
             self.path = Path(path)
             self.providers = providers
+            self.sess_options = sess_options
             self.feeds = []
 
         def get_inputs(self):
@@ -69,14 +73,21 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
 
     sessions = []
 
-    def create_session(path, providers):
-        session = FakeSession(path, providers)
+    def create_session(path, providers, sess_options=None):
+        session = FakeSession(path, providers, sess_options)
         sessions.append(session)
         return session
 
-    monkeypatch.setitem(
-        sys.modules, "onnxruntime", SimpleNamespace(InferenceSession=create_session)
+    class FakeSessionOptions:
+        pass
+
+    fake_runtime = SimpleNamespace(
+        InferenceSession=create_session,
+        SessionOptions=FakeSessionOptions,
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL="sequential"),
+        GraphOptimizationLevel=SimpleNamespace(ORT_DISABLE_ALL="disable"),
     )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_runtime)
     metadata = {
         "input_mode": "input_ids",
         "input_names": [
@@ -88,6 +99,7 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
             "past_value_0",
         ],
         "runtime_profile": "cuda-fp16" if io_dtype == "float16" else "dev-fp32",
+        "runtime_memory_profile": runtime_memory_profile,
         "runtime_provider": provider,
         "io_dtype": io_dtype,
         "hidden_size": hidden_size,
@@ -111,6 +123,14 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
     assert runtime.embeddings is None
     assert logits.shape == (1, 16)
     lm_session = sessions[0]
+    if runtime_memory_profile == "low-memory-exact-ternary":
+        options = lm_session.sess_options
+        assert options.intra_op_num_threads == 1
+        assert options.inter_op_num_threads == 1
+        assert options.execution_mode == "sequential"
+        assert options.enable_mem_pattern is False
+        assert options.enable_cpu_mem_arena is False
+        assert options.graph_optimization_level == "disable"
     np.testing.assert_array_equal(lm_session.feeds[0]["input_ids"], [[3, 5]])
     np.testing.assert_array_equal(
         lm_session.feeds[0]["speaker_hidden"], np.arange(hidden_size)[None, :]

@@ -7,6 +7,7 @@ import hashlib
 import os
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -455,6 +456,15 @@ def _write_exact_weight(
     }
 
 
+def _report_stage(
+    callback: Callable[[str, dict[str, Any]], None] | None,
+    stage: str,
+    **details: Any,
+) -> None:
+    if callback is not None:
+        callback(stage, details)
+
+
 def compress_ternary_matmuls_streaming(
     source_model: str | Path,
     output_model: str | Path,
@@ -463,6 +473,7 @@ def compress_ternary_matmuls_streaming(
     inventory: dict[str, Any],
     exclude_nodes: set[str] | None = None,
     config: TernaryExactStorageConfig | None = None,
+    stage_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Rewrite eligible MatMuls while streaming external initializers and output data."""
     config = config or TernaryExactStorageConfig()
@@ -481,7 +492,9 @@ def compress_ternary_matmuls_streaming(
     temporary_graph = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
     published_data = False
     try:
+        _report_stage(stage_callback, "load_graph")
         model = onnx.load(str(source_path), load_external_data=False)
+        _report_stage(stage_callback, "hash_source_graph")
         source_graph_sha256 = _sha256_file(source_path)
         inventory_graph_sha256 = inventory.get("source_graph_sha256")
         if inventory_graph_sha256 and inventory_graph_sha256 != source_graph_sha256:
@@ -497,8 +510,10 @@ def compress_ternary_matmuls_streaming(
         }
         if output_path in source_external_paths or data_path in source_external_paths:
             raise ValueError("candidate outputs must not overwrite source external data")
+        _report_stage(stage_callback, "hash_source_external_data")
         source_external_data_sha256 = _external_source_hashes(source_path, model)
 
+        _report_stage(stage_callback, "validate_inventory")
         rows_by_node = _inventory_rows(inventory)
         excluded = set(exclude_nodes or ())
         unknown_exclusions = excluded - rows_by_node.keys()
@@ -541,7 +556,13 @@ def compress_ternary_matmuls_streaming(
 
         source_hashes: dict[str, str] = {}
         source_shapes: dict[str, tuple[int, int]] = {}
-        for initializer_name, rows in rows_by_weight.items():
+        for index, (initializer_name, rows) in enumerate(rows_by_weight.items(), start=1):
+            _report_stage(
+                stage_callback,
+                f"scan_weight_{index:03d}_of_{len(rows_by_weight):03d}",
+                initializer=initializer_name,
+                nodes=[row.get("node") for row in rows],
+            )
             tensor = initializers[initializer_name]
             k, n, source_hash = _weight_info(source_path, tensor, rows, config)
             source_hashes[initializer_name] = source_hash
@@ -583,6 +604,7 @@ def compress_ternary_matmuls_streaming(
         initializer_reports: list[dict[str, Any]] = []
         source_fp32_bytes_replaced = 0
 
+        _report_stage(stage_callback, "copy_unmodified_initializers")
         with ExternalDataWriter(temporary_data) as writer:
             for tensor in model.graph.initializer:
                 if tensor.name in removed_weights:
@@ -600,7 +622,13 @@ def compress_ternary_matmuls_streaming(
                 else:
                     new_initializers.append(copy.deepcopy(tensor))
 
-            for initializer_name, rows in targets_by_weight.items():
+            for index, (initializer_name, rows) in enumerate(targets_by_weight.items(), start=1):
+                _report_stage(
+                    stage_callback,
+                    f"encode_weight_{index:03d}_of_{len(targets_by_weight):03d}",
+                    initializer=initializer_name,
+                    nodes=[name for name, _, _ in rows],
+                )
                 tensor = initializers[initializer_name]
                 code_name, scale_name, shape_name, reconstructed_name = names_by_weight[
                     initializer_name
@@ -657,11 +685,10 @@ def compress_ternary_matmuls_streaming(
 
         temporary_relative_location = temporary_data.relative_to(output_path.parent).as_posix()
         final_relative_location = data_path.relative_to(output_path.parent).as_posix()
+        _report_stage(stage_callback, "write_candidate_graph")
         onnx.save_model(model, str(temporary_graph), save_as_external_data=False)
+        _report_stage(stage_callback, "onnx_checker")
         onnx.checker.check_model(str(temporary_graph))
-        import onnxruntime as ort
-
-        ort.InferenceSession(str(temporary_graph), providers=["CPUExecutionProvider"])
 
         for tensor in model.graph.initializer:
             if tensor.data_location != TensorProto.EXTERNAL and not tensor.external_data:
@@ -709,9 +736,12 @@ def compress_ternary_matmuls_streaming(
             "source_hashes": source_hashes,
         }
 
+        _report_stage(stage_callback, "publish_external_data")
         os.replace(temporary_data, data_path)
         published_data = True
+        _report_stage(stage_callback, "publish_graph")
         os.replace(temporary_graph, output_path)
+        _report_stage(stage_callback, "complete")
         return report
     except BaseException:
         temporary_graph.unlink(missing_ok=True)

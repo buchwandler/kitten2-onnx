@@ -9,6 +9,7 @@ import os
 import shutil
 import uuid
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -464,11 +465,13 @@ def _quantize_lm_ternary_nbits4(
 def _quantize_lm_ternary_exact_int8(
     bundle_dir: Path,
     bundle: dict[str, Any],
+    source_bundle_dir: Path | None = None,
     *,
     inventory_path: str | Path | None = None,
     exclude_nodes: Sequence[str] = (),
     exclude_initializers: Sequence[str] = (),
     include_nodes: Sequence[str] = (),
+    progress_path: Path | None = None,
 ) -> dict[str, Any]:
     import platform
     import subprocess
@@ -524,12 +527,16 @@ def _quantize_lm_ternary_exact_int8(
     if metadata.get("io_dtype") != "float32":
         raise ValueError("Exact ternary INT8 LM optimization requires float32 graph I/O")
 
-    source_hash = _sha256(lm_model_path)
-    source_graph = onnx.load(str(lm_model_path), load_external_data=False)
+    source_root = source_bundle_dir or bundle_dir
+    source_lm_model_path = _bundle_path(source_root, lm_entry["model"])
+    source_hash = _sha256(source_lm_model_path)
+    source_graph = onnx.load(str(source_lm_model_path), load_external_data=False)
     source_locations = _all_external_locations(source_graph)
-    source_paths = {_bundle_path(lm_model_path.parent, location) for location in source_locations}
+    source_paths = {
+        _bundle_path(source_lm_model_path.parent, location) for location in source_locations
+    }
     source_external_hashes = {
-        location: _sha256(_bundle_path(lm_model_path.parent, location))
+        location: _sha256(_bundle_path(source_lm_model_path.parent, location))
         for location in sorted(source_locations)
     }
     referenced_before = _bundle_external_paths(bundle_dir)
@@ -541,13 +548,18 @@ def _quantize_lm_ternary_exact_int8(
         f".lm.ternary-exact-int8-{uuid.uuid4().hex}.tmp.onnx"
     )
 
+    def record_stage(stage: str, details: dict[str, Any]) -> None:
+        if progress_path is not None:
+            _append_build_progress(progress_path, stage, **details)
+
     try:
         transformation = compress_ternary_matmuls_streaming(
-            lm_model_path,
+            source_lm_model_path,
             candidate_graph,
             external_path,
             inventory=inventory,
             exclude_nodes=excluded,
+            stage_callback=record_stage,
         )
         candidate_model = onnx.load(str(candidate_graph), load_external_data=False)
         external_locations = _all_external_locations(candidate_model)
@@ -563,7 +575,11 @@ def _quantize_lm_ternary_exact_int8(
         raise
 
     referenced_after = _bundle_external_paths(bundle_dir)
-    stale_paths = (source_paths | set(stale_candidates)) - referenced_after
+    stale_paths = {
+        path
+        for path in source_paths | set(stale_candidates)
+        if path.is_relative_to(bundle_dir.resolve())
+    } - referenced_after
     for stale_path in sorted(stale_paths):
         if stale_path.is_file():
             stale_path.unlink()
@@ -581,8 +597,20 @@ def _quantize_lm_ternary_exact_int8(
     stored_bytes = code_bytes + scale_bytes
     metadata["external_data"] = bool(external_locations)
     metadata["external_data_files"] = sorted(external_locations)
+    runtime_options = {
+        "intra_op_threads": 1,
+        "inter_op_threads": 1,
+        "execution_mode": "sequential",
+        "enable_mem_pattern": False,
+        "enable_cpu_mem_arena": False,
+        "graph_optimization_level": "ORT_DISABLE_ALL",
+    }
+    metadata["runtime_memory_profile"] = "low-memory-exact-ternary"
+    metadata["runtime_options"] = runtime_options
     metadata["quantization"] = {
         "method": "ternary-exact-int8",
+        "runtime_memory_profile": "low-memory-exact-ternary",
+        "runtime_options": runtime_options,
         "backend": "streaming",
         "group_size": 128,
         "code_dtype": "int8",
@@ -623,6 +651,8 @@ def _quantize_lm_ternary_exact_int8(
             "repository_commit": repository_commit,
         },
     }
+    if progress_path is not None:
+        _append_build_progress(progress_path, "write_metadata")
     lm_meta_path.write_text(
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -635,7 +665,47 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def optimize_bundle(
+
+def _append_build_progress(path: Path, stage: str, **details: Any) -> None:
+    event = {"timestamp": datetime.now(UTC).isoformat(), "stage": stage, **details}
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, sort_keys=True) + "\n")
+
+def _copy_bundle_for_exact_ternary(
+    input_root: Path, output_root: Path, bundle: dict[str, Any]
+) -> None:
+    import onnx
+
+    root = input_root.resolve()
+    lm_model_path = _bundle_path(root, bundle["lm"]["model"])
+    lm_model = onnx.load(str(lm_model_path), load_external_data=False)
+    lm_external = {
+        (lm_model_path.parent / location).resolve()
+        for location in _all_external_locations(lm_model)
+    }
+    other_external: set[Path] = set()
+    for graph_path in root.rglob("*.onnx"):
+        if graph_path.resolve() == lm_model_path:
+            continue
+        graph = onnx.load(str(graph_path), load_external_data=False)
+        other_external.update(
+            (graph_path.parent / location).resolve()
+            for location in _all_external_locations(graph)
+        )
+    omitted = {lm_model_path} | (lm_external - other_external)
+    if any(not path.is_relative_to(root) for path in other_external):
+        raise ValueError("Exact-ternary bundle references external data outside the input bundle")
+    if any(not path.is_relative_to(root) for path in omitted):
+        raise ValueError("Exact-ternary source files must remain inside the input bundle")
+
+    def ignore(directory: str, names: list[str]) -> list[str]:
+        parent = Path(directory).resolve()
+        return [name for name in names if (parent / name).resolve() in omitted]
+
+    shutil.copytree(root, output_root, ignore=ignore)
+
+
+def _optimize_bundle_build(
     input_dir: str | Path,
     output_dir: str | Path,
     *,
@@ -674,6 +744,9 @@ def optimize_bundle(
         else output_root.with_name(f"{output_root.name}-reports")
     )
     report_root.mkdir(parents=True, exist_ok=True)
+    progress_path = report_root / "build-progress.jsonl" if lm_method == "ternary-exact-int8" else None
+    if progress_path is not None and progress_path.exists():
+        raise FileExistsError(progress_path)
     output_root.parent.mkdir(parents=True, exist_ok=True)
     if lm_method not in (
         "int8-dynamic",
@@ -703,7 +776,10 @@ def optimize_bundle(
     if bundle.get("format") != "kitten2-onnx-bundle-v1":
         raise ValueError("Unsupported bundle format")
     source_size = sum(path.stat().st_size for path in input_root.rglob("*") if path.is_file())
-    shutil.copytree(input_root, output_root)
+    if lm_method == "ternary-exact-int8":
+        _copy_bundle_for_exact_ternary(input_root, output_root, bundle)
+    else:
+        shutil.copytree(input_root, output_root)
     output_bundle_path = output_root / "bundle.json"
     bundle = json.loads(output_bundle_path.read_text(encoding="utf-8"))
 
@@ -721,10 +797,12 @@ def optimize_bundle(
         quantization = _quantize_lm_ternary_exact_int8(
             output_root,
             bundle,
+            source_bundle_dir=input_root,
             inventory_path=ternary_inventory_path,
             exclude_nodes=exclude_matmul_nodes,
             exclude_initializers=exclude_matmul_initializers,
             include_nodes=include_matmul_nodes,
+            progress_path=progress_path,
         )
     else:
         quantization = _quantize_lm_ternary_nbits4(
@@ -741,10 +819,14 @@ def optimize_bundle(
         raise TypeError("Bundle export metadata must be an object")
     export_metadata["lm_optimization"] = lm_method
     bundle["files"] = _bundle_files(output_root)
+    if progress_path is not None:
+        _append_build_progress(progress_path, "write_bundle_metadata")
     output_bundle_path.write_text(
         json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
+    if progress_path is not None:
+        _append_build_progress(progress_path, "size_audit")
     size_report = audit_bundle(output_root)
     size_path = report_root / "size-report.json"
     _write_json(size_path, size_report)
@@ -753,6 +835,7 @@ def optimize_bundle(
         "lm_method": lm_method,
         "source_bundle": str(input_root),
         "output_bundle": str(output_root),
+        "build_progress": str(progress_path) if progress_path is not None else None,
         "input_bundle_bytes": source_size,
         "output_bundle_bytes": int(size_report["bundle_bytes"]),
         "quantization": quantization,
@@ -796,6 +879,92 @@ def optimize_bundle(
         report["parity"] = {"status": "not_run"}
 
     _write_json(report_root / "optimization.json", report)
+    if progress_path is not None:
+        _append_build_progress(progress_path, "complete")
+    return report
+
+
+def optimize_bundle(
+    input_dir: str | Path,
+    output_dir: str | Path,
+    *,
+    lm_method: str,
+    validate: bool = False,
+    model_dir: str | Path | None = None,
+    corpus_path: str | Path | None = None,
+    report_dir: str | Path | None = None,
+    chunk_rows: int = 64,
+    nbits: int = 4,
+    nbits_block_size: int = 128,
+    nbits_accuracy_level: int = 1,
+    exclude_matmul_nodes: Sequence[str] = (),
+    exclude_matmul_initializers: Sequence[str] = (),
+    ternary_inventory_path: str | Path | None = None,
+    include_matmul_nodes: Sequence[str] = (),
+) -> dict[str, Any]:
+    input_root = Path(input_dir).resolve()
+    final_output_root = Path(output_dir).resolve()
+    if (
+        final_output_root == input_root
+        or final_output_root.is_relative_to(input_root)
+        or input_root.is_relative_to(final_output_root)
+    ):
+        raise ValueError("Input and output bundle directories must not overlap")
+    if final_output_root.exists():
+        raise FileExistsError(final_output_root)
+
+    report_root = (
+        Path(report_dir).resolve()
+        if report_dir is not None
+        else final_output_root.with_name(f"{final_output_root.name}-reports")
+    )
+    if report_root == final_output_root or report_root.is_relative_to(final_output_root):
+        raise ValueError("Report directory must be outside the output bundle")
+    final_output_root.parent.mkdir(parents=True, exist_ok=True)
+    staging_root = final_output_root.with_name(
+        f".{final_output_root.name}.{uuid.uuid4().hex}.partial"
+    )
+    staging_root.mkdir()
+    marker_path = staging_root / "BUILDING.json"
+    _write_json(
+        marker_path,
+        {
+            "status": "building",
+            "pid": os.getpid(),
+            "started_at": datetime.now(UTC).isoformat(),
+            "lm_method": lm_method,
+        },
+    )
+
+    try:
+        staged_output = staging_root / "bundle"
+        report = _optimize_bundle_build(
+            input_root,
+            staged_output,
+            lm_method=lm_method,
+            validate=validate,
+            model_dir=model_dir,
+            corpus_path=corpus_path,
+            report_dir=report_root,
+            chunk_rows=chunk_rows,
+            nbits=nbits,
+            nbits_block_size=nbits_block_size,
+            nbits_accuracy_level=nbits_accuracy_level,
+            exclude_matmul_nodes=exclude_matmul_nodes,
+            exclude_matmul_initializers=exclude_matmul_initializers,
+            ternary_inventory_path=ternary_inventory_path,
+            include_matmul_nodes=include_matmul_nodes,
+        )
+        report["output_bundle"] = str(final_output_root)
+        _write_json(report_root / "optimization.json", report)
+        marker_path.unlink()
+        if final_output_root.exists():
+            raise FileExistsError(final_output_root)
+        os.replace(staged_output, final_output_root)
+    except BaseException:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise
+    shutil.rmtree(staging_root, ignore_errors=True)
     return report
 
 

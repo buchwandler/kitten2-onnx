@@ -20,6 +20,23 @@ S3GEN_SAMPLES_PER_MEL_FRAME = 480
 S3GEN_SPEECH_VOCAB_SIZE = 6561
 
 
+def _cpu_session_options(profile: str):
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    if profile == "default":
+        return options
+    if profile != "low-memory-exact-ternary":
+        raise ValueError(f"Unsupported CPU runtime memory profile: {profile!r}")
+    options.intra_op_num_threads = 1
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.enable_mem_pattern = False
+    options.enable_cpu_mem_arena = False
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return options
+
+
 def clean_s3_tokens(
     speech_tokens: list[int] | np.ndarray, vocab_size: int = S3GEN_SPEECH_VOCAB_SIZE
 ) -> np.ndarray:
@@ -111,10 +128,22 @@ class Kitten2OnnxLM:
             self.embedding_storage_dtype = None
         else:
             raise ValueError(f"Unsupported LM input mode: {self.input_mode!r}")
-        self.session = ort.InferenceSession(
-            str(self.model_dir / "lm.onnx"),
-            providers=providers,
-        )
+        runtime_memory_profile = self.meta.get("runtime_memory_profile", "default")
+        if runtime_memory_profile not in {"default", "low-memory-exact-ternary"}:
+            raise ValueError(f"Unsupported runtime memory profile: {runtime_memory_profile!r}")
+        if runtime_memory_profile == "low-memory-exact-ternary":
+            if runtime_provider != "CPUExecutionProvider":
+                raise ValueError("Low-memory exact-ternary profile requires CPUExecutionProvider")
+            self.session = ort.InferenceSession(
+                str(self.model_dir / "lm.onnx"),
+                sess_options=_cpu_session_options(runtime_memory_profile),
+                providers=providers,
+            )
+        else:
+            self.session = ort.InferenceSession(
+                str(self.model_dir / "lm.onnx"),
+                providers=providers,
+            )
         self.speaker_session = (
             ort.InferenceSession(str(speaker_model), providers=providers)
             if speaker_model is not None
