@@ -44,6 +44,7 @@ def test_load_reference_artifacts_and_prompt(tmp_path, monkeypatch):
                 "token_map": _token_map(),
                 "speaker_embedding_dim": 4,
                 "default_voice": "Bruno",
+                "generation": {"emotion_control": "{emo: 1}"},
                 "voices": "voices/voices.json",
             }
         ),
@@ -74,9 +75,12 @@ def test_load_reference_artifacts_and_prompt(tmp_path, monkeypatch):
             assert not add_special_tokens
             if text == "Reference words.":
                 return [31, 32]
+            if text == "{emo: 1}":
+                return [51]
+            if text == "[joyful] Hello.":
+                return [43, 44]
             assert text == "Target words."
             return [41, 42]
-
     monkeypatch.setattr(
         transformers.AutoTokenizer,
         "from_pretrained",
@@ -103,6 +107,40 @@ def test_load_reference_artifacts_and_prompt(tmp_path, monkeypatch):
         22,
         41,
         42,
+        108,
+        20,
+    ]
+
+    assert artifacts.build_prompt("[joyful] hello") == [
+        24,
+        111,
+        31,
+        32,
+        112,
+        109,
+        100,
+        107,
+        110,
+        51,
+        22,
+        43,
+        44,
+        108,
+        20,
+    ]
+    assert artifacts.build_prompt("[joyful] hello", use_emotion=False) == [
+        24,
+        111,
+        31,
+        32,
+        112,
+        109,
+        100,
+        107,
+        110,
+        22,
+        43,
+        44,
         108,
         20,
     ]

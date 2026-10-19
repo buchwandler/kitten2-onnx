@@ -34,6 +34,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--preset", help="Decode preset from bundle.json")
     parser.add_argument("--seed", type=int, help="Seed for sampling and decoder noise")
     parser.add_argument("--max-new-tokens", type=int, default=512)
+
+    parser.add_argument("--no-normalize", action="store_true")
+    emotion_group = parser.add_mutually_exclusive_group()
+    emotion_group.add_argument("--use-emotion", dest="use_emotion", action="store_true")
+    emotion_group.add_argument("--no-emotion", dest="use_emotion", action="store_false")
+    parser.set_defaults(use_emotion=None)
     parser.add_argument("--provider", action="append", dest="providers")
     parser.add_argument("--output", type=Path, required=True, help="Output WAV path")
     args = parser.parse_args(argv)
@@ -47,6 +53,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         preset=args.preset,
         seed=args.seed,
         max_new_tokens=args.max_new_tokens,
+
+        normalize=not args.no_normalize,
+        use_emotion=args.use_emotion,
     )
     validate_audio(audio)
     args.output.parent.mkdir(parents=True, exist_ok=True)

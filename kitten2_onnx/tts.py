@@ -8,19 +8,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import kitten_text_processing
 import numpy as np
 
 from kitten2_onnx.decoder_reference import load_decoder_reference
 from kitten2_onnx.prompt import build_generation_prompt, build_reference_prefix
 from kitten2_onnx.runtime import GenerationResult, Kitten2OnnxDecoder, Kitten2OnnxLM
 from kitten2_onnx.sampling import SamplingSettings, sampling_settings_from_config
+from kitten2_onnx.text import prepare_generation_text
 from kitten2_onnx.tokens import TokenMap
 
 
 @dataclass(frozen=True)
 class SynthesisResult:
     normalized_text: str
+    expression_detected: bool
+    emotion_control_used: bool
     prompt_length: int
     prompt_ids: list[int]
     raw_ids: list[int]
@@ -57,6 +59,14 @@ class Kitten2OnnxTTS:
         )
         self.sample_rate = self.decoder.sample_rate
         self._voices: dict[str, tuple[np.ndarray, list[int], dict[str, np.ndarray]]] = {}
+
+    @property
+    def available_voices(self) -> list[str]:
+        return list(self.bundle["voices"])
+
+    @property
+    def available_presets(self) -> list[str]:
+        return list(self.bundle.get("decode_presets", {}))
 
     def _voice(self, name: str) -> tuple[np.ndarray, list[int], dict[str, np.ndarray]]:
         if name not in self.bundle["voices"]:
@@ -99,6 +109,8 @@ class Kitten2OnnxTTS:
         preset: str | None = None,
         seed: int | None = None,
         max_new_tokens: int = 512,
+        normalize: bool = True,
+        use_emotion: bool | None = None,
     ) -> np.ndarray:
         """Generate a mono waveform from text and a packaged built-in voice."""
         return self.generate_with_metadata(
@@ -107,6 +119,8 @@ class Kitten2OnnxTTS:
             preset=preset,
             seed=seed,
             max_new_tokens=max_new_tokens,
+            normalize=normalize,
+            use_emotion=use_emotion,
         ).waveform
 
     def generate_with_metadata(
@@ -119,9 +133,19 @@ class Kitten2OnnxTTS:
         max_new_tokens: int = 512,
         sampling_settings: SamplingSettings | None = None,
         logits_callback: Callable[[int, np.ndarray], None] | None = None,
+
+        normalize: bool = True,
+        use_emotion: bool | None = None,
     ) -> SynthesisResult:
         """Generate speech and retain normalized text, prompt, IDs, and optional logits."""
-        normalized_text = kitten_text_processing.normalize_text(text).strip()
+        prepared = prepare_generation_text(
+            text,
+            tokenizer=self.tokenizer,
+            generation_config=self.bundle.get("generation", {}),
+            normalize=normalize,
+            use_emotion=use_emotion,
+        )
+        normalized_text = prepared.processed_text
         if not normalized_text:
             raise ValueError("text must not be empty after normalization")
         if max_new_tokens < 1:
@@ -131,7 +155,10 @@ class Kitten2OnnxTTS:
         speaker_embedding, reference_prefix, conditioning = self._voice(voice)
         target_text_ids = self.tokenizer.encode(normalized_text, add_special_tokens=False)
         prompt_ids = build_generation_prompt(
-            self.token_map, target_text_ids, reference_prefix=reference_prefix
+            self.token_map,
+            target_text_ids,
+            reference_prefix=reference_prefix,
+            emotion_ids=prepared.emotion_ids,
         )
         settings = sampling_settings or sampling_settings_from_config(self.bundle, preset)
         generation: GenerationResult = self.lm.generate(
@@ -156,6 +183,8 @@ class Kitten2OnnxTTS:
             raise ValueError(f"decoder waveform must be mono, found shape {audio.shape}")
         return SynthesisResult(
             normalized_text=normalized_text,
+            expression_detected=prepared.expression_detected,
+            emotion_control_used=prepared.emotion_control_used,
             prompt_length=len(prompt_ids),
             prompt_ids=prompt_ids,
             raw_ids=generation.raw_ids,

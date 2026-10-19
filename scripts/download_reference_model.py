@@ -48,7 +48,6 @@ def voice_files(
         raise TypeError(f"Voice entry {voice_name!r} must be a JSON object")
 
     files = {index_path}
-    files = {index_path}
     for key in ("reference", "artifacts"):
         value = selected.get(key)
         if not isinstance(value, str) or not value:
@@ -80,6 +79,17 @@ def voice_files(
         raise ValueError("Selected voice assets are missing from this revision: " + ", ".join(missing))
     return files
 
+def all_voice_files(
+    config: dict[str, Any],
+    voice_index: dict[str, Any],
+    available_files: set[str],
+) -> set[str]:
+    files: set[str] = set()
+    for voice_name in sorted(voice_index):
+        files.update(voice_files(config, voice_index, voice_name, available_files))
+    return files
+
+
 
 def download_model(
     repo_id: str,
@@ -88,7 +98,11 @@ def download_model(
     *,
     plain_lm: bool,
     voice: str | None,
+    all_voices: bool = False,
 ) -> dict[str, Any]:
+    if voice is not None and all_voices:
+        raise ValueError("Select either one voice or all voices, not both")
+
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
     api = HfApi()
@@ -97,16 +111,21 @@ def download_model(
     available_files = {sibling.rfilename for sibling in model_info.siblings or []}
 
     files = set(BASE_FILES)
+    selected_voices: list[str] = []
     if plain_lm:
         files.add("lm/model.safetensors")
 
-    if voice is not None:
+    if voice is not None or all_voices:
         config_path = hf_hub_download(repo_id, "config.json", revision=resolved_revision)
         config = json.loads(Path(config_path).read_text(encoding="utf-8"))
         index_path = _repo_path(str(config.get("voices", "voices/voices.json")))
         index_local_path = hf_hub_download(repo_id, index_path, revision=resolved_revision)
         voice_index = json.loads(Path(index_local_path).read_text(encoding="utf-8"))
-        files.update(voice_files(config, voice_index, voice, available_files))
+        selected_voices = sorted(voice_index) if all_voices else [voice]
+        if all_voices:
+            files.update(all_voice_files(config, voice_index, available_files))
+        else:
+            files.update(voice_files(config, voice_index, voice, available_files))
 
     missing = sorted(files - available_files)
     if missing:
@@ -127,12 +146,12 @@ def download_model(
         "upstream_code_revision": UPSTREAM_CODE_REVISION,
         "downloaded_files": sorted(files),
         "voice": voice,
+        "voices": selected_voices,
     }
     (output / "model_revision.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
     return manifest
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download a pinned KittenTTS 2 reference model.")
@@ -140,7 +159,9 @@ def main() -> None:
     parser.add_argument("--revision", required=True, help="Pinned branch, tag, or commit revision")
     parser.add_argument("--output", type=Path, required=True, help="Local output directory")
     parser.add_argument("--plain-lm", action="store_true", help="Download lm/model.safetensors")
-    parser.add_argument("--voice", help="Also download one built-in voice and its selected decoder assets")
+    voice_group = parser.add_mutually_exclusive_group()
+    voice_group.add_argument("--voice", help="Also download one built-in voice and its selected decoder assets")
+    voice_group.add_argument("--all-voices", action="store_true", help="Download every built-in voice reference and the shared decoder")
     args = parser.parse_args()
 
     manifest = download_model(
@@ -149,6 +170,7 @@ def main() -> None:
         args.output,
         plain_lm=args.plain_lm,
         voice=args.voice,
+        all_voices=args.all_voices,
     )
     print(json.dumps(manifest, indent=2))
 

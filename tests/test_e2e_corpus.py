@@ -9,6 +9,8 @@ from pathlib import Path
 import kitten_text_processing
 import pytest
 
+from kitten2_onnx.text import has_expression_tag
+
 CORPUS_PATH = Path(__file__).parent / "fixtures" / "e2e_corpus.json"
 
 
@@ -169,7 +171,15 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
                 "max_new_tokens": 2,
                 "seed": 1,
                 "preset": "default",
-                "cases": [{"name": "sample", "text": "Hello", "normalized_text": "Hello"}],
+                "cases": [
+                    {
+                        "name": "sample",
+                        "text": "Hello",
+                        "normalized_text": "Hello",
+                        "normalize": False,
+                        "use_emotion": False,
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -179,6 +189,7 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
         token_map=SimpleNamespace(audio_id_base=100, audio_id_end=200),
     )
 
+    preprocessing_calls = []
     class FakeTTS:
         def __init__(self, bundle_dir, *, providers):
             self.is_original = Path(bundle_dir).name == "original"
@@ -199,8 +210,13 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
             seed,
             max_new_tokens,
             preset,
+            normalize,
+            use_emotion,
             logits_callback=None,
         ):
+            preprocessing_calls.append(
+                ("original" if self.is_original else "candidate", normalize, use_emotion)
+            )
             raw_ids = [100, 101] if self.is_original else [100, 102]
             logits = (
                 [np.asarray([1.0, 0.0]), np.asarray([0.0, 1.0])]
@@ -213,6 +229,8 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
             waveform = np.asarray([0.1, 0.3] if self.is_original else [0.1, 0.2], dtype=np.float32)
             return SimpleNamespace(
                 normalized_text="Hello",
+                expression_detected=False,
+                emotion_control_used=False,
                 prompt_ids=[1, 2],
                 raw_ids=raw_ids,
                 s3_ids=[token - 100 for token in raw_ids],
@@ -221,11 +239,14 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
             )
 
     def fake_capture_reference(*args, logits_callback, **kwargs):
+        preprocessing_calls.append(
+            ("reference", kwargs["normalize"], kwargs["use_emotion"])
+        )
         for index, values in enumerate((np.asarray([1.0, 0.0]), np.asarray([0.0, 1.0]))):
             logits_callback(index, values)
         return (
             {"generated_raw_ids": np.asarray([100, 101]), "prompt_ids": np.asarray([1, 2])},
-            {"prompt_length": 2},
+            {"prompt_length": 2, "processed_text": "Hello", "expression_detected": False, "emotion_control_used": False},
         )
 
     monkeypatch.setattr(validator, "load_reference_artifacts", lambda *args: artifacts)
@@ -253,6 +274,12 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
     assert report["validation_mode"] == "quality_report"
     assert report["quality_review"]["status"] == "requires_manual_review"
     assert report["first_divergence"]["step"] == 1
+    assert preprocessing_calls == [
+        ("reference", False, False),
+        ("candidate", False, False),
+        ("original", False, False),
+        ("candidate", False, False),
+    ]
     assert case_report["token_ids_match_reference"] is False
     assert case_report["logits_compared_steps"] == 2
     assert case_report["waveform_finite"] is True
@@ -266,3 +293,26 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
             corpus_path,
             tmp_path / "strict.json",
         )
+
+
+
+def test_expression_corpus_uses_recognized_controls():
+    expression_path = Path(__file__).parent / "fixtures" / "expression_cases.json"
+    expression_corpus = json.loads(expression_path.read_text(encoding="utf-8"))
+
+    assert len(expression_corpus["cases"]) == 3
+    assert all(has_expression_tag(case["text"]) for case in expression_corpus["cases"])
+
+
+
+def test_multilingual_corpus_disables_normalization_for_each_language():
+    multilingual_path = Path(__file__).parent / "fixtures" / "multilingual_cases.json"
+    multilingual_corpus = json.loads(multilingual_path.read_text(encoding="utf-8"))
+
+    assert {case["name"] for case in multilingual_corpus["cases"]} == {
+        "german",
+        "chinese",
+        "arabic",
+        "hindi",
+    }
+    assert all(case["normalize"] is False for case in multilingual_corpus["cases"])

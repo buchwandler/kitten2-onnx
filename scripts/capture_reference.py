@@ -42,10 +42,14 @@ def capture_reference(
     logits_callback: Callable[[int, np.ndarray], None] | None = None,
     sampling_settings: SamplingSettings | None = None,
     seed: int | None = None,
+
+    normalize: bool = True,
+    use_emotion: bool | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     reference = reference_model or load_reference_model(artifacts, device=device)
     model = reference.model
-    prompt_ids = artifacts.build_prompt(text)
+    prepared = artifacts.prepare_text(text, normalize=normalize, use_emotion=use_emotion)
+    prompt_ids = artifacts.build_prompt_from_prepared(prepared)
     device_obj = reference.device
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device_obj)
     embedding_table = model.get_input_embeddings().weight
@@ -147,6 +151,11 @@ def capture_reference(
         "voice": artifacts.voice,
         "reference_transcript": artifacts.transcript,
         "target_text": text,
+
+        "processed_text": prepared.processed_text,
+        "normalize": prepared.normalize,
+        "expression_detected": prepared.expression_detected,
+        "emotion_control_used": prepared.emotion_control_used,
         "prompt_length": len(prompt_ids),
         "generated_token_count": len(generated_ids),
     }
@@ -160,6 +169,11 @@ def main() -> None:
     parser.add_argument("--text", default="Hello from Kitten.")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--no-normalize", action="store_true")
+    emotion_group = parser.add_mutually_exclusive_group()
+    emotion_group.add_argument("--use-emotion", dest="use_emotion", action="store_true")
+    emotion_group.add_argument("--no-emotion", dest="use_emotion", action="store_false")
+    parser.set_defaults(use_emotion=None)
     parser.add_argument(
         "--output", type=Path, required=True, help="Output basename for .npz and .json files"
     )
@@ -171,6 +185,9 @@ def main() -> None:
         text=args.text,
         max_new_tokens=args.max_new_tokens,
         device=args.device,
+
+        normalize=not args.no_normalize,
+        use_emotion=args.use_emotion,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     npz_path = args.output.with_suffix(".npz")

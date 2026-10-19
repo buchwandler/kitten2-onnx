@@ -139,6 +139,15 @@ python scripts/quantize.py build/lm/lm.onnx build/lm/lm.int8.onnx
 Dynamic INT8 is only a convenient first experiment. It is not intended to
 preserve Kitten's packed ternary representation.
 
+
+### Exact ternary INT8 storage, measured result
+
+The signed-zero-preserving exact-storage path transforms all 196 eligible LM MatMuls. The measured candidate bundle is 3,994,123,323 bytes (about 3.72 GiB), compared with an 8,177,466,136-byte baseline. It replaces 5,637,144,576 FP32 operand bytes with 1,453,326,336 bytes of INT8 codes and FP32 scales. Code `-2` preserves negative zero exactly.
+
+The candidate at `build/experiments/ternary-exact-lowram-all196-retry16-task0011` passed the trusted ONNX-only diagnostic, strict real-LM parity, bundle validation, the five-case E2E corpus, and fixed-seed synthesis. Strict parity and E2E passed under a user-approved 16 GiB process-tree RSS cap. The highest measured peak was 15,617,724,416 bytes during E2E. The worker requires at least 16 GiB available memory before launch, keeps an 8 GiB available-memory reserve, and limits additional swap use to 2 GiB. At the original 12 GiB cap, strict parity and E2E were stopped by the memory guard.
+
+The LM metadata selects the `low-memory-exact-ternary` CPU session profile. This is an exact-storage format, not execution quantization. The full TTS path was measured within the approved 16 GiB worker cap.
+
 ## Development
 
 ```bash
@@ -148,3 +157,107 @@ pytest
 
 No `src/` directory is used. Versioning is Git-tag driven through
 `setuptools-scm`.
+
+
+## Text controls and voice selection
+
+`Kitten2OnnxTTS.generate` and `generate_with_metadata` accept `normalize` and `use_emotion`. Normalization is enabled by default. Set `normalize=False` for multilingual text that should not pass through the English-oriented language normalizer. Basic formatting and sentence termination still apply, while Arabic, Chinese, and Devanagari terminal punctuation is preserved.
+
+`use_emotion=None` enables the configured emotion control when recognized expression or vocal-event markup is present. Set it to `True` or `False` to force or suppress the control token. `generate_with_metadata` reports `expression_detected` and `emotion_control_used`.
+
+```python
+from kitten2_onnx.tts import Kitten2OnnxTTS
+
+tts = Kitten2OnnxTTS("build/kitten2-onnx-47voices")
+print(tts.available_voices)
+audio = tts.generate(
+    "早上好。你今天感觉怎么样？",
+    voice="Bruno",
+    preset="stable",
+    seed=7,
+    normalize=False,
+)
+```
+
+The synthesis CLI exposes the same controls. `--no-normalize` disables language normalization, while `--use-emotion` and `--no-emotion` override automatic emotion selection.
+
+```bash
+python -m kitten2_onnx.synthesize build/kitten2-onnx-47voices \
+  "Guten Morgen." --voice Sable --preset stable --seed 7 \
+  --max-new-tokens 32 --no-normalize --output build/sable.wav
+```
+
+`available_voices` lists the names packaged in the selected bundle. The default voice remains Bruno.
+
+## Building a local 47-voice bundle
+
+The accepted voice set comes from the pinned `voices/voices.json` at model revision `fa8ce5c7547e322a065cad9b813d27a78fad9640` and upstream code revision `36ef3090ca1e59122a81fc23be4a659a502b9d55`. Download the pinned local reference model and all voice assets:
+
+```bash
+python scripts/download_reference_model.py KittenML/kitten-tts-2 \
+  --revision fa8ce5c7547e322a065cad9b813d27a78fad9640 \
+  --output .models/kitten-tts-2 --plain-lm --all-voices
+```
+
+Capture voice-specific S3Gen references sequentially. The command writes one `.npz` and metadata file per voice, a resumable `capture_report.json`, and peak RSS information. Re-running it skips valid captures and recaptures missing or stale ones.
+
+```bash
+python -m scripts.capture_all_voices \
+  --model-dir .models/kitten-tts-2 \
+  --output-dir build/voices-all \
+  --token-count 32
+```
+
+To reuse already exported ONNX graphs, augment a validated source bundle locally:
+
+```bash
+python -m scripts.augment_bundle_voices \
+  build/baseline-hosted-onnx build/voices-all \
+  --model-dir .models/kitten-tts-2 \
+  --output build/kitten2-onnx-47voices
+
+python -m kitten2_onnx.validate_bundle build/kitten2-onnx-47voices \
+  --output build/reports/validate-47-voice-bundle.json
+```
+
+The output directory must not already exist. Augmentation stages a sibling copy, verifies the source bundle, adds only missing voice references, regenerates `bundle.json` file hashes, validates the staged bundle, and compares every unchanged source file hash before atomic promotion. The source bundle is not modified. The workflow only reads local and pinned upstream assets. It does not publish to or modify the Hugging Face repository.
+
+When exporting directly from the pinned model instead of reusing an existing bundle, `python -m kitten2_onnx.export_all ... --all-voices` packages the selected voice set while retaining a single shared decoder graph pair. Without `--all-voices`, export keeps the Bruno-only default.
+
+## Release checks and resource evidence
+
+Run the exact expression parity and multilingual parity cases against the final bundle. The multilingual fixture explicitly sets `normalize=false` for German, Chinese, Arabic, and Hindi.
+
+```bash
+python -m scripts.validate_e2e_corpus .models/kitten-tts-2 \
+  build/kitten2-onnx-47voices \
+  --corpus tests/fixtures/expression_cases.json \
+  --output build/reports/e2e-expression.json
+
+python -m scripts.validate_e2e_corpus .models/kitten-tts-2 \
+  build/kitten2-onnx-47voices \
+  --corpus tests/fixtures/multilingual_cases.json \
+  --output build/reports/e2e-multilingual.json
+```
+
+The local CPU evidence in `build/reports/feature-parity-47voices.json` records 47 captured voices, 167/167 bundle files verified, preserved source file hashes, exact parity for three expression cases and four multilingual cases, finite waveforms, and a non-default Sable CLI smoke test. The underlying report and resource-guard logs are retained beside it.
+
+| Check | Observed peak RSS | Elapsed | Result |
+| --- | ---: | ---: | --- |
+| Capture all 47 voices | 3.03 GB | 15m 36s | 47/47 captured and verified |
+| Augment and validate bundle | 3.69 GB | 46s | 167/167 files verified, source hashes preserved |
+| Expression PyTorch/ONNX parity | 15.88 GB | 17m 23s | Exact token parity, 3/3 cases, finite audio |
+| Multilingual PyTorch/ONNX parity | 16.04 GB | 7m 47s | Exact token parity, 4/4 cases, finite audio |
+| Sable CLI synthesis | 8.68 GB | 1m 44s | 24 kHz finite audio, 0.74s |
+
+The parity runs used `scripts/run_bounded.py` with an 18 GiB RSS cap and a 6 GiB available-memory reserve. Two earlier expression attempts were stopped by stricter swap and reserve guards; the completed run used a 4.5 GiB additional-swap ceiling. Check available memory before running full CPU parity and retain the guard reports. These measurements depend on the host and are not universal sizing guarantees.
+
+The augmented bundle and reports are local build artifacts. The release boundary is: pin source revisions, download and capture, stage and validate local augmentation, run parity and finite-audio checks, then review the hash and resource reports. Remote publication is a separate, explicit operation and is not part of this workflow.
+
+
+Run repository tests and lint before accepting a release bundle:
+
+```bash
+pytest -q
+ruff check .
+```

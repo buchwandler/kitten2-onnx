@@ -143,11 +143,15 @@ def validate_corpus(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     for case_index, case in enumerate(corpus["cases"]):
+        normalize = case.get("normalize", True)
+        use_emotion = case.get("use_emotion")
         reference_logits: list[np.ndarray] = []
         onnx_logits: list[np.ndarray] = []
         expected_arrays, expected_metadata = capture_reference(
             artifacts,
-            text=case["normalized_text"],
+            text=case["text"],
+            normalize=normalize,
+            use_emotion=use_emotion,
             max_new_tokens=max_new_tokens,
             reference_model=reference_model,
             sampling_settings=sampling_settings,
@@ -160,8 +164,15 @@ def validate_corpus(
             seed=seed,
             max_new_tokens=max_new_tokens,
             preset=preset,
+            normalize=normalize,
+            use_emotion=use_emotion,
             logits_callback=lambda index, values, sink=onnx_logits: sink.append(values),
         )
+
+        if result.expression_detected != expected_metadata["expression_detected"]:
+            raise AssertionError(f"{case['name']}: expression detection differs from PyTorch reference")
+        if result.emotion_control_used != expected_metadata["emotion_control_used"]:
+            raise AssertionError(f"{case['name']}: emotion conditioning differs from PyTorch reference")
         reference_result = None
         if quality_report:
             if reference_tts is None:
@@ -172,14 +183,20 @@ def validate_corpus(
                 seed=seed,
                 max_new_tokens=max_new_tokens,
                 preset=preset,
+                normalize=normalize,
+                use_emotion=use_emotion,
             )
-            if reference_result.normalized_text != case["normalized_text"]:
+            if reference_result.normalized_text != expected_metadata["processed_text"]:
                 raise AssertionError(f"{case['name']}: original bundle normalized text differs")
+            if reference_result.expression_detected != expected_metadata["expression_detected"]:
+                raise AssertionError(f"{case['name']}: original bundle expression detection differs")
+            if reference_result.emotion_control_used != expected_metadata["emotion_control_used"]:
+                raise AssertionError(f"{case['name']}: original bundle emotion conditioning differs")
             if reference_result.prompt_ids != expected_arrays["prompt_ids"].tolist():
                 raise AssertionError(f"{case['name']}: original bundle prompt IDs differ")
         expected_ids = expected_arrays["generated_raw_ids"].tolist()
         divergence = _first_difference(expected_ids, result.raw_ids)
-        if result.normalized_text != case["normalized_text"]:
+        if result.normalized_text != expected_metadata["processed_text"]:
             raise AssertionError(
                 f"{case['name']}: normalized text differs: {result.normalized_text!r}"
             )
@@ -276,6 +293,8 @@ def validate_corpus(
                 seed=seed,
                 max_new_tokens=max_new_tokens,
                 preset=preset,
+                normalize=normalize,
+                use_emotion=use_emotion,
             )
             audio_dir = output_path.parent / f"{output_path.stem}-audio"
             candidate_audio_path = audio_dir / f"case-{case_index:03d}-candidate.wav"
@@ -333,13 +352,15 @@ def validate_corpus(
                 raise AssertionError(f"{case['name']}: S3 IDs differ from the checked-in corpus")
         if result.prompt_length != int(expected_metadata["prompt_length"]):
             raise AssertionError(f"{case['name']}: prompt length differs from PyTorch reference")
-        if result.prompt_length != case.get("reference_prompt_length", result.prompt_length):
-            raise AssertionError(f"{case['name']}: prompt length differs from the checked-in corpus")
         report["cases"].append(
             {
                 "name": case["name"],
                 "input_text": case["text"],
+                "normalize": normalize,
+                "use_emotion": use_emotion,
                 "normalized_text": result.normalized_text,
+                "expression_detected": expected_metadata["expression_detected"],
+                "emotion_control_used": expected_metadata["emotion_control_used"],
                 "prompt_length": result.prompt_length,
                 "prompt_ids": result.prompt_ids,
                 "raw_ids": raw_ids,

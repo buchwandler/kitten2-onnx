@@ -1,0 +1,21 @@
+{
+  "format": "kitten2-onnx-expression-corpus-v1",
+  "voice": "Bruno",
+  "preset": "stable",
+  "max_new_tokens": 32,
+  "seed": 7,
+  "cases": [
+    {
+      "name": "joyful",
+      "text": "[joyful] We won the grant!"
+    },
+    {
+      "name": "laugh",
+      "text": "We won <laugh> I can hardly believe it."
+    },
+    {
+      "name": "emphasis",
+      "text": "I told you (((never))) to open that door."
+    }
+  ]
+}

@@ -51,6 +51,39 @@ def _check_shape(name: str, expected: list[Any], actual: list[Any], errors: list
             )
 
 
+def _shape_matches_metadata(
+    tensor_name: str,
+    actual_shape: tuple[int, ...],
+    metadata: dict[str, Any],
+    *,
+    output: bool = False,
+) -> bool:
+    dynamic_axes = metadata.get("dynamic_axes", {})
+    if not isinstance(dynamic_axes, dict):
+        return False
+    if output:
+        expected_shape = metadata.get("output_shape")
+    else:
+        input_shapes = metadata.get("input_shapes")
+        if not isinstance(input_shapes, dict):
+            return False
+        expected_shape = input_shapes.get(tensor_name)
+    tensor_axes = dynamic_axes.get(tensor_name, {})
+    if not isinstance(expected_shape, list) or not isinstance(tensor_axes, dict):
+        return False
+    if len(expected_shape) != len(actual_shape):
+        return False
+
+    dynamic_dimensions = {int(axis) for axis in tensor_axes}
+    if any(axis < 0 or axis >= len(actual_shape) for axis in dynamic_dimensions):
+        raise ValueError(f"Invalid dynamic axis metadata for {tensor_name}")
+    return all(
+        axis in dynamic_dimensions
+        or (type(expected_dim) is int and expected_dim == actual_dim)
+        for axis, (expected_dim, actual_dim) in enumerate(zip(expected_shape, actual_shape, strict=True))
+    )
+
+
 def _check_graph(
     *,
     root: Path,
@@ -433,8 +466,6 @@ def validate_bundle(
         errors.append(f"Model contract validation failed: {error}")
 
     if token_map is not None and flow_meta is not None and mel_meta is not None:
-        flow_shapes = flow_meta.get("input_shapes", {})
-        mel_shapes = mel_meta.get("input_shapes", {})
         silence_count = int(flow_meta.get("silence_tail", {}).get("count", 0))
         token_mel_ratio = int(flow_meta.get("token_mel_ratio", 0))
         voices = bundle.get("voices", {})
@@ -450,6 +481,9 @@ def validate_bundle(
             try:
                 reference = load_decoder_reference(voice_path)
                 arrays = reference.arrays
+                for name, array in arrays.items():
+                    if array.dtype.kind in "fc" and not np.isfinite(array).all():
+                        raise ValueError(f"Voice {voice_name} array {name} contains non-finite values")
                 prompt_tokens = arrays["conditioning_prompt_token"]
                 prompt_lengths = arrays["conditioning_prompt_token_len"]
                 prompt_feat = arrays["conditioning_prompt_feat"]
@@ -461,48 +495,83 @@ def validate_bundle(
                     "embedding": embedding,
                 }
                 for input_name, array in expected_conditioning.items():
-                    expected_shape = flow_shapes.get(input_name)
-                    if expected_shape is None or list(array.shape) != expected_shape:
-                        raise ValueError(f"Voice {voice_name} conditioning shape mismatch for {input_name}")
+                    if not _shape_matches_metadata(input_name, array.shape, flow_meta):
+                        raise ValueError(
+                            f"Voice {voice_name} conditioning shape mismatch for {input_name}"
+                        )
                 if prompt_tokens.ndim != 2 or prompt_tokens.shape[0] != 1 or prompt_lengths.shape != (1,):
                     raise ValueError(f"Voice {voice_name} prompt token tensors must have batch size one")
+                if prompt_lengths.dtype.kind not in "iu":
+                    raise ValueError(f"Voice {voice_name} prompt token length must be an integer")
                 prompt_length = int(prompt_lengths[0])
                 if prompt_length < 1 or prompt_length > prompt_tokens.shape[1]:
                     raise ValueError(f"Voice {voice_name} prompt token length is invalid")
 
                 speech_tokens = arrays["speech_tokens"]
                 speech_lengths = arrays["speech_token_lengths"]
-                expected_padded_tokens = int(speech_lengths[0]) + silence_count
-                if speech_tokens.ndim != 2 or speech_tokens.shape != (1, int(speech_lengths[0])):
+                if speech_lengths.shape != (1,) or speech_lengths.dtype.kind not in "iu":
+                    raise ValueError(f"Voice {voice_name} speech token lengths must be one integer")
+                speech_token_count = int(speech_lengths[0])
+                if speech_tokens.ndim != 2 or speech_tokens.shape[0] != 1:
+                    raise ValueError(f"Voice {voice_name} speech tokens must have batch size one")
+                if speech_token_count < 1 or speech_tokens.shape[1] != speech_token_count:
                     raise ValueError(f"Voice {voice_name} speech token length does not match its tokens")
-                if flow_shapes.get("speech_tokens") != [1, expected_padded_tokens]:
+                expected_padded_tokens = speech_token_count + silence_count
+                if not _shape_matches_metadata(
+                    "speech_tokens", (1, expected_padded_tokens), flow_meta
+                ):
                     raise ValueError(f"Voice {voice_name} speech token shape differs from flow metadata")
-                if int(flow_shapes["speech_token_lengths"][0]) != 1:
+                if not _shape_matches_metadata("speech_token_lengths", (1,), flow_meta):
                     raise ValueError(f"Voice {voice_name} speech length input must have batch size one")
                 expected_noise_frames = token_mel_ratio * (prompt_length + expected_padded_tokens)
-                if arrays["flow_noise"].shape != (1, int(flow_shapes["flow_noise"][1]), expected_noise_frames):
+                if not _shape_matches_metadata("flow_noise", arrays["flow_noise"].shape, flow_meta):
+                    raise ValueError(f"Voice {voice_name} flow noise shape differs from static flow dimensions")
+                if arrays["flow_noise"].shape[2] != expected_noise_frames:
                     raise ValueError(f"Voice {voice_name} flow noise shape is inconsistent with conditioning")
+                if not _shape_matches_metadata(
+                    "mel", arrays["flow_mel"].shape, flow_meta, output=True
+                ):
+                    raise ValueError(f"Voice {voice_name} flow mel shape differs from flow metadata")
                 if arrays["speaker_embedding"].shape != (int(speaker_meta["speaker_dim"]),):
                     raise ValueError(f"Voice {voice_name} speaker embedding shape differs from speaker metadata")
-                if arrays["reference_tokens"].ndim != 1 or (
-                    arrays["reference_tokens"].size
-                    and (
-                        arrays["reference_tokens"].min() < 0
-                        or arrays["reference_tokens"].max() >= token_map.num_audio_tokens
-                    )
-                ):
-                    raise ValueError(f"Voice {voice_name} reference tokens are outside the audio vocabulary")
+                audio_vocab_size = int(flow_meta.get("speech_vocab_size", token_map.num_audio_tokens))
+                if audio_vocab_size != token_map.num_audio_tokens:
+                    raise ValueError("Flow speech vocabulary differs from the bundle token map")
+                for name in ("conditioning_prompt_token", "speech_tokens", "reference_tokens"):
+                    tokens = arrays[name]
+                    if tokens.dtype.kind not in "iu":
+                        raise ValueError(f"Voice {voice_name} {name} must contain integer token IDs")
+                    if tokens.size and (
+                        tokens.min() < 0 or tokens.max() >= audio_vocab_size
+                    ):
+                        raise ValueError(f"Voice {voice_name} {name} is outside the audio vocabulary")
+                    if name == "reference_tokens" and tokens.ndim != 1:
+                        raise ValueError(f"Voice {voice_name} reference tokens must be one-dimensional")
 
                 for input_name, array_name in (
                     ("mel", "mel2wav_input"),
                     ("phase_noise", "vocoder_phase_noise"),
                     ("sine_noise", "vocoder_sine_noise"),
                 ):
-                    if mel_shapes.get(input_name) != list(arrays[array_name].shape):
-                        raise ValueError(f"Voice {voice_name} mel2wav conditioning shape mismatch for {input_name}")
-                expected_samples = int(mel_shapes["mel"][2]) * int(mel_meta["samples_per_mel_frame"])
+                    if not _shape_matches_metadata(
+                        input_name, arrays[array_name].shape, mel_meta
+                    ):
+                        raise ValueError(
+                            f"Voice {voice_name} mel2wav conditioning shape mismatch for {input_name}"
+                        )
+                expected_samples = (
+                    arrays["mel2wav_input"].shape[2]
+                    * int(mel_meta["samples_per_mel_frame"])
+                )
                 if arrays["vocoder_sine_noise"].shape[2] != expected_samples:
                     raise ValueError(f"Voice {voice_name} vocoder noise length is inconsistent with mel frames")
+                expected_waveform_shape = (1, expected_samples)
+                if arrays["mel2wav_waveform"].shape != expected_waveform_shape:
+                    raise ValueError(f"Voice {voice_name} mel2wav waveform length differs from mel frames")
+                if arrays["waveform"].shape != expected_waveform_shape:
+                    raise ValueError(f"Voice {voice_name} waveform length differs from mel2wav output")
+                if reference.metadata.get("voice") != voice_name:
+                    raise ValueError(f"Voice {voice_name} metadata identity differs from the manifest")
                 if reference.metadata.get("source_model_revision") != revisions.get("source_model_revision"):
                     raise ValueError(f"Voice {voice_name} source model revision differs from the bundle")
                 if reference.metadata.get("upstream_code_revision") != revisions.get("upstream_code_revision"):

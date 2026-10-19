@@ -1,0 +1,29 @@
+{
+  "format": "kitten2-onnx-multilingual-corpus-v1",
+  "voice": "Bruno",
+  "preset": "stable",
+  "max_new_tokens": 16,
+  "seed": 7,
+  "cases": [
+    {
+      "name": "german",
+      "text": "Guten Morgen. Wie geht es dir heute?",
+      "normalize": false
+    },
+    {
+      "name": "chinese",
+      "text": "早上好。你今天感觉怎么样？",
+      "normalize": false
+    },
+    {
+      "name": "arabic",
+      "text": "صباح الخير. كيف حالك اليوم؟",
+      "normalize": false
+    },
+    {
+      "name": "hindi",
+      "text": "सुप्रभात। आज आप कैसे हैं?",
+      "normalize": false
+    }
+  ]
+}

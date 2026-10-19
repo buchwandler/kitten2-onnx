@@ -10,6 +10,11 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
     model_dir = tmp_path / "source"
     (model_dir / "lm").mkdir(parents=True)
     (model_dir / "lm" / "tokenizer.json").write_text("{}\n", encoding="utf-8")
+    voice_assets_dir = model_dir / "voices"
+    voice_assets_dir.mkdir()
+    (voice_assets_dir / "voices.json").write_text(
+        json.dumps({"Bruno": {}, "Victoria": {}}), encoding="utf-8"
+    )
     (model_dir / "model_revision.json").write_text(
         json.dumps(
             {
@@ -23,6 +28,7 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
     config = {
         "sample_rate": 24000,
         "default_voice": "Bruno",
+        "voices": "voices/voices.json",
         "default_preset": "stable",
         "decode_presets": {"stable": {"temperature": 0.8}},
         "generation": {"repetition_window": 50},
@@ -61,9 +67,12 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
             encoding="utf-8",
         )
 
-    def fake_capture_reference(_, voice, *, token_count):
-        return {}, {"voice": voice, "token_count": token_count}
+    capture_calls = []
+    shared_context = object()
 
+    def fake_capture_reference(_, voice, *, token_count, s3gen_context=None):
+        capture_calls.append((voice, s3gen_context))
+        return {}, {"voice": voice, "token_count": token_count}
     def fake_write_capture(path, arrays, metadata):
         touch(path, b"voice")
         path.with_suffix(".meta.json").write_text(json.dumps(metadata), encoding="utf-8")
@@ -83,6 +92,8 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
     monkeypatch.setattr(exporter, "export_lm", fake_export_lm)
     monkeypatch.setattr(exporter, "capture_reference", fake_capture_reference)
     monkeypatch.setattr(exporter, "write_capture", fake_write_capture)
+    loaded_contexts = []
+    monkeypatch.setattr(exporter, "load_s3gen_model", lambda: loaded_contexts.append(shared_context) or shared_context)
     monkeypatch.setattr(exporter, "export_flow", fake_export_decoder)
     monkeypatch.setattr(exporter, "export_mel2wav", fake_export_decoder)
     monkeypatch.setattr(exporter, "_package_versions", lambda: {"torch": "test"})
@@ -133,6 +144,40 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
         actual_hash = hashlib.sha256((bundle_dir / relative_path).read_bytes()).hexdigest()
         assert actual_hash == expected_hash
 
+    all_bundle_path = exporter.export_all(
+        model_dir,
+        tmp_path / "bundle-all",
+        all_voices=True,
+    )
+    all_bundle = json.loads(all_bundle_path.read_text(encoding="utf-8"))
+    all_bundle_dir = all_bundle_path.parent
+    assert all_bundle["voices"] == {
+        "Bruno": "voices/Bruno.npz",
+        "Victoria": "voices/Victoria.npz",
+    }
+    assert all_bundle["default_voice"] == "Bruno"
+    assert (all_bundle_dir / "voices/Bruno.npz").is_file()
+    assert (all_bundle_dir / "voices/Victoria.npz").is_file()
+    assert sum(
+        path.startswith("decoder/") and path.endswith(".onnx")
+        for path in all_bundle["files"]
+    ) == 2
+    assert capture_calls == [
+        ("Bruno", None),
+        ("Bruno", shared_context),
+        ("Victoria", shared_context),
+    ]
+    assert loaded_contexts == [shared_context]
+
+    selected_bundle_path = exporter.export_all(
+        model_dir,
+        tmp_path / "bundle-victoria",
+        voice="Victoria",
+    )
+    selected_bundle = json.loads(selected_bundle_path.read_text(encoding="utf-8"))
+    assert selected_bundle["voices"] == {"Victoria": "voices/Victoria.npz"}
+    assert selected_bundle["default_voice"] == "Victoria"
+    assert len(checked) == 12
 
 def test_export_all_rejects_invalid_source_checkpoint(tmp_path, monkeypatch):
     model_dir = tmp_path / "source"

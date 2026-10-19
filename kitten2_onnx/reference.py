@@ -12,6 +12,7 @@ import torch
 from torch import nn
 
 from kitten2_onnx.prompt import build_generation_prompt, build_reference_prefix
+from kitten2_onnx.text import PreparedGenerationText, prepare_generation_text
 from kitten2_onnx.tokens import TokenMap
 
 UPSTREAM_CODE_REVISION = "36ef3090ca1e59122a81fc23be4a659a502b9d55"
@@ -30,15 +31,45 @@ class ReferenceArtifacts:
     reference_tokens: np.ndarray
     reference_prefix: list[int]
 
-    def build_prompt(self, text: str, emotion_ids: list[int] | None = None) -> list[int]:
-        target_ids = self.tokenizer.encode(text, add_special_tokens=False)
+    def prepare_text(
+        self,
+        text: str,
+        *,
+        normalize: bool = True,
+        use_emotion: bool | None = None,
+    ) -> PreparedGenerationText:
+        return prepare_generation_text(
+            text,
+            tokenizer=self.tokenizer,
+            generation_config=self.config.get("generation", {}),
+            normalize=normalize,
+            use_emotion=use_emotion,
+        )
+
+    def build_prompt_from_prepared(
+        self,
+        prepared: PreparedGenerationText,
+        *,
+        emotion_ids: list[int] | None = None,
+    ) -> list[int]:
+        target_ids = self.tokenizer.encode(prepared.processed_text, add_special_tokens=False)
         return build_generation_prompt(
             self.token_map,
             target_ids,
             reference_prefix=self.reference_prefix,
-            emotion_ids=emotion_ids,
+            emotion_ids=prepared.emotion_ids if emotion_ids is None else emotion_ids,
         )
 
+    def build_prompt(
+        self,
+        text: str,
+        emotion_ids: list[int] | None = None,
+        *,
+        normalize: bool = True,
+        use_emotion: bool | None = None,
+    ) -> list[int]:
+        prepared = self.prepare_text(text, normalize=normalize, use_emotion=use_emotion)
+        return self.build_prompt_from_prepared(prepared, emotion_ids=emotion_ids)
 
 @dataclass
 class ReferenceModel:

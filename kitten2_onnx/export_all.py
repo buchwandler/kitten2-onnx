@@ -20,7 +20,7 @@ from kitten2_onnx.export_speaker import export_speaker
 from kitten2_onnx.reference import UPSTREAM_CODE_REVISION
 from kitten2_onnx.s3gen_reference import S3GEN_REPOSITORY, S3GEN_REVISION
 from kitten2_onnx.validate_bundle import validate_bundle
-from scripts.capture_decoder_reference import capture_reference, write_capture
+from scripts.capture_decoder_reference import capture_reference, load_s3gen_model, write_capture
 from scripts.inspect_model import inspect_checkpoint
 
 TOKENIZER_SUFFIXES = {".json", ".txt", ".model", ".tiktoken", ".vocab"}
@@ -79,24 +79,48 @@ def _check_onnx_graphs(graphs: list[Path]) -> list[str]:
         onnx.checker.check_model(str(graph))
     return [path.name for path in graphs]
 
+def _select_voices(
+    model_dir: Path,
+    model_config: dict[str, Any],
+    voice: str | None,
+    all_voices: bool,
+) -> list[str]:
+    voices_path = model_dir / model_config.get("voices", "voices/voices.json")
+    voice_index = json.loads(voices_path.read_text(encoding="utf-8"))
+    if all_voices:
+        voices = sorted(voice_index)
+        if not voices:
+            raise ValueError(f"No built-in voices are indexed in {voices_path}")
+        return voices
+
+    selected_voice = voice or "Bruno"
+    if selected_voice not in voice_index:
+        names = ", ".join(sorted(voice_index))
+        raise ValueError(f"Unknown voice {selected_voice!r}. Available voices: {names}")
+    return [selected_voice]
+
+
 
 def export_all(
     model_dir: str | Path,
     output_dir: str | Path,
     *,
-    voice: str = "Bruno",
+    voice: str | None = None,
+    all_voices: bool = False,
     profile_name: str = "dev-fp32",
     input_mode: str = "inputs_embeds",
     opset: int = 18,
     token_count: int = 32,
     validate: bool = False,
 ) -> Path:
-    """Export graphs, package one built-in voice, and write bundle metadata."""
+    """Export graphs, package selected built-in voices, and write bundle metadata."""
     if profile_name not in RUNTIME_PROFILES:
         raise ValueError(f"Unknown export profile {profile_name!r}; choose from {sorted(RUNTIME_PROFILES)}")
 
     if input_mode not in {"inputs_embeds", "input_ids"}:
         raise ValueError("input_mode must be 'inputs_embeds' or 'input_ids'")
+    if all_voices and voice is not None:
+        raise ValueError("Select either one voice or all voices, not both")
     model_dir = Path(model_dir).resolve()
     output_dir = Path(output_dir).resolve()
     if (
@@ -112,6 +136,7 @@ def export_all(
         raise ValueError(f"Source checkpoint validation failed:\n{errors}")
 
     model_config = inspection["kitten_config"]
+    selected_voices = _select_voices(model_dir, model_config, voice, all_voices)
     revision_path = model_dir / "model_revision.json"
     if not revision_path.is_file():
         raise FileNotFoundError(f"Pinned model revision metadata is missing: {revision_path}")
@@ -143,9 +168,28 @@ def export_all(
     export_speaker(model_dir, speaker_dir, opset=opset)
     export_lm(model_dir, lm_dir, profile_name=profile_name, input_mode=input_mode, opset=opset)
 
-    voice_arrays, voice_metadata = capture_reference(model_dir, voice, token_count=token_count)
-    voice_path = voice_dir / f"{voice}.npz"
-    write_capture(voice_path, voice_arrays, voice_metadata)
+    s3gen_context = load_s3gen_model() if all_voices else None
+    voice_paths: dict[str, Path] = {}
+    for selected_voice in selected_voices:
+        if s3gen_context is None:
+            voice_arrays, voice_metadata = capture_reference(
+                model_dir, selected_voice, token_count=token_count
+            )
+        else:
+            voice_arrays, voice_metadata = capture_reference(
+                model_dir,
+                selected_voice,
+                token_count=token_count,
+                s3gen_context=s3gen_context,
+            )
+        voice_path = voice_dir / f"{selected_voice}.npz"
+        write_capture(voice_path, voice_arrays, voice_metadata)
+        voice_paths[selected_voice] = voice_path
+
+    default_voice = model_config.get("default_voice", "Bruno")
+    if default_voice not in voice_paths:
+        default_voice = selected_voices[0]
+    voice_path = voice_paths[default_voice]
 
     _, flow_metadata_path = export_flow(voice_path, flow_dir, opset=opset)
     _, mel2wav_metadata_path = export_mel2wav(voice_path, mel2wav_dir, opset=opset)
@@ -177,7 +221,7 @@ def export_all(
         "format": "kitten2-onnx-bundle-v1",
         "sample_rate": int(model_config["sample_rate"]),
         "batch_size": 1,
-        "default_voice": model_config.get("default_voice", voice),
+        "default_voice": default_voice,
         "default_preset": model_config.get("default_preset"),
         "lm": lm_bundle_entry,
         "speaker": {
@@ -192,7 +236,7 @@ def export_all(
         },
         "tokenizer": "tokenizer",
         "tokenizer_assets": tokenizer_assets,
-        "voices": {voice: f"voices/{voice}.npz"},
+        "voices": {name: f"voices/{name}.npz" for name in selected_voices},
         "token_map": model_config["token_map"],
         "decode_presets": model_config.get("decode_presets", {}),
         "generation": model_config.get("generation", {}),
@@ -247,7 +291,9 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_dir", type=Path, help="Pinned local KittenTTS 2 checkpoint")
     parser.add_argument("--output", type=Path, required=True, help="Bundle output directory")
-    parser.add_argument("--voice", default="Bruno", help="Built-in voice to package")
+    voice_group = parser.add_mutually_exclusive_group()
+    voice_group.add_argument("--voice", help="Built-in voice to package, defaulting to Bruno")
+    voice_group.add_argument("--all-voices", action="store_true", help="Package every indexed built-in voice")
     parser.add_argument("--profile", choices=sorted(RUNTIME_PROFILES), default="dev-fp32")
     parser.add_argument(
         "--input-mode", choices=("inputs_embeds", "input_ids"), default="inputs_embeds"
@@ -266,6 +312,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         opset=args.opset,
         token_count=args.token_count,
         validate=args.validate,
+        all_voices=args.all_voices,
     )
     print(bundle_path)
 

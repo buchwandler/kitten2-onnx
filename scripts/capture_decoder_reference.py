@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,8 @@ def capture_reference(
     token_count: int = 32,
     flow_seed: int = 314159,
     vocoder_seed: int = 271828,
+    s3gen_context: tuple[Any, Path] | None = None,
+    s3gen_weights_sha256: str | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     import soundfile as sf
     import torch
@@ -82,7 +86,10 @@ def capture_reference(
         reference_waveform = reference_waveform.mean(axis=1)
     reference_waveform = torch.from_numpy(np.asarray(reference_waveform, dtype=np.float32))[None]
 
-    model, weights_path = load_s3gen_model()
+    model, weights_path = s3gen_context if s3gen_context is not None else load_s3gen_model()
+    weights_sha256 = (
+        s3gen_weights_sha256 if s3gen_weights_sha256 is not None else _sha256(weights_path)
+    )
 
     with torch.inference_mode():
         conditioning = model.embed_ref(reference_waveform, reference_sample_rate)
@@ -177,13 +184,14 @@ def capture_reference(
         "upstream_code_revision": UPSTREAM_CODE_REVISION,
         "s3gen_repository": S3GEN_REPOSITORY,
         "s3gen_revision": S3GEN_REVISION,
-        "s3gen_weights_sha256": _sha256(weights_path),
+        "s3gen_weights_sha256": weights_sha256,
         "torch_version": torch.__version__,
         "python_version": platform.python_version(),
         "device": "cpu",
         "dtype": str(model.dtype),
         "sample_rate": 24000,
         "meanflow_steps": MEANFLOW_STEPS,
+        "token_count": int(token_count),
         "flow_seed": int(flow_seed),
         "vocoder_seed": int(vocoder_seed),
         "fixed_tokens_source": "conditioning_prompt_token prefix",
@@ -216,8 +224,20 @@ def write_capture(
     arrays: dict[str, np.ndarray],
     metadata: dict[str, Any],
 ) -> tuple[Path, Path]:
-    return write_decoder_reference(output_path, arrays, metadata)
-
+    output_path = Path(output_path)
+    metadata_path = output_path.with_suffix(".meta.json")
+    temporary_path = output_path.with_name(
+        f".{output_path.stem}.{uuid.uuid4().hex}.tmp.npz"
+    )
+    temporary_metadata_path = temporary_path.with_suffix(".meta.json")
+    try:
+        write_decoder_reference(temporary_path, arrays, metadata)
+        os.replace(temporary_path, output_path)
+        os.replace(temporary_metadata_path, metadata_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+        temporary_metadata_path.unlink(missing_ok=True)
+    return output_path, metadata_path
 
 def main() -> None:
     parser = argparse.ArgumentParser(
