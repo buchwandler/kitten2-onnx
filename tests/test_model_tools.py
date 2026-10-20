@@ -17,6 +17,7 @@ UPSTREAM_CODE_REVISION = _DOWNLOAD_TOOLS["UPSTREAM_CODE_REVISION"]
 download_model = _DOWNLOAD_TOOLS["download_model"]
 voice_files = _DOWNLOAD_TOOLS["voice_files"]
 all_voice_files = _DOWNLOAD_TOOLS["all_voice_files"]
+weight_files = _DOWNLOAD_TOOLS["weight_files"]
 PINNED_VOICE_FIXTURE = Path(__file__).parent / "fixtures" / "voices_fa8ce5c.json"
 PINNED_VOICE_DATA = json.loads(PINNED_VOICE_FIXTURE.read_text(encoding="utf-8"))
 PINNED_VOICE_NAMES = PINNED_VOICE_DATA["voices"]
@@ -149,6 +150,84 @@ def test_voice_files_rejects_paths_outside_repository():
 
     with pytest.raises(ValueError, match="Invalid repository-relative path"):
         voice_files(config, voices, "Bruno", available)
+
+
+def test_weight_files_selects_full_packed_or_emb4_payloads():
+    config = {
+        "lm_dir": "lm",
+        "lm_packed": "lm/model-ternary.safetensors",
+        "lm_emb4": "lm/model-tl2-emb4.safetensors",
+    }
+    available = {
+        "lm/model.safetensors",
+        "lm/model-00001-of-00002.safetensors",
+        "lm/model-00002-of-00002.safetensors",
+        "lm/model-ternary.safetensors",
+        "lm/model-tl2-emb4.safetensors",
+    }
+
+    assert weight_files(config, "full", available) == {
+        "lm/model.safetensors",
+        "lm/model-00001-of-00002.safetensors",
+        "lm/model-00002-of-00002.safetensors",
+    }
+    assert weight_files(config, "packed", available) == {"lm/model-ternary.safetensors"}
+    assert weight_files(config, "emb4", available) == {"lm/model-tl2-emb4.safetensors"}
+
+
+def test_download_emb4_requests_only_selected_weight_file(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    requested = {}
+    available = set(BASE_FILES) | {
+        "lm/model.safetensors",
+        "lm/model-ternary.safetensors",
+        "lm/model-tl2-emb4.safetensors",
+    }
+
+    class FakeApi:
+        def model_info(self, repo_id, *, revision):
+            return SimpleNamespace(
+                sha="resolved-emb4-commit",
+                siblings=[SimpleNamespace(rfilename=name) for name in sorted(available)],
+            )
+
+    config_path = tmp_path / "remote-config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "lm_dir": "lm",
+                "lm_packed": "lm/model-ternary.safetensors",
+                "lm_emb4": "lm/model-tl2-emb4.safetensors",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_hf_hub_download(repo_id, filename, *, revision):
+        assert filename == "config.json"
+        assert revision == "resolved-emb4-commit"
+        return config_path
+
+    def fake_snapshot_download(repo_id, *, revision, local_dir, allow_patterns):
+        requested.update(revision=revision, allow_patterns=set(allow_patterns))
+        Path(local_dir).mkdir(parents=True)
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_hf_hub_download)
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot_download)
+
+    output = tmp_path / "emb4-download"
+    manifest = download_model(
+        "KittenML/kitten-tts-2",
+        "requested-tag",
+        output,
+        weights="emb4",
+    )
+
+    assert requested["revision"] == "resolved-emb4-commit"
+    assert requested["allow_patterns"] == set(BASE_FILES) | {"lm/model-tl2-emb4.safetensors"}
+    assert manifest["weight_variant"] == "emb4"
 
 
 def test_download_uses_resolved_revision_and_requested_files(tmp_path, monkeypatch):

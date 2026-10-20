@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from safetensors import safe_open
@@ -51,22 +51,74 @@ def load_plain_state_dict(path: str | Path) -> dict[str, torch.Tensor]:
     return state
 
 
-def load_lm_state_dict(model_dir: str | Path, *, variant: str = "packed") -> dict[str, torch.Tensor]:
-    """Load the configured ``packed`` or ``plain`` LM checkpoint variant."""
+WeightVariant = Literal["full", "plain", "packed", "emb4"]
+_WEIGHT_CONFIG_KEYS = {"packed": "lm_packed", "emb4": "lm_emb4"}
+
+
+def resolve_weight_path(model_dir: str | Path, variant: WeightVariant) -> Path | None:
+    """Resolve a configured source checkpoint path; ``plain`` aliases ``full``."""
     model_dir = Path(model_dir)
-    config_path = model_dir / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
     if variant == "plain":
-        return load_plain_state_dict(model_dir / config.get("lm_dir", "lm"))
-    if variant != "packed":
-        raise ValueError("variant must be 'plain' or 'packed'")
-    packed_name = config.get("lm_packed")
-    if not isinstance(packed_name, str) or not packed_name:
-        raise ValueError(f"No packed LM checkpoint is declared in {config_path}")
-    packed_path = model_dir / packed_name
-    if not packed_path.is_file():
-        raise FileNotFoundError(f"Packed LM checkpoint not found: {packed_path}")
-    return load_packed_state_dict(packed_path)
+        variant = "full"
+    if variant == "full":
+        config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        name = config.get("lm_dir", "lm")
+    elif variant in _WEIGHT_CONFIG_KEYS:
+        config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        name = config.get(_WEIGHT_CONFIG_KEYS[variant])
+        if not isinstance(name, str) or not name:
+            return None
+    else:
+        raise ValueError("variant must be one of 'full', 'packed', or 'emb4'")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Invalid configured LM path for {variant!r}: {name!r}")
+    path = (model_dir / name).resolve()
+    if not path.is_relative_to(model_dir.resolve()):
+        raise ValueError(f"Configured LM path escapes model directory: {name!r}")
+    return path
+
+
+def available_weight_variants(model_dir: str | Path) -> tuple[str, ...]:
+    """Return declared local variants whose checkpoint payload is present."""
+    available = []
+    full_path = resolve_weight_path(model_dir, "full")
+    if full_path is not None and (
+        full_path.is_file()
+        or full_path.is_dir()
+        and (
+            (full_path / "model.safetensors").is_file()
+            or any(full_path.glob("model-*-of-*.safetensors"))
+        )
+    ):
+        available.append("full")
+    for variant in ("packed", "emb4"):
+        path = resolve_weight_path(model_dir, variant)
+        if path is not None and path.is_file():
+            available.append(variant)
+    return tuple(available)
+
+
+def load_lm_state_dict(
+    model_dir: str | Path, *, variant: WeightVariant = "packed"
+) -> dict[str, torch.Tensor]:
+    """Load one configured full, packed, or emb4 LM checkpoint."""
+    model_dir = Path(model_dir)
+    if variant == "plain":
+        variant = "full"
+    if variant not in {"full", "packed", "emb4"}:
+        raise ValueError("variant must be one of 'full', 'packed', or 'emb4'")
+    path = resolve_weight_path(model_dir, variant)
+    if path is None:
+        raise ValueError(f"No {variant!r} LM checkpoint is declared in {model_dir / 'config.json'}")
+    if variant == "full":
+        return load_plain_state_dict(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"{variant!r} LM checkpoint not found: {path}")
+    if variant == "packed":
+        return load_packed_state_dict(path)
+    from kitten2_onnx.tl2_emb4 import load_emb4_state_dict
+
+    return load_emb4_state_dict(path)
 
 
 def compare_packed_checkpoint(

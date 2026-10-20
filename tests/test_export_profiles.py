@@ -70,7 +70,7 @@ def test_export_lm_records_precision_profile(
     output_dir = tmp_path / "exported"
     seen = {}
 
-    def fake_load_hf_lm(path, requested_dtype):
+    def fake_load_hf_lm(path, requested_dtype, *, weight_variant="full"):
         seen["loaded_dtype"] = requested_dtype
         return tiny_qwen3.to(requested_dtype)
 
@@ -107,6 +107,47 @@ def test_export_lm_records_precision_profile(
     embedding = np.load(output_dir / metadata["embedding_file"], allow_pickle=False)
     assert str(embedding.dtype) == ("float16" if dtype == torch.float16 else "uint16")
 
+
+
+def test_export_lm_records_packed_source_and_exports_shared_head(tmp_path, monkeypatch, tiny_qwen3):
+    repo_dir = tmp_path / "source"
+    lm_dir = _make_repo(repo_dir)
+    (repo_dir / "config.json").write_text(
+        json.dumps({"lm_packed": "lm/model-ternary.safetensors"}), encoding="utf-8"
+    )
+    packed_path = lm_dir / "model-ternary.safetensors"
+    packed_path.write_bytes(b"synthetic-packed-checkpoint")
+    loaded_variants = []
+
+    def fake_load(path, requested_dtype, *, weight_variant="full"):
+        loaded_variants.append(weight_variant)
+        return tiny_qwen3.to(requested_dtype)
+
+    def fake_export(model, args, output_path, **kwargs):
+        Path(output_path).write_bytes(b"synthetic-core-graph")
+
+    monkeypatch.setattr(export_lm_module, "load_hf_lm", fake_load)
+    monkeypatch.setattr(export_lm_module, "_export_with_diagnostics", fake_export)
+    monkeypatch.chdir(tmp_path)
+    output_dir = tmp_path / "packed-export"
+
+    export_lm_module.export_lm(
+        Path("source"),
+        output_dir,
+        weight_variant="packed",
+        shared_vocabulary=True,
+    )
+
+    metadata = json.loads((output_dir / "lm.meta.json").read_text(encoding="utf-8"))
+    assert loaded_variants == ["packed"]
+    assert metadata["source_weight_variant"] == "packed"
+    assert metadata["source_weight_sha256"] == __import__("hashlib").sha256(
+        packed_path.read_bytes()
+    ).hexdigest()
+    assert metadata["vocabulary_mode"] == "shared"
+    assert metadata["output_head_file"] == "lm_output.onnx"
+    assert (output_dir / "lm_output.onnx").is_file()
+    assert metadata["onnxruntime_min_tested_version"]
 
 def test_load_hf_lm_tolerates_speaker_head_but_verifies_transformer_weights(tmp_path, monkeypatch):
     import transformers

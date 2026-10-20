@@ -15,7 +15,12 @@ from kitten2_onnx.ternary import (
     unpack_state_dict,
     unpack_tensor,
 )
-from kitten2_onnx.weights import compare_packed_checkpoint, load_lm_state_dict
+from kitten2_onnx.weights import (
+    available_weight_variants,
+    compare_packed_checkpoint,
+    load_lm_state_dict,
+    resolve_weight_path,
+)
 
 
 def _sample_state():
@@ -56,6 +61,9 @@ def test_packed_safetensors_loader_and_streaming_comparison(tmp_path):
         json.dumps({"lm_dir": "lm", "lm_packed": "lm/model-ternary.safetensors"}),
         encoding="utf-8",
     )
+    assert available_weight_variants(model_dir) == ("full", "packed")
+    assert resolve_weight_path(model_dir, "full") == lm_dir.resolve()
+    assert resolve_weight_path(model_dir, "plain") == lm_dir.resolve()
 
     loaded_plain = load_lm_state_dict(model_dir, variant="plain")
     loaded_packed = load_lm_state_dict(model_dir, variant="packed")

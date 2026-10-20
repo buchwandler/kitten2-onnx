@@ -11,9 +11,14 @@ from onnx import TensorProto, external_data_helper, helper, numpy_helper
 from kitten2_onnx.quantize_ternary_nbits import (
     BLOCK_SIZE,
     TernaryNBitsConfig,
+    pack_codes,
+    pack_ternary_nbits,
     pack_ternary_nbits4,
     quantize_ternary_matmuls_streaming,
+    rewrite_matmul_to_nbits2,
     rewrite_matmul_to_nbits4,
+    unpack_codes,
+    unpack_ternary_nbits,
     unpack_ternary_nbits4,
 )
 
@@ -36,13 +41,13 @@ def _nonternary_weight() -> np.ndarray:
     weight[1, 0] = 0.625
     return weight
 
-def _matmul_model(weight: np.ndarray) -> onnx.ModelProto:
+def _matmul_model(weight: np.ndarray, rows: int = 3) -> onnx.ModelProto:
     k, n = weight.shape
     graph = helper.make_graph(
         [helper.make_node("MatMul", ["A", "W"], ["Y"], name="tiny_matmul")],
         "tiny-ternary-matmul",
-        [helper.make_tensor_value_info("A", TensorProto.FLOAT, [3, k])],
-        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [3, n])],
+        [helper.make_tensor_value_info("A", TensorProto.FLOAT, [rows, k])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [rows, n])],
         [numpy_helper.from_array(weight, name="W")],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
@@ -63,6 +68,57 @@ def test_pack_unpack_preserves_exact_group_scales_and_values():
     np.testing.assert_array_equal(packed.zero_points[:, 0], 0x88)
     np.testing.assert_array_equal(packed.zero_points[:, 1], 0x08)
 
+
+
+def test_pack_unpack_nbits2_preserves_ternary_values():
+    weight = _weight(384)
+    packed = pack_ternary_nbits(weight, TernaryNBitsConfig(bits=2))
+    reconstructed = unpack_ternary_nbits(packed)
+
+    np.testing.assert_array_equal(reconstructed.view(np.uint32), weight.view(np.uint32))
+    assert packed.bits == 2
+    assert packed.packed.shape == (3, 3, 32)
+    assert packed.zero_points.shape == (3, 1)
+    np.testing.assert_array_equal(packed.zero_points[:, 0], 0x15)
+
+
+def test_nbits2_uses_integer_zero_point_one():
+    weight = np.zeros((128, 4), dtype=np.float32)
+    weight[0, :] = -1
+    weight[1, :] = 1
+    packed = pack_ternary_nbits(weight, TernaryNBitsConfig(bits=2))
+
+    np.testing.assert_array_equal(
+        packed.packed[:, 0, 0], np.full(4, 0x58, dtype=np.uint8)
+    )
+    np.testing.assert_array_equal(
+        packed.zero_points[:, 0], np.full(4, 1, dtype=np.uint8)
+    )
+
+
+def test_nbits2_packs_four_codes_per_byte():
+    codes = np.array([0, 1, 2, 3], dtype=np.uint8)
+
+    np.testing.assert_array_equal(pack_codes(codes, 2), np.array([0xE4], dtype=np.uint8))
+    np.testing.assert_array_equal(unpack_codes(np.array([0xE4], dtype=np.uint8), 2, 4), codes)
+
+
+def test_nbits2_rejects_code_three():
+    packed = pack_ternary_nbits(_weight(128), TernaryNBitsConfig(bits=2))
+    invalid_codes = packed.packed.copy()
+    invalid_codes[0, 0, 0] = (invalid_codes[0, 0, 0] & 0xFC) | 0x03
+
+    with pytest.raises(ValueError, match="outside the exact ternary encoding"):
+        unpack_ternary_nbits(replace(packed, packed=invalid_codes))
+
+
+def test_nbits2_zero_point_blob_geometry():
+    packed = pack_ternary_nbits(_weight(512), TernaryNBitsConfig(bits=2))
+
+    assert packed.zero_points.shape == (3, 1)
+    np.testing.assert_array_equal(
+        packed.zero_points[:, 0], np.full(3, 0x55, dtype=np.uint8)
+    )
 
 
 def test_pack_accepts_signed_zero_values():
@@ -95,7 +151,7 @@ def test_pack_unpack_smaller_blocks_preserve_source_group_scales(block_size: int
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"bits": 2}, "only 4-bit"),
+        ({"bits": 8}, "bits must be 2 or 4"),
         ({"block_size": 8}, "block_size must be one of"),
         ({"source_group_size": 64}, "source_group_size must remain 128"),
         ({"accuracy_level": 2}, "accuracy_level must be 0 or 1"),
@@ -177,6 +233,33 @@ def test_rewrite_rejects_non_ternary_initializer():
         rewrite_matmul_to_nbits4(model)
 
 
+@pytest.mark.parametrize("rows", [1, 5])
+def test_nbits2_rewritten_matmul_runs_on_ort_cpu(rows: int):
+    weight = _weight(128)
+    activation = np.random.default_rng(32 + rows).normal(size=(rows, 128)).astype(np.float32)
+    rewritten = rewrite_matmul_to_nbits2(_matmul_model(weight, rows))
+
+    onnx.checker.check_model(rewritten)
+    node = rewritten.graph.node[0]
+    attributes = {
+        attribute.name: helper.get_attribute_value(attribute) for attribute in node.attribute
+    }
+    assert attributes["bits"] == 2
+    assert node.domain == "com.microsoft"
+    zero_points = next(
+        tensor for tensor in rewritten.graph.initializer if tensor.name == "W_nbits2_zero_points"
+    )
+    np.testing.assert_array_equal(
+        numpy_helper.to_array(zero_points), np.ones(3, dtype=np.uint8)
+    )
+
+    session = ort.InferenceSession(
+        rewritten.SerializeToString(), providers=["CPUExecutionProvider"]
+    )
+    actual = session.run(None, {"A": activation})[0]
+    np.testing.assert_allclose(actual, activation @ weight, rtol=1e-5, atol=1e-5)
+
+
 
 def _external_initializer(name: str, weight: np.ndarray, location: str, offset: int) -> TensorProto:
     tensor = TensorProto()
@@ -198,7 +281,10 @@ def _external_initializer(name: str, weight: np.ndarray, location: str, offset: 
 
 
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])
-def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path, block_size: int):
+@pytest.mark.parametrize("bits", [2, 4])
+def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(
+    tmp_path, block_size: int, bits: int
+):
     k = 256
     ternary = _weight(k, 3)
     dense = np.zeros((k, 2), dtype=np.float32)
@@ -259,8 +345,8 @@ def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path, b
     report = quantize_ternary_matmuls_streaming(
         source_path,
         output_path,
-        output_external_data="lm.nbits4.onnx.data",
-        config=TernaryNBitsConfig(block_size=block_size),
+        output_external_data=f"lm.nbits{bits}.onnx.data",
+        config=TernaryNBitsConfig(bits=bits, block_size=block_size),
         expected_source_ternary_matmul_count=1,
         column_chunk=2,
     )
@@ -276,9 +362,14 @@ def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path, b
     assert tensor_report["source_initializer"] == "W_ternary"
     assert tensor_report["source_shape"] == [k, 3]
     assert tensor_report["exact_reconstruction"]
-    assert tensor_report["packed_code_bytes"] == 3 * (k // block_size) * (block_size // 2)
+    assert tensor_report["bits"] == bits
+    assert tensor_report["packed_code_bytes"] == (
+        3 * (k // block_size) * (block_size * bits // 8)
+    )
     assert tensor_report["scale_bytes"] == 3 * (k // block_size) * 4
-    assert tensor_report["zero_point_bytes"] == 3 * ((k // block_size + 1) // 2)
+    assert tensor_report["zero_point_bytes"] == 3 * (
+        (k // block_size + (8 // bits) - 1) // (8 // bits)
+    )
     assert tensor_report["block_size"] == block_size
 
     rewritten = onnx.load(str(output_path), load_external_data=False)
@@ -289,7 +380,24 @@ def test_streaming_rewrite_preserves_non_targets_and_executes_on_cpu(tmp_path, b
         for entry in tensor.external_data
         if entry.key == "location"
     }
-    assert locations == {"lm.nbits4.onnx.data"}
+    assert locations == {f"lm.nbits{bits}.onnx.data"}
+    in_memory = pack_ternary_nbits(
+        ternary, TernaryNBitsConfig(bits=bits, block_size=block_size)
+    )
+    loaded = onnx.load(str(output_path), load_external_data=True)
+    initializers = {
+        tensor.name: numpy_helper.to_array(tensor) for tensor in loaded.graph.initializer
+    }
+    np.testing.assert_array_equal(
+        initializers[tensor_report["packed_initializer"]], in_memory.packed
+    )
+    np.testing.assert_array_equal(
+        initializers[tensor_report["scales_initializer"]], in_memory.scales.reshape(-1)
+    )
+    np.testing.assert_array_equal(
+        initializers[tensor_report["zero_points_initializer"]],
+        in_memory.zero_points.reshape(-1),
+    )
     session = ort.InferenceSession(str(output_path), providers=["CPUExecutionProvider"])
     rng = np.random.default_rng(72)
     activation = rng.normal(size=(2, k)).astype(np.float32)

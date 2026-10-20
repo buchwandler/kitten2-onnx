@@ -158,6 +158,11 @@ def _check_graph(
         else:
             errors.append(f"Unsupported LM input mode: {input_mode!r}")
 
+    if label == "lm_output":
+        if any(value.type != "tensor(float)" for value in inputs):
+            errors.append("Shared output head inputs must be float32")
+        if any(value.type != "tensor(float)" for value in outputs):
+            errors.append("Shared output head logits must be float32")
     for value in inputs:
         expected = (input_shapes or {}).get(value.name)
         if expected is not None:
@@ -202,9 +207,14 @@ def validate_bundle(
     except (OSError, json.JSONDecodeError) as error:
         errors.append(f"Cannot read bundle.json: {error}")
         return report
-    if not isinstance(bundle, dict) or bundle.get("format") != "kitten2-onnx-bundle-v1":
+    if not isinstance(bundle, dict) or bundle.get("format") not in {
+        "kitten2-onnx-bundle-v1",
+        "kitten2-onnx-bundle-v2",
+    }:
         errors.append("Unsupported or malformed bundle format")
         return report
+    bundle_v2 = bundle["format"] == "kitten2-onnx-bundle-v2"
+    report["bundle_format"] = bundle["format"]
     report["checks"].append("bundle format")
 
     files = bundle.get("files")
@@ -324,6 +334,80 @@ def validate_bundle(
     if not isinstance(export_meta, dict):
         errors.append("Bundle export metadata must be an object")
         export_meta = {}
+    if bundle_v2:
+        variant = lm.get("weight_variant")
+        if variant not in {"packed", "emb4"}:
+            errors.append("Bundle v2 weight_variant must be 'packed' or 'emb4'")
+        storage = lm.get("storage")
+        if not isinstance(storage, dict):
+            errors.append("Bundle v2 LM storage metadata must be an object")
+            storage = {}
+        transformer = storage.get("transformer")
+        vocabulary = storage.get("vocabulary")
+        if not isinstance(transformer, dict) or not isinstance(vocabulary, dict):
+            errors.append("Bundle v2 must declare transformer and vocabulary storage")
+            transformer = transformer if isinstance(transformer, dict) else {}
+            vocabulary = vocabulary if isinstance(vocabulary, dict) else {}
+        source_hash = lm.get("source_weight_sha256")
+        if not isinstance(source_hash, str) or len(source_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in source_hash
+        ):
+            errors.append("Bundle v2 source_weight_sha256 must be a lowercase SHA256")
+        if lm_meta is not None:
+            if lm_meta.get("source_weight_variant") != variant:
+                errors.append("LM metadata source weight variant differs from bundle")
+            if lm_meta.get("source_weight_sha256") != source_hash:
+                errors.append("LM metadata source weight hash differs from bundle")
+            if lm_meta.get("source_model_revision") != revisions.get("source_model_revision"):
+                errors.append("LM source model revision differs from the bundle")
+            minimum_runtime = lm.get("onnxruntime_min_tested_version")
+            if not isinstance(minimum_runtime, str) or not minimum_runtime:
+                errors.append("Bundle v2 must declare onnxruntime_min_tested_version")
+            elif minimum_runtime != lm_meta.get("onnxruntime_min_tested_version"):
+                errors.append("LM minimum tested ONNX Runtime version differs from bundle")
+            if isinstance(minimum_runtime, str):
+                import onnxruntime as ort
+                from packaging.version import InvalidVersion, Version
+
+                try:
+                    if Version(ort.__version__) < Version(minimum_runtime):
+                        errors.append("Installed ONNX Runtime is older than the minimum tested version")
+                except InvalidVersion:
+                    errors.append("Bundle minimum tested ONNX Runtime version is invalid")
+            if variant == "emb4":
+                from kitten2_onnx.tl2_emb4 import EMB4_RECONSTRUCTION_VERSION
+
+                if lm.get("embedding_reconstruction_version") != EMB4_RECONSTRUCTION_VERSION:
+                    errors.append("Bundle emb4 reconstruction version is unsupported")
+                if lm_meta.get("embedding_reconstruction_version") != EMB4_RECONSTRUCTION_VERSION:
+                    errors.append("LM emb4 reconstruction version is unsupported")
+            elif lm.get("embedding_reconstruction_version") is not None:
+                errors.append("Packed bundle must not declare emb4 reconstruction")
+        vocabulary_method = vocabulary.get("method")
+        if vocabulary_method not in {"bfloat16-u16", "kitten-emb4"}:
+            errors.append("Bundle v2 vocabulary storage method is unsupported")
+        if (vocabulary_method == "kitten-emb4") != (variant == "emb4"):
+            errors.append("Bundle vocabulary storage method differs from the source variant")
+        if vocabulary.get("lossy") is not (variant == "emb4"):
+            errors.append("Bundle vocabulary lossy marker differs from the source variant")
+        if transformer.get("method") == "matmul-nbits":
+            if (
+                transformer.get("bits") != 4
+                or transformer.get("zero_point") != 8
+                or not isinstance(transformer.get("block_size"), int)
+                or transformer.get("source_group_size") != 128
+            ):
+                errors.append("Bundle transformer storage must declare q4 MatMulNBits with zero point 8")
+            quantization = lm_meta.get("quantization", {}) if lm_meta is not None else {}
+            if (
+                not isinstance(quantization, dict)
+                or quantization.get("method") != "ternary-nbits"
+                or quantization.get("bits") != 4
+                or quantization.get("source_weight_sha256") != source_hash
+            ):
+                errors.append("LM q4 quantization provenance is inconsistent with bundle metadata")
+        elif transformer.get("method") != "float":
+            errors.append("Bundle transformer storage method is unsupported")
     if export_meta.get("runtime_profile") == "cuda-fp16":
         if lm_meta is not None and (
             lm_meta.get("graph_dtype") != "float16"
@@ -363,12 +447,14 @@ def validate_bundle(
         else:
             report["checks"].append("tokenizer assets")
 
-    graph_specs = (
-        ("lm", lm.get("model", ""), lm_meta),
+    graph_specs = [
+        ("lm", lm.get("model", lm.get("core_model", "")), lm_meta),
         ("speaker", speaker.get("model", ""), speaker_meta),
         ("flow", decoder.get("flow", ""), flow_meta),
         ("mel2wav", decoder.get("mel2wav", ""), mel_meta),
-    )
+    ]
+    if bundle_v2:
+        graph_specs.append(("lm_output", lm.get("head_model", ""), lm_meta))
     for label, _, metadata in graph_specs:
         if metadata is None:
             continue
@@ -382,11 +468,14 @@ def validate_bundle(
         graph_path = require(relative_graph)
         if graph_path is None or metadata is None:
             continue
-        if metadata.get("graph") is not None and metadata["graph"] != graph_path.name:
+        if label != "lm_output" and metadata.get("graph") is not None and metadata["graph"] != graph_path.name:
             errors.append(f"{label} graph path differs from metadata")
         if label == "lm":
             inputs = metadata.get("input_names", [])
             outputs = metadata.get("output_names", [])
+        elif label == "lm_output":
+            inputs = metadata.get("output_head_input_names", ["hidden_states", "vocabulary_weight"])
+            outputs = metadata.get("output_head_output_names", ["logits"])
         elif label == "speaker":
             inputs = metadata.get("input_names", ["speaker_embedding"])
             outputs = metadata.get("output_names", ["speaker_hidden"])
@@ -399,12 +488,14 @@ def validate_bundle(
         input_shapes = metadata.get("input_shapes")
         if label == "lm":
             input_shapes = None
+        elif label == "lm_output":
+            input_shapes = metadata.get("output_head_input_shapes")
         output_shape = metadata.get("output_shape")
         if label == "speaker":
             input_shapes = {"speaker_embedding": [1, metadata.get("speaker_dim")]}
             output_shape = [1, metadata.get("hidden_size")]
-        if label == "lm":
-            output_shape = None
+        if label in {"lm", "lm_output"}:
+            output_shape = None if label == "lm" else metadata.get("output_head_output_shape")
         graph_report = _check_graph(
             root=root,
             label=label,
@@ -419,14 +510,94 @@ def validate_bundle(
         )
         if graph_report is not None:
             report["graphs"][label] = graph_report
-    if len(report["graphs"]) == 4:
+    if len(report["graphs"]) == len(graph_specs):
         report["checks"].append("ONNX checker, Runtime sessions, and graph I/O")
 
     try:
         if lm_meta is None:
             raise ValueError("LM metadata is missing")
         input_mode = lm_meta.get("input_mode", "inputs_embeds")
-        if input_mode == "inputs_embeds":
+        if bundle_v2:
+            if input_mode != "inputs_embeds" or lm_meta.get("vocabulary_mode") != "shared":
+                raise ValueError("Bundle v2 LM must use inputs_embeds with a shared vocabulary")
+            embedding_file = lm_meta["embedding_file"]
+            core_model = lm.get("core_model", lm.get("model", ""))
+            expected_embedding = (Path(core_model).parent / embedding_file).as_posix()
+            if lm.get("embeddings") != expected_embedding:
+                raise ValueError("Bundle embedding path differs from LM metadata")
+            vocabulary_storage = lm["storage"]["vocabulary"]
+            if vocabulary_storage.get("file") != expected_embedding:
+                raise ValueError("Bundle vocabulary storage path differs from LM metadata")
+            expected_shape = (int(lm_meta["vocab_size"]), int(lm_meta["hidden_size"]))
+            method = vocabulary_storage["method"]
+            embedding_path = require(expected_embedding)
+            if embedding_path is not None:
+                if method == "kitten-emb4":
+                    from kitten2_onnx.tl2_emb4 import inspect_emb4_embedding_asset
+
+                    payload = inspect_emb4_embedding_asset(embedding_path)
+                    dimensions = payload["embedding_metadata"]
+                    if (dimensions["V"], dimensions["D"]) != expected_shape:
+                        raise ValueError("emb4 vocabulary dimensions differ from LM metadata")
+                else:
+                    embeddings = np.load(embedding_path, mmap_mode="r", allow_pickle=False)
+                    if embeddings.shape != expected_shape:
+                        raise ValueError(
+                            f"Embedding shape {embeddings.shape} differs from LM config {expected_shape}"
+                        )
+                    if embeddings.dtype != np.uint16 or lm_meta.get("embedding_storage_dtype") != method:
+                        raise ValueError("bfloat16-u16 embedding storage metadata is inconsistent")
+                report["checks"].append("LM embedding shape")
+                from safetensors import safe_open
+
+                asset_copies = set()
+                for candidate in (root / "lm").rglob("*"):
+                    if not candidate.is_file():
+                        continue
+                    if candidate.suffix == ".npy":
+                        array = np.load(candidate, mmap_mode="r", allow_pickle=False)
+                        if tuple(array.shape) == expected_shape:
+                            asset_copies.add(candidate.resolve())
+                        mmap = getattr(array, "_mmap", None)
+                        if mmap is not None:
+                            mmap.close()
+                    elif candidate.suffix == ".safetensors":
+                        with safe_open(str(candidate), framework="pt", device="cpu") as handle:
+                            names = set(handle.keys())
+                        if "model.embed_tokens.weight" in names or any(
+                            name.startswith("emb4/") for name in names
+                        ):
+                            asset_copies.add(candidate.resolve())
+                if asset_copies != {embedding_path.resolve()}:
+                    raise ValueError("Bundle contains duplicate vocabulary asset storage")
+
+            core_path = require(core_model)
+            head_path = require(lm["head_model"])
+            if embedding_path is not None and core_path is not None and head_path is not None:
+                import onnx
+
+                expected_vocab_shapes = {
+                    expected_shape,
+                    (expected_shape[1], expected_shape[0]),
+                }
+                copies = 0
+                for graph_path in (core_path, head_path):
+                    graph = onnx.load(str(graph_path), load_external_data=False).graph
+                    copies += sum(
+                        tuple(initializer.dims) in expected_vocab_shapes
+                        for initializer in graph.initializer
+                    )
+                if copies:
+                    raise ValueError("Shared vocabulary is duplicated in ONNX graph initializers")
+                report["vocabulary_storage"] = {
+                    "logical_parameters": expected_shape[0] * expected_shape[1],
+                    "physical_copies": 1,
+                    "stored_bytes": embedding_path.stat().st_size,
+                    "method": method,
+                    "lossy": method == "kitten-emb4",
+                }
+                report["checks"].append("single shared vocabulary storage")
+        elif input_mode == "inputs_embeds":
             embedding_file = lm_meta["embedding_file"]
             expected_embedding = (Path(lm["model"]).parent / embedding_file).as_posix()
             if lm.get("embeddings") != expected_embedding:

@@ -51,7 +51,9 @@ def test_export_all_writes_bundle_paths_hashes_and_revisions(tmp_path, monkeypat
             json.dumps({"hidden_size": 8, "dtype": "fp32"}), encoding="utf-8"
         )
 
-    def fake_export_lm(_, output_dir, *, profile_name, input_mode, opset):
+    def fake_export_lm(
+        _, output_dir, *, profile_name, input_mode, shared_vocabulary, weight_variant, opset
+    ):
         touch(output_dir / "lm.onnx")
         touch(output_dir / "lm.onnx.data", b"external")
         touch(output_dir / "embed_tokens.npy", b"embeddings")

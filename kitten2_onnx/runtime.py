@@ -72,6 +72,50 @@ class GenerationResult:
     s3_ids: list[int]
 
 
+class SharedVocabulary:
+    """One reconstructed vocabulary table shared by token lookup and output projection."""
+
+    def __init__(self, model_dir: Path, metadata: Mapping[str, object], ort):
+        self.storage_dtype = str(metadata["embedding_storage_dtype"])
+        embedding_path = model_dir / str(metadata["embedding_file"])
+        expected_shape = (int(metadata["vocab_size"]), int(metadata["hidden_size"]))
+        if self.storage_dtype == "kitten-emb4":
+            import torch
+
+            from kitten2_onnx.tl2_emb4 import read_emb4_embedding_asset
+
+            table = read_emb4_embedding_asset(embedding_path)
+            if tuple(table.shape) != expected_shape:
+                raise ValueError(
+                    f"Vocabulary shape {tuple(table.shape)} differs from metadata {expected_shape}"
+                )
+            weights = table.to(torch.float32).numpy()
+            self.storage = None
+        else:
+            self.storage = np.load(embedding_path, mmap_mode="r", allow_pickle=False)
+            if self.storage.shape != expected_shape:
+                raise ValueError(
+                    f"Vocabulary shape {self.storage.shape} differs from metadata {expected_shape}"
+                )
+            if self.storage_dtype == "bfloat16-u16":
+                if self.storage.dtype != np.uint16:
+                    raise ValueError("bfloat16-u16 vocabulary storage must use uint16")
+                bits = np.asarray(self.storage, dtype=np.uint32) << 16
+                weights = bits.view(np.float32)
+            elif self.storage_dtype in {"float16", "float32"}:
+                if str(self.storage.dtype) != self.storage_dtype:
+                    raise ValueError("Vocabulary array dtype differs from metadata")
+                weights = self.storage.astype(np.float32, copy=False)
+            else:
+                raise ValueError(
+                    f"Unsupported shared vocabulary storage dtype: {self.storage_dtype!r}"
+                )
+        self.weights = np.ascontiguousarray(weights)
+        self.ortvalue = ort.OrtValue.ortvalue_from_numpy(self.weights)
+    def lookup(self, token_ids: np.ndarray, dtype: np.dtype) -> np.ndarray:
+        return np.asarray(self.weights[token_ids], dtype=dtype)
+
+
 class Kitten2OnnxLM:
     """Drive the exported Qwen3 LM with explicit embeddings and KV cache.
 
@@ -107,7 +151,17 @@ class Kitten2OnnxLM:
             raise ValueError(f"Profile {runtime_profile!r} requires CUDAExecutionProvider")
 
         self.input_mode = self.meta.get("input_mode", "inputs_embeds")
-        if self.input_mode == "inputs_embeds":
+        self.vocabulary_mode = self.meta.get("vocabulary_mode", "embedded")
+        if self.vocabulary_mode not in {"embedded", "shared"}:
+            raise ValueError(f"Unsupported vocabulary mode: {self.vocabulary_mode!r}")
+        self.vocabulary = None
+        if self.vocabulary_mode == "shared":
+            if self.input_mode != "inputs_embeds":
+                raise ValueError("Shared vocabulary requires input_mode='inputs_embeds'")
+            self.vocabulary = SharedVocabulary(self.model_dir, self.meta, ort)
+            self.embeddings = None
+            self.embedding_storage_dtype = self.vocabulary.storage_dtype
+        elif self.input_mode == "inputs_embeds":
             self.embeddings = np.load(
                 self.model_dir / self.meta["embedding_file"], mmap_mode="r", allow_pickle=False
             )
@@ -144,6 +198,26 @@ class Kitten2OnnxLM:
                 str(self.model_dir / "lm.onnx"),
                 providers=providers,
             )
+        self.output_session = None
+        if self.vocabulary is not None:
+            output_head_file = self.meta.get("output_head_file")
+            if not isinstance(output_head_file, str):
+                raise ValueError("Shared vocabulary metadata must declare output_head_file")
+            self.output_session = ort.InferenceSession(
+                str(self.model_dir / output_head_file), providers=providers
+            )
+            head_inputs = self.output_session.get_inputs()
+            if [item.name for item in head_inputs] != self.meta.get("output_head_input_names"):
+                raise ValueError("Output-head inputs differ from LM metadata")
+            if {item.name: item.type for item in head_inputs} != {
+                "hidden_states": "tensor(float)",
+                "vocabulary_weight": "tensor(float)",
+            }:
+                raise ValueError(
+                    "Shared output head must accept float32 hidden states and vocabulary"
+                )
+            if [item.name for item in self.output_session.get_outputs()] != ["logits"]:
+                raise ValueError("Shared output head must return logits")
         self.speaker_session = (
             ort.InferenceSession(str(speaker_model), providers=providers)
             if speaker_model is not None
@@ -196,7 +270,9 @@ class Kitten2OnnxLM:
         prefill: bool,
     ) -> np.ndarray:
         token_ids = np.asarray(token_ids, dtype=np.int64)
-        if self.embedding_storage_dtype == "bfloat16-u16":
+        if self.vocabulary is not None:
+            values = self.vocabulary.lookup(token_ids, self.model_numpy_dtype)
+        elif self.embedding_storage_dtype == "bfloat16-u16":
             bits = np.asarray(self.embeddings[token_ids], dtype=np.uint32) << 16
             values = bits.view(np.float32).astype(self.model_numpy_dtype)
         else:
@@ -206,6 +282,15 @@ class Kitten2OnnxLM:
             values = values.copy()
             values[0, 0, :] = speaker_hidden[0].astype(values.dtype, copy=False)
         return values
+
+    def _project_logits(self, hidden_states: np.ndarray) -> np.ndarray:
+        binding = self.output_session.io_binding()
+        hidden_states = np.ascontiguousarray(hidden_states, dtype=np.float32)
+        binding.bind_cpu_input("hidden_states", hidden_states)
+        binding.bind_ortvalue_input("vocabulary_weight", self.vocabulary.ortvalue)
+        binding.bind_output("logits", "cpu")
+        self.output_session.run_with_iobinding(binding)
+        return binding.copy_outputs_to_cpu()[0]
 
     def step(
         self,
@@ -257,7 +342,7 @@ class Kitten2OnnxLM:
             inputs["input_ids"] = token_ids
             inputs["speaker_hidden"] = speaker_hidden
         outputs = self.session.run(None, inputs)
-        logits = outputs[0]
+        logits = self._project_logits(outputs[0]) if self.vocabulary is not None else outputs[0]
         new_past: dict[str, np.ndarray] = {}
         for i in range(self.layers):
             new_past[f"past_key_{i}"] = outputs[1 + 2 * i]

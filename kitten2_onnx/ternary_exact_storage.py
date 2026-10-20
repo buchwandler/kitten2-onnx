@@ -23,11 +23,16 @@ from kitten2_onnx.external_data import (
 )
 from kitten2_onnx.quantize_int8_streaming import ExternalDataWriter
 from kitten2_onnx.quantize_ternary_nbits import (
+    SOURCE_GROUP_SIZE,
+    ZERO_POINTS,
+    TernaryNBitsConfig,
     _close_memmap,
     _graph_names,
     _is_exact_ternary_weight,
     _load_float32_weight,
     _unique_graph_name,
+    pack_codes,
+    pack_zero_points,
 )
 
 TERNARY_NEGATIVE_ZERO_CODE = np.int8(-2)
@@ -749,3 +754,566 @@ def compress_ternary_matmuls_streaming(
         if published_data and not output_path.exists():
             data_path.unlink(missing_ok=True)
         raise
+
+
+def _hash_external_initializer(model_dir: Path, tensor: onnx.TensorProto) -> str:
+    tensor_slice = resolve_external_data_range(
+        model_dir,
+        tensor,
+        logical_bytes=logical_tensor_bytes(tensor),
+        require_exact_length=True,
+    )
+    digest = hashlib.sha256()
+    with tensor_slice.path.open("rb") as stream:
+        stream.seek(tensor_slice.offset)
+        remaining = tensor_slice.length
+        while remaining:
+            block = stream.read(min(8 * 1024 * 1024, remaining))
+            if not block:
+                raise ValueError(f"External initializer ended early: {tensor.name}")
+            digest.update(block)
+            remaining -= len(block)
+    return digest.hexdigest()
+
+
+def _map_external_initializer(
+    model_dir: Path, tensor: onnx.TensorProto, dtype: np.dtype, shape: tuple[int, ...]
+) -> np.memmap:
+    if tensor.data_location != TensorProto.EXTERNAL or tuple(tensor.dims) != shape:
+        raise ValueError(f"External initializer has unexpected storage or shape: {tensor.name}")
+    tensor_slice = resolve_external_data_range(
+        model_dir,
+        tensor,
+        logical_bytes=logical_tensor_bytes(tensor),
+        require_exact_length=True,
+    )
+    return np.memmap(
+        tensor_slice.path,
+        mode="r",
+        dtype=dtype,
+        offset=tensor_slice.offset,
+        shape=shape,
+        order="C",
+    )
+
+
+def _prune_graph_to_outputs(graph: onnx.GraphProto) -> set[str]:
+    needed = {value.name for value in graph.output}
+    retained_nodes = []
+    for node in reversed(graph.node):
+        if any(name in needed for name in node.output):
+            retained_nodes.append(node)
+            needed.update(name for name in node.input if name)
+    retained_nodes.reverse()
+    del graph.node[:]
+    graph.node.extend(retained_nodes)
+    del graph.initializer[:]
+    # The caller restores the live initializers after this helper returns.
+    live_values = needed | {value.name for value in graph.input}
+    del graph.value_info[:]
+    return live_values
+
+
+def transcode_exact_ternary_matmuls_to_nbits4_streaming(
+    input_model: str | Path,
+    output_model: str | Path,
+    output_external_data: str | Path,
+    *,
+    exact_storage_metadata: dict[str, Any],
+    config: TernaryNBitsConfig | None = None,
+    exclude_nodes: set[str] | None = None,
+    exclude_initializers: set[str] | None = None,
+    column_chunk: int = 64,
+) -> dict[str, Any]:
+    """Transcode exact-int8 ternary MatMuls to q4 without materializing FP32 weights."""
+    config = config or TernaryNBitsConfig(bits=4)
+    if config.bits != 4:
+        raise ValueError("exact ternary INT8 transcoding requires bits=4")
+    if column_chunk <= 0:
+        raise ValueError("column_chunk must be positive")
+
+    source_path = Path(input_model).resolve()
+    output_path = Path(output_model).resolve()
+    data_path = Path(output_external_data).resolve()
+    if source_path == output_path or source_path == data_path or output_path == data_path:
+        raise ValueError("source model and candidate outputs must be distinct")
+    if output_path.parent != data_path.parent:
+        raise ValueError("candidate graph and external data must share a directory")
+    if output_path.exists() or data_path.exists():
+        raise FileExistsError("candidate output path already exists")
+
+    if exact_storage_metadata.get("method") != "ternary-exact-int8":
+        raise ValueError("source LM metadata is not ternary-exact-int8")
+    if (
+        exact_storage_metadata.get("encoding_version") != TERNARY_ENCODING_VERSION
+        or exact_storage_metadata.get("code_values") != list(TERNARY_CODE_VALUES)
+        or exact_storage_metadata.get("negative_zero_code") != int(TERNARY_NEGATIVE_ZERO_CODE)
+        or exact_storage_metadata.get("negative_zero_preserved") is not True
+    ):
+        raise ValueError("source exact ternary storage metadata is unsupported")
+    source_graph_sha256 = _sha256_file(source_path)
+    if exact_storage_metadata.get("graph_sha256") != source_graph_sha256:
+        raise ValueError("source exact ternary graph hash does not match metadata")
+
+    model = onnx.load(str(source_path), load_external_data=False)
+    source_external_hashes = _external_source_hashes(source_path, model)
+    if exact_storage_metadata.get("external_data_sha256") != source_external_hashes:
+        raise ValueError("source exact ternary external-data hashes do not match metadata")
+    initializers = {tensor.name: tensor for tensor in model.graph.initializer}
+    initializer_reports = exact_storage_metadata.get("initializer_reports")
+    if not isinstance(initializer_reports, list) or not initializer_reports:
+        raise ValueError("source exact ternary metadata has no initializer reports")
+
+    reports_by_source: dict[str, dict[str, Any]] = {}
+    reports_by_node: dict[str, dict[str, Any]] = {}
+    graph_nodes: dict[str, tuple[int, onnx.NodeProto]] = {}
+    for index, node in enumerate(model.graph.node):
+        label = node.name or f"MatMul#{index}"
+        if label in graph_nodes:
+            raise ValueError(f"source graph has duplicate node label: {label}")
+        graph_nodes[label] = (index, node)
+    for report in initializer_reports:
+        source_name = report.get("source_initializer")
+        if not isinstance(source_name, str) or source_name in reports_by_source:
+            raise ValueError("source exact ternary metadata has a missing or duplicate initializer")
+        reports_by_source[source_name] = report
+        nodes = report.get("transformed_nodes")
+        if not isinstance(nodes, list) or not nodes:
+            raise ValueError(f"source initializer has no transformed nodes: {source_name}")
+        for node_name in nodes:
+            if node_name in reports_by_node:
+                raise ValueError(f"source exact ternary node is listed more than once: {node_name}")
+            reports_by_node[node_name] = report
+
+    excluded_node_names = set(exclude_nodes or ())
+    excluded_initializer_names = set(exclude_initializers or ())
+    unknown_nodes = excluded_node_names - reports_by_node.keys()
+    unknown_initializers = excluded_initializer_names - reports_by_source.keys()
+    if unknown_nodes:
+        raise ValueError(f"Unknown exact ternary MatMul node exclusions: {sorted(unknown_nodes)}")
+    if unknown_initializers:
+        raise ValueError(
+            f"Unknown exact ternary initializer exclusions: {sorted(unknown_initializers)}"
+        )
+
+    selected_nodes: dict[str, tuple[int, onnx.NodeProto, dict[str, Any]]] = {}
+    for node_name, report in reports_by_node.items():
+        if (
+            node_name in excluded_node_names
+            or report["source_initializer"] in excluded_initializer_names
+        ):
+            continue
+        found = graph_nodes.get(node_name)
+        if found is None:
+            raise ValueError(f"source exact ternary MatMul is missing from graph: {node_name}")
+        index, node = found
+        if node.op_type != "MatMul" or len(node.input) != 2:
+            raise ValueError(f"source exact ternary node is not a two-input MatMul: {node_name}")
+        selected_nodes[node_name] = (index, node, report)
+    if not selected_nodes:
+        raise ValueError("no exact ternary MatMuls were selected for q4 transcoding")
+
+    producer_by_value = {
+        output: node for node in model.graph.node for output in node.output if output
+    }
+    initializer_names = set(initializers)
+
+    def ancestor_initializers(value_name: str) -> set[str]:
+        pending = [value_name]
+        visited_values: set[str] = set()
+        ancestors: set[str] = set()
+        while pending:
+            value = pending.pop()
+            if value in visited_values:
+                continue
+            visited_values.add(value)
+            if value in initializer_names:
+                ancestors.add(value)
+                continue
+            producer = producer_by_value.get(value)
+            if producer is not None:
+                pending.extend(name for name in producer.input if name)
+        return ancestors
+
+    targets_by_source: dict[str, list[tuple[str, int, onnx.NodeProto]]] = defaultdict(list)
+    for node_name, (index, node, report) in selected_nodes.items():
+        code_name = report.get("code_initializer")
+        scale_name = report.get("scale_initializer")
+        ancestors = ancestor_initializers(node.input[1])
+        if code_name not in ancestors or scale_name not in ancestors:
+            raise ValueError(
+                f"source MatMul does not reconstruct its reported codes/scales: {node_name}"
+            )
+        targets_by_source[report["source_initializer"]].append((node_name, index, node))
+
+    for source_name in targets_by_source:
+        report = reports_by_source[source_name]
+        shape = report.get("source_shape")
+        if not isinstance(shape, list) or len(shape) != 2:
+            raise ValueError(f"source exact ternary shape is invalid: {source_name}")
+        k, n = (int(value) for value in shape)
+        if k <= 0 or n <= 0 or k % SOURCE_GROUP_SIZE:
+            raise ValueError(f"source exact ternary shape is unsupported: {source_name}")
+        group_count = k // SOURCE_GROUP_SIZE
+        code_tensor = initializers.get(report.get("code_initializer"))
+        scale_tensor = initializers.get(report.get("scale_initializer"))
+        if code_tensor is None or scale_tensor is None:
+            raise ValueError(
+                f"source exact ternary code/scale initializer is missing: {source_name}"
+            )
+        if code_tensor.data_type != TensorProto.INT8 or tuple(code_tensor.dims) != (
+            group_count,
+            SOURCE_GROUP_SIZE,
+            n,
+        ):
+            raise ValueError(f"source exact ternary code shape is invalid: {source_name}")
+        if scale_tensor.data_type != TensorProto.FLOAT or tuple(scale_tensor.dims) != (
+            group_count,
+            1,
+            n,
+        ):
+            raise ValueError(f"source exact ternary scale shape is invalid: {source_name}")
+        for tensor, expected_hash, role in (
+            (code_tensor, report.get("code_sha256"), "code"),
+            (scale_tensor, report.get("scale_sha256"), "scale"),
+        ):
+            if tensor.data_location != TensorProto.EXTERNAL or not expected_hash:
+                raise ValueError(
+                    f"source exact ternary {role} storage is not external: {source_name}"
+                )
+            if _hash_external_initializer(source_path.parent, tensor) != expected_hash:
+                raise ValueError(
+                    f"source exact ternary {role} hash does not match metadata: {source_name}"
+                )
+
+    used_names = _graph_names(model.graph)
+    names_by_source: dict[str, tuple[str, str, str]] = {}
+    q4_placeholders: list[onnx.TensorProto] = []
+    source_shapes: dict[str, tuple[int, int]] = {}
+    blocks_per_source_group = SOURCE_GROUP_SIZE // config.block_size
+    for source_name in targets_by_source:
+        report = reports_by_source[source_name]
+        k, n = (int(value) for value in report["source_shape"])
+        group_count = k // SOURCE_GROUP_SIZE
+        block_count = group_count * blocks_per_source_group
+        packed_name = _unique_graph_name(f"{source_name}_nbits4", used_names)
+        scales_name = _unique_graph_name(f"{source_name}_nbits4_scales", used_names)
+        zero_points_name = _unique_graph_name(f"{source_name}_nbits4_zero_points", used_names)
+        names_by_source[source_name] = (packed_name, scales_name, zero_points_name)
+        source_shapes[source_name] = (k, n)
+        q4_placeholders.extend(
+            [
+                make_external_tensor(
+                    packed_name,
+                    TensorProto.UINT8,
+                    (n, block_count, config.block_size // 2),
+                    data_path.name,
+                    0,
+                    n * block_count * (config.block_size // 2),
+                ),
+                make_external_tensor(
+                    scales_name,
+                    TensorProto.FLOAT,
+                    (n * block_count,),
+                    data_path.name,
+                    0,
+                    n * block_count * np.dtype(np.float32).itemsize,
+                ),
+                make_external_tensor(
+                    zero_points_name,
+                    TensorProto.UINT8,
+                    (n * ((block_count + 1) // 2),),
+                    data_path.name,
+                    0,
+                    n * ((block_count + 1) // 2),
+                ),
+            ]
+        )
+
+    rewritten = copy.deepcopy(model)
+    for node_name, (index, node, report) in selected_nodes.items():
+        packed_name, scales_name, zero_points_name = names_by_source[report["source_initializer"]]
+        replacement = helper.make_node(
+            "MatMulNBits",
+            [node.input[0], packed_name, scales_name, zero_points_name],
+            list(node.output),
+            name=_unique_graph_name(f"{node.name or node_name}_nbits4", used_names),
+            domain="com.microsoft",
+            K=source_shapes[report["source_initializer"]][0],
+            N=source_shapes[report["source_initializer"]][1],
+            bits=4,
+            block_size=config.block_size,
+            accuracy_level=config.accuracy_level,
+        )
+        rewritten.graph.node[index].CopyFrom(replacement)
+    rewritten.graph.initializer.extend(q4_placeholders)
+    if not any(opset.domain == "com.microsoft" for opset in rewritten.opset_import):
+        rewritten.opset_import.append(helper.make_opsetid("com.microsoft", 1))
+
+    source_initializer_names = set(initializers)
+    q4_names = {tensor.name for tensor in q4_placeholders}
+    live_values = _prune_graph_to_outputs(rewritten.graph)
+    kept_source_names = (source_initializer_names & live_values) - q4_names
+    kept_q4_names = q4_names & live_values
+    if kept_q4_names != q4_names:
+        raise ValueError("a transcoded q4 initializer is not used by a graph output")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_data = data_path.with_name(f".{data_path.name}.{uuid.uuid4().hex}.tmp")
+    temporary_graph = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
+    temp_location = temporary_data.name
+    output_initializers: list[onnx.TensorProto] = []
+    tensor_reports: list[dict[str, Any]] = []
+    signed_zero_differences = 0
+    packed_code_bytes = 0
+    scale_bytes = 0
+    zero_point_bytes = 0
+    published_data = False
+    try:
+        with ExternalDataWriter(temporary_data) as writer:
+            for source_name, (
+                packed_name,
+                scales_name,
+                zero_points_name,
+            ) in names_by_source.items():
+                k, n = source_shapes[source_name]
+                group_count = k // SOURCE_GROUP_SIZE
+                block_count = group_count * blocks_per_source_group
+                report = reports_by_source[source_name]
+                code_tensor = initializers[report["code_initializer"]]
+                scale_tensor = initializers[report["scale_initializer"]]
+                code_values = _map_external_initializer(
+                    source_path.parent,
+                    code_tensor,
+                    np.dtype(np.int8),
+                    (group_count, SOURCE_GROUP_SIZE, n),
+                )
+                scale_values = _map_external_initializer(
+                    source_path.parent,
+                    scale_tensor,
+                    np.dtype("<f4"),
+                    (group_count, 1, n),
+                )
+                try:
+                    code_offset = writer.start_tensor()
+                    packed_digest = hashlib.sha256()
+                    negative_zero_count = 0
+                    packed_block_bytes = config.block_size // 2
+                    for n_start in range(0, n, column_chunk):
+                        n_end = min(n, n_start + column_chunk)
+                        packed_columns = np.empty(
+                            (n_end - n_start, block_count, packed_block_bytes), dtype=np.uint8
+                        )
+                        for group_index in range(group_count):
+                            source_codes = np.asarray(code_values[group_index, :, n_start:n_end]).T
+                            if np.any(
+                                (source_codes != int(TERNARY_NEGATIVE_ZERO_CODE))
+                                & (source_codes != int(TERNARY_NEGATIVE_CODE))
+                                & (source_codes != int(TERNARY_POSITIVE_ZERO_CODE))
+                                & (source_codes != int(TERNARY_POSITIVE_CODE))
+                            ):
+                                raise ValueError(f"invalid exact ternary code: {source_name}")
+                            negative_zero_count += int(
+                                np.count_nonzero(source_codes == TERNARY_NEGATIVE_ZERO_CODE)
+                            )
+                            q4_codes = np.where(
+                                source_codes == TERNARY_NEGATIVE_CODE,
+                                ZERO_POINTS[4] - 1,
+                                np.where(
+                                    source_codes == TERNARY_POSITIVE_CODE,
+                                    ZERO_POINTS[4] + 1,
+                                    ZERO_POINTS[4],
+                                ),
+                            ).astype(np.uint8)
+                            for subblock in range(blocks_per_source_group):
+                                block_index = group_index * blocks_per_source_group + subblock
+                                block_start = subblock * config.block_size
+                                source_block = source_codes[
+                                    :, block_start : block_start + config.block_size
+                                ]
+                                q4_block = q4_codes[
+                                    :, block_start : block_start + config.block_size
+                                ]
+                                scales = np.asarray(
+                                    scale_values[group_index, 0, n_start:n_end], dtype=np.float32
+                                )
+                                reconstructed = (q4_block.astype(np.int8) - ZERO_POINTS[4]).astype(
+                                    np.float32
+                                )
+                                reconstructed *= scales[:, None]
+                                source_values = source_block.astype(np.float32)
+                                source_values = np.where(
+                                    source_block == TERNARY_NEGATIVE_ZERO_CODE,
+                                    np.float32(-0.0),
+                                    source_values,
+                                )
+                                source_values *= scales[:, None]
+                                if not np.array_equal(reconstructed, source_values):
+                                    raise ValueError(
+                                        f"q4 reconstruction differs from exact-int8 source: {source_name}"
+                                    )
+                                packed_columns[:, block_index, :] = pack_codes(q4_block, 4)
+                        payload = memoryview(packed_columns).cast("B")
+                        writer.write(payload)
+                        packed_digest.update(payload)
+                    code_offset, code_length = writer.finish_tensor(code_offset)
+                    if negative_zero_count != int(report.get("negative_zero_count", -1)):
+                        raise ValueError(f"exact ternary negative-zero count changed: {source_name}")
+
+                    scales_offset = writer.start_tensor()
+                    scales_digest = hashlib.sha256()
+                    for n_start in range(0, n, column_chunk):
+                        n_end = min(n, n_start + column_chunk)
+                        source_scales = np.asarray(
+                            scale_values[:, 0, n_start:n_end], dtype=np.float32
+                        ).T
+                        if not np.isfinite(source_scales).all() or np.any(source_scales < 0):
+                            raise ValueError(f"invalid exact ternary scales: {source_name}")
+                        scales_block = np.repeat(source_scales, blocks_per_source_group, axis=1)
+                        payload = memoryview(np.ascontiguousarray(scales_block)).cast("B")
+                        writer.write(payload)
+                        scales_digest.update(payload)
+                    scales_offset, scales_length = writer.finish_tensor(scales_offset)
+
+                    zero_offset = writer.start_tensor()
+                    zero_digest = hashlib.sha256()
+                    for n_start in range(0, n, column_chunk):
+                        n_end = min(n, n_start + column_chunk)
+                        zero_block = np.full(
+                            (n_end - n_start, block_count), ZERO_POINTS[4], dtype=np.uint8
+                        )
+                        payload = memoryview(pack_zero_points(zero_block, 4)).cast("B")
+                        writer.write(payload)
+                        zero_digest.update(payload)
+                    zero_offset, zero_length = writer.finish_tensor(zero_offset)
+                finally:
+                    for mapped in (code_values, scale_values):
+                        mapped_file = getattr(mapped, "_mmap", None)
+                        if mapped_file is not None and not mapped_file.closed:
+                            mapped_file.close()
+
+                output_initializers.extend(
+                    [
+                        make_external_tensor(
+                            packed_name,
+                            TensorProto.UINT8,
+                            (n, block_count, config.block_size // 2),
+                            temp_location,
+                            code_offset,
+                            code_length,
+                        ),
+                        make_external_tensor(
+                            scales_name,
+                            TensorProto.FLOAT,
+                            (n * block_count,),
+                            temp_location,
+                            scales_offset,
+                            scales_length,
+                        ),
+                        make_external_tensor(
+                            zero_points_name,
+                            TensorProto.UINT8,
+                            (n * ((block_count + 1) // 2),),
+                            temp_location,
+                            zero_offset,
+                            zero_length,
+                        ),
+                    ]
+                )
+                signed_zero_differences += negative_zero_count
+                packed_code_bytes += code_length
+                scale_bytes += scales_length
+                zero_point_bytes += zero_length
+                tensor_reports.append(
+                    {
+                        "source_initializer": source_name,
+                        "source_shape": [k, n],
+                        "source_sha256": report["source_sha256"],
+                        "source_code_initializer": report["code_initializer"],
+                        "source_scale_initializer": report["scale_initializer"],
+                        "source_negative_zero_count": negative_zero_count,
+                        "signed_zero_bit_differences": negative_zero_count,
+                        "packed_initializer": packed_name,
+                        "packed_code_bytes": code_length,
+                        "packed_code_sha256": packed_digest.hexdigest(),
+                        "scales_initializer": scales_name,
+                        "scale_bytes": scales_length,
+                        "scales_sha256": scales_digest.hexdigest(),
+                        "zero_points_initializer": zero_points_name,
+                        "zero_point_bytes": zero_length,
+                        "zero_points_sha256": zero_digest.hexdigest(),
+                        "exact_numeric_reconstruction": True,
+                    }
+                )
+
+            for tensor in model.graph.initializer:
+                if tensor.name not in kept_source_names:
+                    continue
+                copied = copy.deepcopy(tensor)
+                if tensor.data_location == TensorProto.EXTERNAL or tensor.external_data:
+                    tensor_slice = resolve_external_data_range(
+                        source_path.parent,
+                        tensor,
+                        logical_bytes=logical_tensor_bytes(tensor),
+                        require_exact_length=True,
+                    )
+                    offset, length = writer.copy_range(tensor_slice)
+                    _set_external_reference(copied, temp_location, offset, length)
+                output_initializers.append(copied)
+
+        del rewritten.graph.initializer[:]
+        rewritten.graph.initializer.extend(output_initializers)
+        onnx.save_model(rewritten, str(temporary_graph), save_as_external_data=False)
+        onnx.checker.check_model(str(temporary_graph))
+        import onnxruntime as ort
+
+        ort.InferenceSession(str(temporary_graph), providers=["CPUExecutionProvider"])
+
+        for tensor in rewritten.graph.initializer:
+            if tensor.data_location != TensorProto.EXTERNAL and not tensor.external_data:
+                continue
+            external = {entry.key: entry.value for entry in tensor.external_data}
+            if external.get("location") == temp_location:
+                _set_external_reference(
+                    tensor,
+                    data_path.name,
+                    int(external.get("offset", "0")),
+                    int(external.get("length", str(logical_tensor_bytes(tensor)))),
+                )
+        onnx.save_model(rewritten, str(temporary_graph), save_as_external_data=False)
+        os.replace(temporary_data, data_path)
+        published_data = True
+        os.replace(temporary_graph, output_path)
+    except BaseException:
+        temporary_graph.unlink(missing_ok=True)
+        temporary_data.unlink(missing_ok=True)
+        if published_data and not output_path.exists():
+            data_path.unlink(missing_ok=True)
+        raise
+
+    transformed_node_names = [
+        node_name for node_name in reports_by_node if node_name in selected_nodes
+    ]
+    return {
+        "method": "ternary-exact-int8-to-nbits4",
+        "bits": 4,
+        "block_size": config.block_size,
+        "source_group_size": SOURCE_GROUP_SIZE,
+        "accuracy_level": config.accuracy_level,
+        "source_graph_sha256": source_graph_sha256,
+        "source_external_data_sha256": source_external_hashes,
+        "graph_sha256": _sha256_file(output_path),
+        "external_data_file": data_path.name,
+        "external_data_sha256": {data_path.name: _sha256_file(data_path)},
+        "transformed_matmul_count": len(transformed_node_names),
+        "transformed_initializer_count": len(tensor_reports),
+        "transformed_nodes": transformed_node_names,
+        "excluded_nodes": sorted(excluded_node_names),
+        "excluded_initializers": sorted(excluded_initializer_names),
+        "exact_numeric_reconstruction": True,
+        "signed_zero_bit_differences": signed_zero_differences,
+        "packed_code_bytes": packed_code_bytes,
+        "scale_bytes": scale_bytes,
+        "zero_point_bytes": zero_point_bytes,
+        "transformed_tensors": tensor_reports,
+    }

@@ -556,17 +556,30 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         embedding_path = graph_path.parent / embedding_name
         embedding: dict[str, Any] | None = None
         if embedding_path.is_file():
-            array = np.load(embedding_path, mmap_mode="r", allow_pickle=False)
-            embedding = {
-                "file": embedding_name,
-                "file_bytes": embedding_path.stat().st_size,
-                "logical_bytes": int(array.nbytes),
-                "dtype": str(array.dtype),
-                "shape": list(array.shape),
-            }
-            mmap = getattr(array, "_mmap", None)
-            if mmap is not None:
-                mmap.close()
+            if metadata.get("embedding_storage_dtype") == "kitten-emb4":
+                from kitten2_onnx.tl2_emb4 import inspect_emb4_embedding_asset
+
+                payload = inspect_emb4_embedding_asset(embedding_path)
+                dimensions = payload["embedding_metadata"]
+                embedding = {
+                    "file": embedding_name,
+                    "file_bytes": embedding_path.stat().st_size,
+                    "logical_bytes": int(dimensions["V"]) * int(dimensions["D"]) * 2,
+                    "dtype": "bfloat16-reconstructed",
+                    "shape": [int(dimensions["V"]), int(dimensions["D"])],
+                }
+            else:
+                array = np.load(embedding_path, mmap_mode="r", allow_pickle=False)
+                embedding = {
+                    "file": embedding_name,
+                    "file_bytes": embedding_path.stat().st_size,
+                    "logical_bytes": int(array.nbytes),
+                    "dtype": str(array.dtype),
+                    "shape": list(array.shape),
+                }
+                mmap = getattr(array, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
 
         vocabulary_initializer_bytes = sum(item["logical_bytes"] for item in candidates)
         vocabulary_initializer_storage_bytes = sum(item["storage_bytes"] for item in candidates)
@@ -586,6 +599,78 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
         }
 
     return report
+
+
+def _v2_vocabulary_storage_report(root: Path, bundle: dict[str, Any]) -> dict[str, Any]:
+    lm = bundle["lm"]
+    vocabulary = lm["storage"]["vocabulary"]
+    metadata = json.loads((root / lm["metadata"]).read_text(encoding="utf-8"))
+    vocab_size = int(metadata["vocab_size"])
+    hidden_size = int(metadata["hidden_size"])
+    expected_shape = (vocab_size, hidden_size)
+    asset_relative = vocabulary["file"]
+    asset_path = (root / asset_relative).resolve()
+    if not asset_path.is_relative_to(root.resolve()) or not asset_path.is_file():
+        raise ValueError("Bundle v2 vocabulary asset is missing or escapes the bundle")
+    if lm.get("embeddings") != asset_relative:
+        raise ValueError("Bundle v2 vocabulary asset differs from its LM embedding path")
+
+    from safetensors import safe_open
+
+    vocabulary_assets = set()
+    for path in (root / "lm").rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix == ".npy":
+            array = np.load(path, mmap_mode="r", allow_pickle=False)
+            if tuple(array.shape) == expected_shape:
+                vocabulary_assets.add(path.resolve())
+            mmap = getattr(array, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
+        elif path.suffix == ".safetensors":
+            with safe_open(str(path), framework="pt", device="cpu") as handle:
+                names = set(handle.keys())
+            if "model.embed_tokens.weight" in names or any(name.startswith("emb4/") for name in names):
+                vocabulary_assets.add(path.resolve())
+
+    if asset_path not in vocabulary_assets:
+        raise ValueError("Bundle v2 vocabulary asset does not contain the declared vocabulary")
+
+    initializer_copies = 0
+    initializer_storage_bytes = 0
+    valid_shapes = {expected_shape, (hidden_size, vocab_size)}
+    graph_paths = {lm["core_model"], lm["head_model"]}
+    for relative_graph in graph_paths:
+        graph_path = (root / relative_graph).resolve()
+        if not graph_path.is_relative_to(root.resolve()) or not graph_path.is_file():
+            raise ValueError(f"Bundle v2 graph is missing or escapes the bundle: {relative_graph}")
+        graph = onnx.load(str(graph_path), load_external_data=False).graph
+        for tensor in graph.initializer:
+            if tuple(tensor.dims) in valid_shapes:
+                initializer_copies += 1
+                logical_bytes = _logical_tensor_bytes(tensor)
+                initializer_storage_bytes += _storage_info(
+                    tensor, graph_path.parent, logical_bytes
+                )["bytes"]
+
+    physical_copies = len(vocabulary_assets) + initializer_copies
+    if physical_copies != 1:
+        raise ValueError(
+            f"Bundle v2 stores {physical_copies} physical vocabulary copies, expected exactly one"
+        )
+    asset_bytes = asset_path.stat().st_size
+    return {
+        "logical_parameters": vocab_size * hidden_size,
+        "logical_bfloat16_bytes": vocab_size * hidden_size * 2,
+        "physical_copies": physical_copies,
+        "asset_bytes": asset_bytes,
+        "initializer_storage_bytes": initializer_storage_bytes,
+        "stored_bytes": asset_bytes + initializer_storage_bytes,
+        "method": vocabulary["method"],
+        "lossy": vocabulary["lossy"],
+        "file": asset_relative,
+    }
 
 
 def audit_bundle(
@@ -616,12 +701,16 @@ def audit_bundle(
     graphs: dict[str, Any] = {}
     for graph_path in sorted(root.rglob("*.onnx")):
         relative = graph_path.relative_to(root).as_posix()
-        graph_key = {
-            "lm/lm.onnx": "lm",
-            "speaker/speaker.onnx": "speaker",
-            "decoder/flow/flow.onnx": "flow",
-            "decoder/mel2wav/mel2wav.onnx": "mel2wav",
-        }.get(relative, relative.removesuffix(".onnx"))
+        lm_entry = bundle_manifest.get("lm", {})
+        if relative == lm_entry.get("head_model"):
+            graph_key = "lm_output"
+        else:
+            graph_key = {
+                "lm/lm.onnx": "lm",
+                "speaker/speaker.onnx": "speaker",
+                "decoder/flow/flow.onnx": "flow",
+                "decoder/mel2wav/mel2wav.onnx": "mel2wav",
+            }.get(relative, relative.removesuffix(".onnx"))
         graphs[graph_key] = _graph_size_report(graph_path)
 
     bundle_bytes = sum(files.values())
@@ -651,6 +740,10 @@ def audit_bundle(
             "ternary_exact_int8": graphs.get("lm", {}).get("ternary_exact_int8", {}),
         },
     }
+    if bundle_manifest.get("format") == "kitten2-onnx-bundle-v2":
+        vocabulary_storage = _v2_vocabulary_storage_report(root, bundle_manifest)
+        report["vocabulary_storage"] = vocabulary_storage
+        report["storage_breakdown"]["variant_vocabulary"] = vocabulary_storage
     if checkpoint is not None:
         report["checkpoint"] = audit_checkpoint(checkpoint)
     return report

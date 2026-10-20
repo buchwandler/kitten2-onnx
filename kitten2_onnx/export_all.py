@@ -109,6 +109,7 @@ def export_all(
     all_voices: bool = False,
     profile_name: str = "dev-fp32",
     input_mode: str = "inputs_embeds",
+    weight_variant: str = "full",
     opset: int = 18,
     token_count: int = 32,
     validate: bool = False,
@@ -119,6 +120,12 @@ def export_all(
 
     if input_mode not in {"inputs_embeds", "input_ids"}:
         raise ValueError("input_mode must be 'inputs_embeds' or 'input_ids'")
+    if weight_variant not in {"full", "packed", "emb4"}:
+        raise ValueError("weight_variant must be 'full', 'packed', or 'emb4'")
+    if weight_variant != "full" and input_mode != "inputs_embeds":
+        raise ValueError("packed and emb4 variants require input_mode='inputs_embeds'")
+    if weight_variant != "full" and profile_name != "dev-fp32":
+        raise ValueError("packed and emb4 variants require the dev-fp32 CPU export profile")
     if all_voices and voice is not None:
         raise ValueError("Select either one voice or all voices, not both")
     model_dir = Path(model_dir).resolve()
@@ -130,12 +137,23 @@ def export_all(
     ):
         raise ValueError("output_dir must not overlap the source model directory")
 
-    inspection = inspect_checkpoint(model_dir)
-    if not inspection["valid"]:
-        errors = "\n".join(f"- {error}" for error in inspection["errors"])
-        raise ValueError(f"Source checkpoint validation failed:\n{errors}")
+    if weight_variant == "full":
+        inspection = inspect_checkpoint(model_dir)
+        if not inspection["valid"]:
+            errors = "\n".join(f"- {error}" for error in inspection["errors"])
+            raise ValueError(f"Source checkpoint validation failed:\n{errors}")
+        model_config = inspection["kitten_config"]
+    else:
+        model_config = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+        from kitten2_onnx.weights import resolve_weight_path
 
-    model_config = inspection["kitten_config"]
+        weight_path = resolve_weight_path(model_dir, weight_variant)
+        if weight_path is None or not weight_path.is_file():
+            raise FileNotFoundError(f"No {weight_variant!r} LM checkpoint declared in {model_dir}")
+        if weight_variant == "emb4":
+            from kitten2_onnx.tl2_emb4 import inspect_emb4
+
+            inspect_emb4(weight_path)
     selected_voices = _select_voices(model_dir, model_config, voice, all_voices)
     revision_path = model_dir / "model_revision.json"
     if not revision_path.is_file():
@@ -166,7 +184,15 @@ def export_all(
     voice_dir.mkdir(parents=True)
 
     export_speaker(model_dir, speaker_dir, opset=opset)
-    export_lm(model_dir, lm_dir, profile_name=profile_name, input_mode=input_mode, opset=opset)
+    export_lm(
+        model_dir,
+        lm_dir,
+        profile_name=profile_name,
+        input_mode=input_mode,
+        shared_vocabulary=weight_variant != "full",
+        weight_variant=weight_variant,
+        opset=opset,
+    )
 
     s3gen_context = load_s3gen_model() if all_voices else None
     voice_paths: dict[str, Path] = {}
@@ -210,15 +236,44 @@ def export_all(
     }
     if "embedding_file" in lm_metadata:
         lm_bundle_entry["embeddings"] = f"lm/{lm_metadata['embedding_file']}"
+    if weight_variant != "full":
+        vocabulary_file = f"lm/{lm_metadata['embedding_file']}"
+        lm_bundle_entry.update(
+            {
+                "core_model": "lm/lm.onnx",
+                "head_model": f"lm/{lm_metadata['output_head_file']}",
+                "weight_variant": weight_variant,
+                "source_weight_sha256": lm_metadata["source_weight_sha256"],
+                "embedding_reconstruction_version": lm_metadata[
+                    "embedding_reconstruction_version"
+                ],
+                "onnxruntime_min_tested_version": lm_metadata[
+                    "onnxruntime_min_tested_version"
+                ],
+                "storage": {
+                    "transformer": {
+                        "method": "float",
+                        "dtype": lm_metadata["graph_dtype"],
+                    },
+                    "vocabulary": {
+                        "method": lm_metadata["embedding_storage_dtype"],
+                        "file": vocabulary_file,
+                        "lossy": weight_variant == "emb4",
+                    },
+                },
+            }
+        )
     graphs = [
         lm_dir / "lm.onnx",
         speaker_dir / "speaker.onnx",
         flow_dir / flow_metadata["graph"],
         mel2wav_dir / mel2wav_metadata["graph"],
     ]
+    if weight_variant != "full":
+        graphs.append(lm_dir / lm_metadata["output_head_file"])
 
     bundle: dict[str, Any] = {
-        "format": "kitten2-onnx-bundle-v1",
+        "format": "kitten2-onnx-bundle-v2" if weight_variant != "full" else "kitten2-onnx-bundle-v1",
         "sample_rate": int(model_config["sample_rate"]),
         "batch_size": 1,
         "default_voice": default_voice,
@@ -277,8 +332,9 @@ def export_all(
     bundle_path.write_text(json.dumps(bundle, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     checked_graphs = _check_onnx_graphs(graphs)
-    if len(checked_graphs) != 4:
-        raise RuntimeError("Expected to validate all four ONNX graphs")
+    expected_graph_count = 5 if weight_variant != "full" else 4
+    if len(checked_graphs) != expected_graph_count:
+        raise RuntimeError(f"Expected to validate all {expected_graph_count} ONNX graphs")
     if validate:
         validation_report = validate_bundle(output_dir)
         if not validation_report["valid"]:
@@ -298,6 +354,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument(
         "--input-mode", choices=("inputs_embeds", "input_ids"), default="inputs_embeds"
     )
+    parser.add_argument("--weights", choices=("full", "packed", "emb4"), default="full")
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--token-count", type=int, default=32)
     parser.add_argument("--validate", action="store_true", help="Run full bundle validation with CPU ONNX Runtime")
@@ -309,6 +366,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         voice=args.voice,
         profile_name=args.profile,
         input_mode=args.input_mode,
+        weight_variant=args.weights,
         opset=args.opset,
         token_count=args.token_count,
         validate=args.validate,

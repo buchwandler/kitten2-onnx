@@ -223,6 +223,166 @@ def _validate_voice_bundle(bundle_dir, monkeypatch):
     return validator_module.validate_bundle(bundle_dir)
 
 
+
+def _write_v2_voice_bundle(bundle_dir, variant, *, duplicate_initializer=False):
+    _write_voice_bundle(bundle_dir, [{"name": "Bruno"}])
+    import onnx
+    import onnxruntime as ort
+    from onnx import TensorProto, helper
+
+    lm_dir = bundle_dir / "lm"
+    embedding_name = "vocabulary.bf16.npy" if variant == "packed" else "vocabulary.emb4.safetensors"
+    embedding_path = lm_dir / embedding_name
+    if variant == "packed":
+        np.save(embedding_path, np.zeros((3, 4), dtype=np.uint16), allow_pickle=False)
+        storage_method = "bfloat16-u16"
+    else:
+        import torch
+        from safetensors.torch import save_file
+
+        save_file(
+            {
+                "emb4/tier_map": torch.zeros(3, dtype=torch.uint8),
+                "emb4/t0_codes": torch.zeros(3, dtype=torch.uint8),
+                "emb4/t0_centers": torch.zeros((4, 4), dtype=torch.float32),
+                "emb4/t0_s": torch.ones(3, dtype=torch.float32),
+                "emb4/t0_t": torch.ones(4, dtype=torch.float32),
+            },
+            str(embedding_path),
+            metadata={
+                "schema": "kitten_ternary_tl2_rl_v1",
+                "embedding_metadata": json.dumps({"V": 3, "D": 4, "Ks": "[4]"}),
+            },
+        )
+        storage_method = "kitten-emb4"
+
+    initializer = (
+        [onnx.numpy_helper.from_array(np.zeros((3, 4), dtype=np.float32), "duplicate_vocab")]
+        if duplicate_initializer
+        else []
+    )
+    core_graph = helper.make_graph(
+        [],
+        "core",
+        [helper.make_tensor_value_info("inputs_embeds", TensorProto.FLOAT, [1, 4])],
+        [helper.make_tensor_value_info("last_hidden_state", TensorProto.FLOAT, [1, 4])],
+        initializer=initializer,
+    )
+    head_graph = helper.make_graph(
+        [],
+        "head",
+        [
+            helper.make_tensor_value_info("hidden_states", TensorProto.FLOAT, [1, 4]),
+            helper.make_tensor_value_info("vocabulary_weight", TensorProto.FLOAT, [3, 4]),
+        ],
+        [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 3])],
+    )
+    for name, graph in (("lm.onnx", core_graph), ("lm_output.onnx", head_graph)):
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        model.ir_version = min(model.ir_version, 10)
+        onnx.save_model(model, str(lm_dir / name))
+
+    import hashlib
+
+    bundle_path = bundle_dir / "bundle.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    lm_metadata_path = lm_dir / "lm.meta.json"
+    lm_metadata = json.loads(lm_metadata_path.read_text(encoding="utf-8"))
+    source_hash = "b" * 64
+    reconstruction_version = "kitten2-tl2-emb4-v1" if variant == "emb4" else None
+    lm_metadata.update(
+        {
+            "graph": "lm.onnx",
+            "input_mode": "inputs_embeds",
+            "vocabulary_mode": "shared",
+            "input_names": ["inputs_embeds"],
+            "output_names": ["last_hidden_state"],
+            "io_dtype": "float32",
+            "runtime_profile": "dev-fp32",
+            "runtime_provider": "CPUExecutionProvider",
+            "hidden_size": 4,
+            "vocab_size": 3,
+            "embedding_file": embedding_name,
+            "embedding_storage_dtype": storage_method,
+            "embedding_runtime_dtype": "float32",
+            "output_head_file": "lm_output.onnx",
+            "output_head_input_names": ["hidden_states", "vocabulary_weight"],
+            "output_head_output_names": ["logits"],
+            "output_head_input_shapes": {
+                "hidden_states": [None, 4],
+                "vocabulary_weight": [3, 4],
+            },
+            "output_head_output_shape": [None, 3],
+            "source_model_revision": "model-rev",
+            "source_weight_variant": variant,
+            "source_weight_sha256": source_hash,
+            "embedding_reconstruction_version": reconstruction_version,
+            "onnxruntime_min_tested_version": ort.__version__,
+            "quantization": {
+                "method": "ternary-nbits",
+                "bits": 4,
+                "source_weight_sha256": source_hash,
+            },
+        }
+    )
+    lm_metadata_path.write_text(json.dumps(lm_metadata), encoding="utf-8")
+    bundle["format"] = "kitten2-onnx-bundle-v2"
+    bundle["lm"].update(
+        {
+            "core_model": "lm/lm.onnx",
+            "head_model": "lm/lm_output.onnx",
+            "embeddings": f"lm/{embedding_name}",
+            "weight_variant": variant,
+            "source_weight_sha256": source_hash,
+            "embedding_reconstruction_version": reconstruction_version,
+            "onnxruntime_min_tested_version": ort.__version__,
+            "storage": {
+                "transformer": {
+                    "method": "matmul-nbits",
+                    "bits": 4,
+                    "block_size": 128,
+                    "source_group_size": 128,
+                    "zero_point": 8,
+                    "source_weight_sha256": source_hash,
+                },
+                "vocabulary": {
+                    "method": storage_method,
+                    "file": f"lm/{embedding_name}",
+                    "lossy": variant == "emb4",
+                },
+            },
+        }
+    )
+    bundle["files"] = {
+        path.relative_to(bundle_dir).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(bundle_dir.rglob("*"))
+        if path.is_file() and path != bundle_path
+    }
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+
+def test_validate_bundle_v2_accepts_packed_and_emb4_and_rejects_duplicate_storage(
+    tmp_path, monkeypatch
+):
+    packed = tmp_path / "packed"
+    _write_v2_voice_bundle(packed, "packed")
+    packed_report = _validate_voice_bundle(packed, monkeypatch)
+    assert packed_report["valid"], packed_report["errors"]
+    assert packed_report["vocabulary_storage"]["physical_copies"] == 1
+    assert packed_report["vocabulary_storage"]["lossy"] is False
+
+    emb4 = tmp_path / "emb4"
+    _write_v2_voice_bundle(emb4, "emb4")
+    emb4_report = _validate_voice_bundle(emb4, monkeypatch)
+    assert emb4_report["valid"], emb4_report["errors"]
+    assert emb4_report["vocabulary_storage"]["lossy"] is True
+
+    duplicate = tmp_path / "duplicate"
+    _write_v2_voice_bundle(duplicate, "packed", duplicate_initializer=True)
+    duplicate_report = _validate_voice_bundle(duplicate, monkeypatch)
+    assert not duplicate_report["valid"]
+    assert any("Shared vocabulary is duplicated" in error for error in duplicate_report["errors"])
+
 def test_validate_bundle_reports_corrupt_hash_and_unsafe_path(tmp_path):
     bundle_dir = tmp_path / "bundle"
     bundle_dir.mkdir()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -55,6 +56,55 @@ def test_synthesis_cli_generates_valid_builtin_voice_wav(tmp_path):
     rms = np.sqrt(np.mean(np.square(audio, dtype=np.float64)))
     assert 1e-6 <= rms <= 0.5
 
+
+def test_tts_accepts_bundle_v2(monkeypatch, tmp_path):
+    import transformers
+
+    class Tokenizer:
+        pass
+
+    monkeypatch.setattr(
+        transformers.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: Tokenizer()
+    )
+    monkeypatch.setattr(
+        tts_module,
+        "Kitten2OnnxLM",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        tts_module,
+        "Kitten2OnnxDecoder",
+        lambda *args, **kwargs: type("Decoder", (), {"sample_rate": 24000})(),
+    )
+    bundle = {
+        "format": "kitten2-onnx-bundle-v2",
+        "token_map": {
+            "audio_id_base": 10,
+            "num_audio_tokens": 5,
+            "speech_start_id": 1,
+            "speech_end_id": 2,
+            "text_start_id": 3,
+            "text_end_id": 4,
+            "start_id": 5,
+            "stop_id": 6,
+            "final_seg_id": 15,
+        },
+        "default_voice": "Bruno",
+        "voices": {"Bruno": "voices/Bruno.npz"},
+        "tokenizer": "tokenizer",
+        "lm": {"model": "lm/lm.onnx"},
+        "speaker": {"model": "speaker/speaker.onnx"},
+        "decoder": {
+            "flow": "decoder/flow/flow.onnx",
+            "mel2wav": "decoder/mel2wav/mel2wav.onnx",
+        },
+    }
+    (tmp_path / "bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
+
+    tts = Kitten2OnnxTTS(tmp_path)
+
+    assert tts.bundle["format"] == "kitten2-onnx-bundle-v2"
+    assert tts.sample_rate == 24000
 
 
 def test_emotion_conditioning_is_independent_from_sampling_preset(monkeypatch):

@@ -16,7 +16,8 @@ def _exact_weight() -> np.ndarray:
     return codes.astype(np.float32) * scales[None, :]
 
 
-def test_compare_matmul_uses_same_activation_and_reports_kernel_diagnostics():
+@pytest.mark.parametrize("bits", [2, 4])
+def test_compare_matmul_uses_same_activation_and_reports_kernel_diagnostics(bits: int):
     rng = np.random.default_rng(991)
     activation = rng.normal(size=(5, 128)).astype(np.float32)
     weight = _exact_weight()
@@ -24,12 +25,13 @@ def test_compare_matmul_uses_same_activation_and_reports_kernel_diagnostics():
     report = compare_matmul(
         activation,
         weight,
-        TernaryNBitsConfig(block_size=64, accuracy_level=1),
+        TernaryNBitsConfig(bits=bits, block_size=64, accuracy_level=1),
         iterations=1,
         intra_op_threads=1,
     )
 
     assert report["block_size"] == 64
+    assert report["bits"] == bits
     assert report["accuracy_level"] == 1
     assert report["input_shape"] == [5, 128]
     assert report["output_shape"] == [5, 3]

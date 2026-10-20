@@ -381,3 +381,137 @@ def test_size_audit_recognizes_legacy_and_signed_zero_exact_storage(
     assert report["source_fp32_bytes_replaced"] == 1024
     assert report["storage_reduction_bytes"] == 760
     assert report["exact_storage_ratio"] == 264 / 1024
+
+
+@pytest.mark.parametrize("variant", ["packed", "emb4"])
+def test_size_audit_v2_reports_one_vocabulary_copy(tmp_path, variant):
+    bundle = tmp_path / "bundle-v2"
+    lm_dir = bundle / "lm"
+    lm_dir.mkdir(parents=True)
+    embedding_name = "vocabulary.bf16.npy" if variant == "packed" else "vocabulary.emb4.safetensors"
+    embedding_path = lm_dir / embedding_name
+    if variant == "packed":
+        np.save(embedding_path, np.zeros((3, 8), dtype=np.uint16), allow_pickle=False)
+        method = "bfloat16-u16"
+    else:
+        from safetensors.torch import save_file
+
+        save_file(
+            {
+                "emb4/tier_map": torch.zeros(3, dtype=torch.uint8),
+                "emb4/t0_codes": torch.zeros(3, dtype=torch.uint8),
+                "emb4/t0_centers": torch.zeros((2, 8), dtype=torch.float32),
+                "emb4/t0_s": torch.ones(3, dtype=torch.float32),
+                "emb4/t0_t": torch.ones(8, dtype=torch.float32),
+            },
+            str(embedding_path),
+            metadata={
+                "schema": "kitten_ternary_tl2_rl_v1",
+                "embedding_metadata": json.dumps({"V": 3, "D": 8, "Ks": "[2]"}),
+            },
+        )
+        method = "kitten-emb4"
+
+    (lm_dir / "lm.meta.json").write_text(
+        json.dumps(
+            {
+                "graph": "lm.onnx",
+                "vocab_size": 3,
+                "hidden_size": 8,
+                "embedding_file": embedding_name,
+                "embedding_storage_dtype": method,
+            }
+        ),
+        encoding="utf-8",
+    )
+    core_inputs = [helper.make_tensor_value_info("hidden", TensorProto.FLOAT, [1, 8])]
+    core_outputs = [helper.make_tensor_value_info("last_hidden_state", TensorProto.FLOAT, [1, 8])]
+    core = helper.make_graph([], "core", core_inputs, core_outputs)
+    head_inputs = [
+        helper.make_tensor_value_info("hidden_states", TensorProto.FLOAT, [1, 8]),
+        helper.make_tensor_value_info("vocabulary_weight", TensorProto.FLOAT, [3, 8]),
+    ]
+    head_outputs = [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 3])]
+    head = helper.make_graph([], "head", head_inputs, head_outputs)
+    for path, graph in ((lm_dir / "lm.onnx", core), (lm_dir / "lm_output.onnx", head)):
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        model.ir_version = min(model.ir_version, 10)
+        onnx.save_model(model, str(path))
+    manifest = {
+        "format": "kitten2-onnx-bundle-v2",
+        "lm": {
+            "model": "lm/lm.onnx",
+            "core_model": "lm/lm.onnx",
+            "head_model": "lm/lm_output.onnx",
+            "metadata": "lm/lm.meta.json",
+            "embeddings": f"lm/{embedding_name}",
+            "storage": {
+                "transformer": {
+                    "method": "matmul-nbits",
+                    "bits": 4,
+                    "block_size": 128,
+                    "source_group_size": 128,
+                    "zero_point": 8,
+                },
+                "vocabulary": {
+                    "method": method,
+                    "file": f"lm/{embedding_name}",
+                    "lossy": variant == "emb4",
+                },
+            },
+        },
+    }
+    (bundle / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    report = audit_bundle(bundle)
+
+    assert report["vocabulary_storage"]["logical_parameters"] == 24
+    assert report["vocabulary_storage"]["physical_copies"] == 1
+    assert report["vocabulary_storage"]["stored_bytes"] == embedding_path.stat().st_size
+    assert report["vocabulary_storage"]["lossy"] is (variant == "emb4")
+
+
+def test_size_audit_v2_rejects_duplicate_vocabulary_assets(tmp_path):
+    bundle = tmp_path / "bundle-v2"
+    lm_dir = bundle / "lm"
+    lm_dir.mkdir(parents=True)
+    embedding_path = lm_dir / "vocabulary.bf16.npy"
+    vocabulary = np.zeros((3, 8), dtype=np.uint16)
+    np.save(embedding_path, vocabulary, allow_pickle=False)
+    np.save(lm_dir / "vocabulary-copy.npy", vocabulary, allow_pickle=False)
+    metadata_path = lm_dir / "lm.meta.json"
+    metadata_path.write_text(
+        json.dumps({"vocab_size": 3, "hidden_size": 8, "embedding_file": embedding_path.name}),
+        encoding="utf-8",
+    )
+    for name in ("lm.onnx", "lm_output.onnx"):
+        graph = helper.make_graph(
+            [],
+            name,
+            [helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 8])],
+            [helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 8])],
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 18)])
+        model.ir_version = min(model.ir_version, 10)
+        onnx.save_model(model, str(lm_dir / name))
+    manifest = {
+        "format": "kitten2-onnx-bundle-v2",
+        "lm": {
+            "model": "lm/lm.onnx",
+            "core_model": "lm/lm.onnx",
+            "head_model": "lm/lm_output.onnx",
+            "metadata": "lm/lm.meta.json",
+            "embeddings": "lm/vocabulary.bf16.npy",
+            "storage": {
+                "vocabulary": {
+                    "method": "bfloat16-u16",
+                    "file": "lm/vocabulary.bf16.npy",
+                    "lossy": False,
+                }
+            },
+        },
+    }
+    (bundle / "bundle.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="physical vocabulary copies"):
+        audit_bundle(bundle)

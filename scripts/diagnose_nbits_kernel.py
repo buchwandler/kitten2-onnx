@@ -22,7 +22,7 @@ from onnx import TensorProto, helper, numpy_helper
 from kitten2_onnx.quantize_ternary_nbits import (
     TernaryNBitsConfig,
     _array_sha256,
-    rewrite_matmul_to_nbits4,
+    rewrite_matmul_to_nbits,
 )
 
 _TARGET_PROJECTIONS = (
@@ -94,6 +94,7 @@ def _compare_sessions(
     relative_difference = absolute_difference / np.maximum(np.abs(fp32_output), 1e-12)
     allowed_difference = _ATOL + _RTOL * np.abs(fp32_output)
     return {
+        "bits": config.bits,
         "block_size": config.block_size,
         "accuracy_level": config.accuracy_level,
         "input_shape": list(activation.shape),
@@ -134,7 +135,7 @@ def compare_matmul(
     if iterations <= 0:
         raise ValueError("iterations must be positive")
     source_model = _source_matmul_model(weight)
-    nbits_model = rewrite_matmul_to_nbits4(source_model, config=config)
+    nbits_model = rewrite_matmul_to_nbits(source_model, config=config)
     onnx.checker.check_model(source_model)
     onnx.checker.check_model(nbits_model)
     fp32_session = _session(source_model, intra_op_threads)
@@ -252,6 +253,7 @@ def _diagnose_real_activations(
     inventory_path: Path,
     layers: list[int],
     decode_steps: list[int],
+    bit_widths: list[int],
     accuracy_level_0_block_size: int | None,
     iterations: int,
     intra_op_threads: int,
@@ -263,10 +265,18 @@ def _diagnose_real_activations(
         intra_op_threads=intra_op_threads,
     )
     named_modules = dict(model.named_modules())
-    configs = [TernaryNBitsConfig(block_size=size, accuracy_level=1) for size in _BLOCK_SIZES]
+    configs = [
+        TernaryNBitsConfig(bits=bit_width, block_size=size, accuracy_level=1)
+        for bit_width in bit_widths
+        for size in _BLOCK_SIZES
+    ]
     if accuracy_level_0_block_size is not None:
-        configs.append(TernaryNBitsConfig(block_size=accuracy_level_0_block_size, accuracy_level=0))
-
+        configs.extend(
+            TernaryNBitsConfig(
+                bits=bit_width, block_size=accuracy_level_0_block_size, accuracy_level=0
+            )
+            for bit_width in bit_widths
+        )
     rows = []
     for layer in layers:
         for projection in _TARGET_PROJECTIONS:
@@ -282,7 +292,7 @@ def _diagnose_real_activations(
             fp32_session = _session(source_model, intra_op_threads)
             nbits_sessions = []
             for config in configs:
-                nbits_model = rewrite_matmul_to_nbits4(source_model, config=config)
+                nbits_model = rewrite_matmul_to_nbits(source_model, config=config)
                 onnx.checker.check_model(nbits_model)
                 nbits_sessions.append((config, _session(nbits_model, intra_op_threads)))
             for case, activations in captured.items():
@@ -330,7 +340,11 @@ def _diagnose_real_activations(
         "projections": list(_TARGET_PROJECTIONS),
         "decode_steps": decode_steps,
         "configurations": [
-            {"block_size": config.block_size, "accuracy_level": config.accuracy_level}
+            {
+                "bits": config.bits,
+                "block_size": config.block_size,
+                "accuracy_level": config.accuracy_level,
+            }
             for config in configs
         ],
         "iterations_per_case": iterations,
@@ -353,6 +367,7 @@ def main() -> None:
     parser.add_argument("--inventory", type=Path, required=True)
     parser.add_argument("--layers", type=int, nargs="+", default=[23, 24, 25, 26, 27])
     parser.add_argument("--decode-steps", type=int, nargs="+", default=[0, 1, 4])
+    parser.add_argument("--bits", type=int, nargs="+", choices=(2, 4), default=[2, 4])
     parser.add_argument("--accuracy-level-0-block-size", type=int, choices=_BLOCK_SIZES)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument("--intra-op-threads", type=int, default=4)
@@ -368,6 +383,7 @@ def main() -> None:
         inventory_path=args.inventory,
         layers=args.layers,
         decode_steps=args.decode_steps,
+        bit_widths=args.bits,
         accuracy_level_0_block_size=args.accuracy_level_0_block_size,
         iterations=args.iterations,
         intra_op_threads=args.intra_op_threads,

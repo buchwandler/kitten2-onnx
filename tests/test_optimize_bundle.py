@@ -387,6 +387,7 @@ def test_optimize_cli_exposes_chunked_mode_without_removing_legacy_mode(monkeypa
     assert "int8-dynamic-chunked" in help_output
 
     assert "ternary-nbits4" in help_output
+    assert "ternary-exact-int8-to-nbits4" in help_output
     assert "--chunk-rows" in help_output
     assert "--exclude-matmul-initializer" in help_output
     assert "--lm-method" in help_output
@@ -740,6 +741,133 @@ def test_optimize_bundle_ternary_exact_int8_routes_accounts_and_preserves_source
         if path.is_file()
     } == source_files
 
+def test_optimize_bundle_exact_int8_to_nbits4_streams_and_preserves_sources(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    weight = _write_ternary_tiny_bundle(source, signed_zero=True)
+    inventory = _write_exact_ternary_inventory(
+        tmp_path / "inventory.json", source, weight, matmul_count=196
+    )
+    source_files = {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    }
+    exact = tmp_path / "exact-int8"
+    optimize_bundle(
+        source,
+        exact,
+        lm_method="ternary-exact-int8",
+        ternary_inventory_path=inventory,
+    )
+    exact_files = {
+        path.relative_to(exact).as_posix(): path.read_bytes()
+        for path in exact.rglob("*")
+        if path.is_file()
+    }
+
+    output = tmp_path / "q4"
+    report = optimize_bundle(
+        exact,
+        output,
+        lm_method="ternary-exact-int8-to-nbits4",
+        nbits_block_size=32,
+    )
+
+    quantization = report["quantization"]
+    metadata = json.loads((output / "lm/lm.meta.json").read_text(encoding="utf-8"))
+    bundle = json.loads((output / "bundle.json").read_text(encoding="utf-8"))
+    graph = onnx.load(str(output / "lm/lm.onnx"), load_external_data=False)
+    assert bundle["export"]["lm_optimization"] == "ternary-exact-int8-to-nbits4"
+    assert quantization["method"] == "ternary-exact-int8-to-nbits4"
+    assert quantization["bits"] == 4
+    assert quantization["block_size"] == 32
+    assert quantization["transformed_matmul_count"] == 196
+    assert quantization["signed_zero_bit_differences"] == 1
+    provenance = quantization["provenance"]
+    assert provenance["onnx_version"]
+    assert provenance["onnxruntime_version"]
+    assert provenance["python_version"]
+    assert provenance["repository_commit"]
+    assert quantization["source_external_data_sha256"] == {
+        "lm.ternary-exact-int8.onnx.data": hashlib.sha256(
+            (exact / "lm/lm.ternary-exact-int8.onnx.data").read_bytes()
+        ).hexdigest()
+    }
+    assert metadata["quantization"] == quantization
+    assert metadata["external_data_files"] == ["lm.nbits4.onnx.data"]
+    assert not (output / "lm/lm.ternary-exact-int8.onnx.data").exists()
+    assert [node.op_type for node in graph.graph.node] == ["MatMulNBits"] * 196
+    assert "lm/lm.nbits4.onnx.data" in bundle["files"]
+    assert "lm/lm.ternary-exact-int8.onnx.data" not in bundle["files"]
+
+    import onnxruntime as ort
+
+    session = ort.InferenceSession(str(output / "lm/lm.onnx"), providers=["CPUExecutionProvider"])
+    activation = np.arange(128, dtype=np.float32).reshape(1, 128) / 128
+    actual = session.run(None, {"inputs_embeds": activation})
+    assert len(actual) == 196
+    for result in actual:
+        np.testing.assert_allclose(result, activation @ weight, rtol=1e-5, atol=1e-5)
+
+    assert {
+        path.relative_to(source).as_posix(): path.read_bytes()
+        for path in source.rglob("*")
+        if path.is_file()
+    } == source_files
+    assert {
+        path.relative_to(exact).as_posix(): path.read_bytes()
+        for path in exact.rglob("*")
+        if path.is_file()
+    } == exact_files
+
+
+def test_optimize_bundle_exact_int8_to_nbits4_failure_keeps_source_and_removes_stage(
+    tmp_path, monkeypatch
+):
+    import onnxruntime as ort
+
+    source = tmp_path / "source"
+    source.mkdir()
+    weight = _write_ternary_tiny_bundle(source, signed_zero=True)
+    inventory = _write_exact_ternary_inventory(
+        tmp_path / "inventory.json", source, weight, matmul_count=196
+    )
+    exact = tmp_path / "exact-int8"
+    optimize_bundle(
+        source,
+        exact,
+        lm_method="ternary-exact-int8",
+        ternary_inventory_path=inventory,
+    )
+    exact_files = {
+        path.relative_to(exact).as_posix(): path.read_bytes()
+        for path in exact.rglob("*")
+        if path.is_file()
+    }
+    output = tmp_path / "q4-failed"
+
+    def fail_session(*args, **kwargs):
+        raise RuntimeError("injected q4 ORT failure")
+
+    monkeypatch.setattr(ort, "InferenceSession", fail_session)
+    with pytest.raises(RuntimeError, match="injected q4 ORT failure"):
+        optimize_bundle(
+            exact,
+            output,
+            lm_method="ternary-exact-int8-to-nbits4",
+            nbits_block_size=32,
+        )
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".q4-failed.*.partial"))
+    assert {
+        path.relative_to(exact).as_posix(): path.read_bytes()
+        for path in exact.rglob("*")
+        if path.is_file()
+    } == exact_files
+
+
 
 def test_optimize_bundle_preserves_existing_output(tmp_path):
     source = tmp_path / "source"
@@ -889,3 +1017,99 @@ def test_optimize_bundle_ternary_exact_int8_include_selects_only_requested_nodes
     assert exact_storage["node_count"] == 1
     assert exact_storage["source_fp32_bytes_replaced"] == 0
     assert exact_storage["storage_reduction_bytes"] == -264
+
+
+
+def test_optimize_bundle_v2_builds_q4_and_preserves_variant_provenance(tmp_path):
+    import onnxruntime as ort
+
+    source = tmp_path / "source-v2"
+    source.mkdir()
+    _write_ternary_tiny_bundle(source)
+    lm_dir = source / "lm"
+    vocabulary_path = lm_dir / "vocabulary.bf16.npy"
+    np.save(vocabulary_path, np.zeros((3, 8), dtype=np.uint16), allow_pickle=False)
+    head_graph = helper.make_graph(
+        [],
+        "shared-head",
+        [
+            helper.make_tensor_value_info("hidden_states", TensorProto.FLOAT, [1, 8]),
+            helper.make_tensor_value_info("vocabulary_weight", TensorProto.FLOAT, [3, 8]),
+        ],
+        [helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, 3])],
+    )
+    head_model = helper.make_model(head_graph, opset_imports=[helper.make_opsetid("", 18)])
+    head_model.ir_version = min(head_model.ir_version, 10)
+    onnx.save_model(head_model, str(lm_dir / "lm_output.onnx"))
+
+    source_hash = "a" * 64
+    minimum_runtime = ort.__version__
+    metadata_path = lm_dir / "lm.meta.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "input_mode": "inputs_embeds",
+            "vocabulary_mode": "shared",
+            "hidden_size": 8,
+            "vocab_size": 3,
+            "embedding_file": vocabulary_path.name,
+            "embedding_storage_dtype": "bfloat16-u16",
+            "embedding_runtime_dtype": "float32",
+            "source_model_revision": "model-v2",
+            "source_weight_variant": "packed",
+            "source_weight_sha256": source_hash,
+            "onnxruntime_min_tested_version": minimum_runtime,
+            "output_head_file": "lm_output.onnx",
+            "output_head_input_names": ["hidden_states", "vocabulary_weight"],
+            "output_head_output_names": ["logits"],
+            "output_head_input_shapes": {
+                "hidden_states": [None, 8],
+                "vocabulary_weight": [3, 8],
+            },
+            "output_head_output_shape": [None, 3],
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    bundle_path = source / "bundle.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["format"] = "kitten2-onnx-bundle-v2"
+    bundle["revisions"] = {"source_model_revision": "model-v2"}
+    bundle["lm"].update(
+        {
+            "core_model": "lm/lm.onnx",
+            "head_model": "lm/lm_output.onnx",
+            "embeddings": "lm/vocabulary.bf16.npy",
+            "weight_variant": "packed",
+            "source_weight_sha256": source_hash,
+            "embedding_reconstruction_version": None,
+            "onnxruntime_min_tested_version": minimum_runtime,
+            "storage": {
+                "transformer": {"method": "float", "dtype": "float32"},
+                "vocabulary": {
+                    "method": "bfloat16-u16",
+                    "file": "lm/vocabulary.bf16.npy",
+                    "lossy": False,
+                },
+            },
+        }
+    )
+    bundle["files"] = {
+        path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(source.rglob("*"))
+        if path.is_file() and path != bundle_path
+    }
+    bundle_path.write_text(json.dumps(bundle), encoding="utf-8")
+
+    output = tmp_path / "optimized-v2"
+    report = optimize_bundle(source, output, lm_method="ternary-nbits4")
+    output_bundle = json.loads((output / "bundle.json").read_text(encoding="utf-8"))
+    output_metadata = json.loads((output / "lm/lm.meta.json").read_text(encoding="utf-8"))
+
+    assert output_bundle["format"] == "kitten2-onnx-bundle-v2"
+    assert output_bundle["lm"]["storage"]["transformer"]["bits"] == 4
+    assert output_bundle["lm"]["storage"]["transformer"]["zero_point"] == 8
+    assert output_bundle["lm"]["storage"]["transformer"]["source_weight_sha256"] == source_hash
+    assert output_metadata["quantization"]["source_weight_sha256"] == source_hash
+    assert report["quantization"]["method"] == "ternary-nbits"
+    assert report["size_report"]

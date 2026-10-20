@@ -2,16 +2,17 @@
 
 The default graph starts at ``inputs_embeds`` and keeps Kitten speaker injection
 in the runtime. An optional ``input_ids`` graph performs tied token lookup and
-position-zero speaker injection inside ONNX.
+position-zero speaker injection inside ONNX. ``--shared-vocabulary`` exports a
+vocabulary-free transformer core with a separate, I/O-bound output projection.
 
-One graph serves prefill and decode:
+The transformer graph serves prefill and decode:
 
     inputs_embeds [B, S, H]
     attention_mask [B, P + S]
     position_ids [B, S]
     past_key_i / past_value_i [B, KV, P, D]
         ->
-    logits [B, V]                       (last position only)
+    logits [B, V] or last_hidden_state [B, H]
     present_key_i / present_value_i     [B, KV, P + S, D]
 
 Prefill uses P=0; cached decode normally uses S=1.
@@ -20,6 +21,7 @@ Prefill uses P=0; cached decode normally uses S=1.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from collections.abc import Iterable
@@ -45,6 +47,15 @@ RUNTIME_PROFILES = {
     "cuda-fp16": ExportProfile(torch.float16, "float16", "float16", "CUDAExecutionProvider", False),
     "cuda-bf16": ExportProfile(torch.bfloat16, "bfloat16", "bfloat16", "CUDAExecutionProvider", False),
 }
+
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class KittenQwen3ExportWrapper(nn.Module):
@@ -88,6 +99,43 @@ class KittenQwen3ExportWrapper(nn.Module):
         flat = [tensor for layer in present for tensor in layer]
         return (logits, *flat)
 
+
+
+class KittenQwen3CoreExportWrapper(nn.Module):
+    """Export the transformer body without a tied-vocabulary output head."""
+
+    def __init__(self, model: nn.Module):
+        super().__init__()
+        self.transformer = model.model
+        if (
+            model.get_input_embeddings().weight.data_ptr()
+            != model.get_output_embeddings().weight.data_ptr()
+        ):
+            raise ValueError("Shared vocabulary export requires tied input and output embeddings")
+        self.num_layers = int(model.config.num_hidden_layers)
+
+    def forward(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, ...]:
+        from transformers.cache_utils import DynamicCache
+
+        legacy = tuple((past[2 * i], past[2 * i + 1]) for i in range(self.num_layers))
+        cache = DynamicCache.from_legacy_cache(legacy)
+        out = self.transformer(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=cache,
+            use_cache=True,
+        )
+        last_hidden = out.last_hidden_state[:, -1, :]
+        present = out.past_key_values.to_legacy_cache()
+        flat = [tensor for layer in present for tensor in layer]
+        return (last_hidden, *flat)
 
 
 class KittenQwen3InputIdsExportWrapper(nn.Module):
@@ -144,6 +192,38 @@ def _io_names(num_layers: int) -> tuple[list[str], list[str]]:
     return past, present
 
 
+
+def _export_shared_vocabulary_head(
+    output_path: Path, *, vocab_size: int, hidden_size: int, opset: int
+) -> Path:
+    import onnx
+    from onnx import TensorProto, helper
+
+    hidden = helper.make_tensor_value_info(
+        "hidden_states", TensorProto.FLOAT, ["batch", hidden_size]
+    )
+    vocabulary = helper.make_tensor_value_info(
+        "vocabulary_weight", TensorProto.FLOAT, [vocab_size, hidden_size]
+    )
+    logits = helper.make_tensor_value_info("logits", TensorProto.FLOAT, ["batch", vocab_size])
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "Transpose", ["vocabulary_weight"], ["vocabulary_transposed"], perm=[1, 0]
+            ),
+            helper.make_node("MatMul", ["hidden_states", "vocabulary_transposed"], ["logits"]),
+        ],
+        "kitten_shared_vocabulary_output_head",
+        [hidden, vocabulary],
+        [logits],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)])
+    model.ir_version = min(model.ir_version, 10)
+    onnx.checker.check_model(model)
+    onnx.save_model(model, str(output_path))
+    return output_path
+
+
 def _dummy_inputs(config, dtype: torch.dtype, seq: int = 4, past_len: int = 3):
     hidden = int(config.hidden_size)
     kv_heads = int(config.num_key_value_heads)
@@ -172,36 +252,64 @@ def _dummy_input_ids(config, dtype: torch.dtype, seq: int = 4, past_len: int = 3
     return input_ids, speaker_hidden, mask, pos, past
 
 
-def load_hf_lm(repo_dir: Path, dtype: torch.dtype):
-    """Load and validate the plain Kitten Qwen3 checkpoint for ONNX export."""
-    from transformers import AutoModelForCausalLM
+def load_hf_lm(
+    repo_dir: Path, dtype: torch.dtype, *, weight_variant: str = "full"
+):
+    """Load a full or upstream ternary Kitten Qwen3 checkpoint for ONNX export."""
+    from transformers import AutoConfig, AutoModelForCausalLM
 
     repo_dir = Path(repo_dir)
     lm_dir = repo_dir / "lm"
     config_path = lm_dir / "config.json"
-    checkpoint_path = lm_dir / "model.safetensors"
     if not config_path.is_file():
         raise FileNotFoundError(f"Kitten LM config not found: {config_path}")
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Plain Kitten LM checkpoint not found: {checkpoint_path}")
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    if config.get("model_type") != "qwen3":
+    config_values = json.loads(config_path.read_text(encoding="utf-8"))
+    if config_values.get("model_type") != "qwen3":
         raise ValueError(f"Expected a Qwen3 checkpoint in {lm_dir}")
+    if weight_variant == "plain":
+        weight_variant = "full"
+    if weight_variant not in {"full", "packed", "emb4"}:
+        raise ValueError("weight_variant must be 'full', 'packed', or 'emb4'")
 
-    model, loading_info = AutoModelForCausalLM.from_pretrained(
-        str(lm_dir),
-        dtype=dtype,
-        attn_implementation="eager",
-        low_cpu_mem_usage=True,
-        local_files_only=True,
-        output_loading_info=True,
-    )
-    missing = set(loading_info["missing_keys"])
+    if weight_variant == "full":
+        checkpoint_path = lm_dir / "model.safetensors"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Plain Kitten LM checkpoint not found: {checkpoint_path}")
+        model, loading_info = AutoModelForCausalLM.from_pretrained(
+            str(lm_dir),
+            dtype=dtype,
+            attn_implementation="eager",
+            low_cpu_mem_usage=True,
+            local_files_only=True,
+            output_loading_info=True,
+        )
+        missing = set(loading_info["missing_keys"])
+        unexpected = {
+            name for name in loading_info["unexpected_keys"] if not name.startswith("spk_proj.")
+        }
+    else:
+        from accelerate import init_empty_weights
+
+        from kitten2_onnx.weights import load_lm_state_dict, resolve_weight_path
+
+        checkpoint_path = resolve_weight_path(repo_dir, weight_variant)
+        if checkpoint_path is None or not checkpoint_path.is_file():
+            raise FileNotFoundError(f"No {weight_variant!r} LM checkpoint found in {repo_dir}")
+        config = AutoConfig.from_pretrained(str(lm_dir), local_files_only=True)
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(config, attn_implementation="eager")
+        state = {
+            name: tensor.to(dtype=dtype)
+            for name, tensor in load_lm_state_dict(repo_dir, variant=weight_variant).items()
+            if not name.startswith("spk_proj.")
+        }
+        loading_info = model.load_state_dict(state, strict=False, assign=True)
+        missing = set(loading_info.missing_keys)
+        unexpected = set(loading_info.unexpected_keys)
+        del state
+
     if model.config.tie_word_embeddings:
         missing.discard("lm_head.weight")
-    unexpected = {
-        name for name in loading_info["unexpected_keys"] if not name.startswith("spk_proj.")
-    }
     if missing:
         raise ValueError(f"Missing transformer checkpoint weights: {sorted(missing)}")
     if unexpected:
@@ -215,7 +323,6 @@ def load_hf_lm(repo_dir: Path, dtype: torch.dtype):
             raise ValueError("Qwen3 input and output embeddings are not tied")
     model.eval()
     return model
-
 
 def save_embedding_table(
     model: nn.Module, output_dir: Path, *, source_dtype: str
@@ -421,6 +528,8 @@ def export_lm(
     *,
     profile_name: str = "dev-fp32",
     input_mode: str = "inputs_embeds",
+    shared_vocabulary: bool = False,
+    weight_variant: str = "full",
     opset: int = 18,
     diagnostics_dir: str | Path | None = None,
 ) -> Path:
@@ -433,28 +542,52 @@ def export_lm(
 
     if input_mode not in {"inputs_embeds", "input_ids"}:
         raise ValueError("input_mode must be 'inputs_embeds' or 'input_ids'")
+    if shared_vocabulary and input_mode != "inputs_embeds":
+        raise ValueError("shared_vocabulary requires input_mode='inputs_embeds'")
+
+    if weight_variant == "plain":
+        weight_variant = "full"
+    if weight_variant not in {"full", "packed", "emb4"}:
+        raise ValueError("weight_variant must be 'full', 'packed', or 'emb4'")
+    if weight_variant != "full" and not shared_vocabulary:
+        raise ValueError("packed and emb4 variants require shared_vocabulary=True")
+    if weight_variant != "full" and profile_name != "dev-fp32":
+        raise ValueError("packed and emb4 variants require the dev-fp32 CPU export profile")
     repo_dir = Path(repo_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     lm_dir = repo_dir / "lm"
-    checkpoint_path = lm_dir / "model.safetensors"
+    if weight_variant == "full":
+        checkpoint_path = lm_dir / "model.safetensors"
+    else:
+        from kitten2_onnx.weights import resolve_weight_path
+
+        checkpoint_path = resolve_weight_path(repo_dir, weight_variant)
+        if checkpoint_path is None:
+            raise FileNotFoundError(f"No {weight_variant!r} LM checkpoint is declared in {repo_dir}")
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"LM checkpoint not found: {checkpoint_path}")
     source_config = json.loads((lm_dir / "config.json").read_text(encoding="utf-8"))
     source_dtype = str(source_config.get("dtype", source_config.get("torch_dtype", "unknown")))
     revision_path = repo_dir / "model_revision.json"
     revision = json.loads(revision_path.read_text(encoding="utf-8")) if revision_path.is_file() else {}
 
-    model = load_hf_lm(repo_dir, profile.graph_dtype)
+    model = load_hf_lm(repo_dir, profile.graph_dtype, weight_variant=weight_variant)
     config = model.config
     past_names, present_names = _io_names(int(config.num_hidden_layers))
     if input_mode == "inputs_embeds":
-        wrapper = KittenQwen3ExportWrapper(model).eval()
+        wrapper = (
+            KittenQwen3CoreExportWrapper(model)
+            if shared_vocabulary
+            else KittenQwen3ExportWrapper(model)
+        ).eval()
         input_names = ["inputs_embeds", "attention_mask", "position_ids", *past_names]
         dummy = _dummy_inputs(config, dtype=profile.graph_dtype, seq=4, past_len=3)
     else:
         wrapper = KittenQwen3InputIdsExportWrapper(model).eval()
         input_names = ["input_ids", "speaker_hidden", "attention_mask", "position_ids", *past_names]
         dummy = _dummy_input_ids(config, dtype=profile.graph_dtype, seq=4, past_len=3)
-    output_names = ["logits", *present_names]
+    output_names = ["last_hidden_state" if shared_vocabulary else "logits", *present_names]
 
     batch_dim = torch.export.Dim("batch", min=1)
     seq_dim = torch.export.Dim("seq", min=1)
@@ -489,6 +622,25 @@ def export_lm(
         dynamo=True,
         external_data=True,
     )
+    shared_metadata = {}
+    if shared_vocabulary:
+        output_head_path = _export_shared_vocabulary_head(
+            output_dir / "lm_output.onnx",
+            vocab_size=int(config.vocab_size),
+            hidden_size=int(config.hidden_size),
+            opset=opset,
+        )
+        shared_metadata = {
+            "vocabulary_mode": "shared",
+            "output_head_file": output_head_path.name,
+            "output_head_input_names": ["hidden_states", "vocabulary_weight"],
+            "output_head_output_names": ["logits"],
+            "output_head_input_shapes": {
+                "hidden_states": [None, int(config.hidden_size)],
+                "vocabulary_weight": [int(config.vocab_size), int(config.hidden_size)],
+            },
+            "output_head_output_shape": [None, int(config.vocab_size)],
+        }
     if input_mode == "input_ids":
         _share_tied_vocabulary_weight(
             output_path,
@@ -498,13 +650,37 @@ def export_lm(
 
     embedding_metadata = {}
     if input_mode == "inputs_embeds":
-        embedding_path, embedding_storage_dtype = save_embedding_table(
-            model, output_dir, source_dtype=source_dtype
-        )
+        if weight_variant == "emb4":
+            from kitten2_onnx.tl2_emb4 import (
+                EMB4_RECONSTRUCTION_VERSION,
+                write_emb4_embedding_asset,
+            )
+
+            embedding_path = write_emb4_embedding_asset(
+                checkpoint_path, output_dir / "vocabulary.emb4.safetensors"
+            )
+            embedding_storage_dtype = "kitten-emb4"
+        else:
+            embedding_path, embedding_storage_dtype = save_embedding_table(
+                model, output_dir, source_dtype=source_dtype
+            )
         embedding_metadata = {
             "embedding_file": embedding_path.name,
             "embedding_storage_dtype": embedding_storage_dtype,
             "embedding_runtime_dtype": profile.io_dtype,
+        }
+    variant_metadata = {}
+    if weight_variant != "full":
+        import onnxruntime as ort
+
+        variant_metadata = {
+            "source_weight_variant": weight_variant,
+            "source_weight_file": checkpoint_path.resolve().relative_to(repo_dir.resolve()).as_posix(),
+            "source_weight_sha256": _sha256(checkpoint_path),
+            "embedding_reconstruction_version": (
+                EMB4_RECONSTRUCTION_VERSION if weight_variant == "emb4" else None
+            ),
+            "onnxruntime_min_tested_version": ort.__version__,
         }
     meta = {
         "format": "kitten2-onnx-lm-v1",
@@ -530,6 +706,8 @@ def export_lm(
         "opset": int(opset),
         "input_mode": input_mode,
         **embedding_metadata,
+        **variant_metadata,
+        **shared_metadata,
         "input_names": input_names,
         "output_names": output_names,
     }
@@ -545,6 +723,12 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument(
         "--input-mode", choices=("inputs_embeds", "input_ids"), default="inputs_embeds"
     )
+    parser.add_argument(
+        "--shared-vocabulary",
+        action="store_true",
+        help="Export a vocabulary-free transformer core and separate output-head graph",
+    )
+    parser.add_argument("--weights", choices=("full", "packed", "emb4"), default="full")
     parser.add_argument("--opset", type=int, default=18)
     args = parser.parse_args(argv)
 
@@ -553,6 +737,8 @@ def main(argv: Iterable[str] | None = None) -> None:
         args.output,
         profile_name=args.profile,
         input_mode=args.input_mode,
+        shared_vocabulary=args.shared_vocabulary,
+        weight_variant=args.weights,
         opset=args.opset,
     )
     print(path)

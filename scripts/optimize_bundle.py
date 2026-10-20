@@ -462,6 +462,114 @@ def _quantize_lm_ternary_nbits4(
     )
     return metadata["quantization"]
 
+def _quantize_lm_ternary_exact_int8_to_nbits4(
+    bundle_dir: Path,
+    bundle: dict[str, Any],
+    *,
+    block_size: int,
+    accuracy_level: int,
+    exclude_nodes: Sequence[str] = (),
+    exclude_initializers: Sequence[str] = (),
+) -> dict[str, Any]:
+    import platform
+    import subprocess
+
+    import onnx
+    import onnxruntime as ort
+
+    from kitten2_onnx.quantize_ternary_nbits import TernaryNBitsConfig
+    from kitten2_onnx.ternary_exact_storage import (
+        transcode_exact_ternary_matmuls_to_nbits4_streaming,
+    )
+
+    lm_entry = bundle["lm"]
+    lm_meta_path = _bundle_path(bundle_dir, lm_entry["metadata"])
+    lm_model_path = _bundle_path(bundle_dir, lm_entry["model"])
+    metadata = json.loads(lm_meta_path.read_text(encoding="utf-8"))
+    exact_storage_metadata = metadata.get("quantization")
+    if not isinstance(exact_storage_metadata, dict):
+        raise TypeError("LM metadata has no exact ternary storage record")
+    if metadata.get("runtime_provider") != "CPUExecutionProvider":
+        raise ValueError("Exact ternary INT8 to q4 conversion requires a CPU deployment bundle")
+    if metadata.get("io_dtype") != "float32":
+        raise ValueError("Exact ternary INT8 to q4 conversion requires float32 graph I/O")
+
+    source_graph = onnx.load(str(lm_model_path), load_external_data=False)
+    source_locations = _all_external_locations(source_graph)
+    source_paths = {_bundle_path(lm_model_path.parent, location) for location in source_locations}
+    referenced_before = _bundle_external_paths(bundle_dir)
+    _, external_path, stale_candidates = _ternary_external_location(
+        lm_model_path,
+        referenced_before,
+    )
+    temporary_graph = lm_model_path.with_name(f".lm.nbits4-{uuid.uuid4().hex}.tmp.onnx")
+
+    try:
+        transformation = transcode_exact_ternary_matmuls_to_nbits4_streaming(
+            lm_model_path,
+            temporary_graph,
+            external_path,
+            exact_storage_metadata=exact_storage_metadata,
+            config=TernaryNBitsConfig(
+                bits=4,
+                block_size=block_size,
+                accuracy_level=accuracy_level,
+            ),
+            exclude_nodes=set(exclude_nodes),
+            exclude_initializers=set(exclude_initializers),
+        )
+        candidate_graph = onnx.load(str(temporary_graph), load_external_data=False)
+        quantized_locations = _all_external_locations(candidate_graph)
+        for location in quantized_locations:
+            external_file = _bundle_path(lm_model_path.parent, location)
+            if not external_file.is_file():
+                raise FileNotFoundError(f"q4 ONNX external data is missing: {external_file}")
+        onnx.checker.check_model(str(temporary_graph))
+        ort.InferenceSession(str(temporary_graph), providers=["CPUExecutionProvider"])
+        os.replace(temporary_graph, lm_model_path)
+    except BaseException:
+        temporary_graph.unlink(missing_ok=True)
+        external_path.unlink(missing_ok=True)
+        raise
+
+    referenced_after = _bundle_external_paths(bundle_dir)
+    stale_paths = (source_paths | set(stale_candidates)) - referenced_after
+    for stale_path in sorted(stale_paths):
+        if stale_path.is_file():
+            stale_path.unlink()
+
+    project_root = Path(__file__).resolve().parents[1]
+    repository_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    metadata["external_data"] = bool(quantized_locations)
+    metadata["external_data_files"] = sorted(quantized_locations)
+    metadata["quantization"] = {
+        **transformation,
+        "method": "ternary-exact-int8-to-nbits4",
+        "backend": "streaming",
+        "provenance": {
+            "onnx_version": onnx.__version__,
+            "onnxruntime_version": ort.__version__,
+            "python_version": platform.python_version(),
+            "cpu_architecture": platform.machine(),
+            "source_model_revision": exact_storage_metadata.get("provenance", {}).get(
+                "source_model_revision", metadata.get("source_model_revision")
+            ),
+            "repository_commit": repository_commit,
+        },
+    }
+    lm_meta_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return metadata["quantization"]
+
+
 def _quantize_lm_ternary_exact_int8(
     bundle_dir: Path,
     bundle: dict[str, Any],
@@ -754,6 +862,7 @@ def _optimize_bundle_build(
         "ternary-nbits",
         "ternary-nbits4",
         "ternary-exact-int8",
+        "ternary-exact-int8-to-nbits4",
     ):
         raise ValueError(f"Unsupported LM optimization method: {lm_method!r}")
     if (
@@ -762,6 +871,7 @@ def _optimize_bundle_build(
             "ternary-nbits",
             "ternary-nbits4",
             "ternary-exact-int8",
+            "ternary-exact-int8-to-nbits4",
         )
         and (exclude_matmul_nodes or exclude_matmul_initializers)
     ):
@@ -773,8 +883,15 @@ def _optimize_bundle_build(
 
     input_bundle_path = input_root / "bundle.json"
     bundle = json.loads(input_bundle_path.read_text(encoding="utf-8"))
-    if bundle.get("format") != "kitten2-onnx-bundle-v1":
+    if bundle.get("format") not in {"kitten2-onnx-bundle-v1", "kitten2-onnx-bundle-v2"}:
         raise ValueError("Unsupported bundle format")
+    if bundle["format"] == "kitten2-onnx-bundle-v2":
+        if bundle.get("lm", {}).get("weight_variant") not in {"packed", "emb4"}:
+            raise ValueError("Bundle v2 requires a packed or emb4 LM weight variant")
+        if lm_method != "ternary-nbits4" or nbits != 4:
+            raise ValueError("Packed and emb4 bundle v2 builds require q4 ternary-nbits4 optimization")
+        if exclude_matmul_nodes or exclude_matmul_initializers:
+            raise ValueError("Packed and emb4 bundle v2 builds require all transformer MatMuls to use q4")
     source_size = sum(path.stat().st_size for path in input_root.rglob("*") if path.is_file())
     if lm_method == "ternary-exact-int8":
         _copy_bundle_for_exact_ternary(input_root, output_root, bundle)
@@ -804,6 +921,17 @@ def _optimize_bundle_build(
             include_nodes=include_matmul_nodes,
             progress_path=progress_path,
         )
+    elif lm_method == "ternary-exact-int8-to-nbits4":
+        if nbits != 4:
+            raise ValueError("ternary-exact-int8-to-nbits4 requires --nbits 4")
+        quantization = _quantize_lm_ternary_exact_int8_to_nbits4(
+            output_root,
+            bundle,
+            block_size=nbits_block_size,
+            accuracy_level=nbits_accuracy_level,
+            exclude_nodes=exclude_matmul_nodes,
+            exclude_initializers=exclude_matmul_initializers,
+        )
     else:
         quantization = _quantize_lm_ternary_nbits4(
             output_root,
@@ -814,6 +942,28 @@ def _optimize_bundle_build(
             exclude_nodes=exclude_matmul_nodes,
             exclude_initializers=exclude_matmul_initializers,
         )
+    if bundle["format"] == "kitten2-onnx-bundle-v2":
+        lm_meta_path = _bundle_path(output_root, bundle["lm"]["metadata"])
+        lm_metadata = json.loads(lm_meta_path.read_text(encoding="utf-8"))
+        quantization["source_weight_sha256"] = bundle["lm"]["source_weight_sha256"]
+        quantization["provenance"]["source_weight_sha256"] = bundle["lm"][
+            "source_weight_sha256"
+        ]
+        quantization["provenance"]["source_weight_variant"] = bundle["lm"]["weight_variant"]
+        lm_metadata["quantization"] = quantization
+        lm_meta_path.write_text(
+            json.dumps(lm_metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        bundle["lm"]["storage"]["transformer"] = {
+            "method": "matmul-nbits",
+            "bits": 4,
+            "block_size": quantization["block_size"],
+            "source_group_size": quantization.get("source_group_size", 128),
+            "zero_point": 8,
+            "source_weight_sha256": bundle["lm"]["source_weight_sha256"],
+            "source_graph_sha256": quantization["source_graph_sha256"],
+            "graph_sha256": quantization["graph_sha256"],
+        }
     export_metadata = bundle.get("export")
     if not isinstance(export_metadata, dict):
         raise TypeError("Bundle export metadata must be an object")
@@ -982,6 +1132,7 @@ def main() -> None:
             "ternary-nbits",
             "ternary-nbits4",
             "ternary-exact-int8",
+            "ternary-exact-int8-to-nbits4",
         ),
         required=True,
     )

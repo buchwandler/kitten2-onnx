@@ -31,6 +31,35 @@ def _repo_path(value: str, base: PurePosixPath | None = None) -> str:
     return (base / path).as_posix()
 
 
+def weight_files(config: dict[str, Any], variant: str, available_files: set[str]) -> set[str]:
+    if variant == "full":
+        lm_dir = PurePosixPath(_repo_path(str(config.get("lm_dir", "lm"))))
+        selected = {
+            path
+            for path in available_files
+            if PurePosixPath(path).parent == lm_dir
+            and (
+                PurePosixPath(path).name == "model.safetensors"
+                or PurePosixPath(path).name.startswith("model-")
+                and "-of-" in PurePosixPath(path).name
+                and PurePosixPath(path).suffix == ".safetensors"
+            )
+        }
+        if not selected:
+            raise ValueError(f"No full LM SafeTensors payload found under {lm_dir}")
+        return selected
+    if variant not in {"packed", "emb4"}:
+        raise ValueError("weights must be one of 'full', 'packed', or 'emb4'")
+    key = "lm_packed" if variant == "packed" else "lm_emb4"
+    name = config.get(key)
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"The reference config declares no {variant!r} LM weights")
+    path = _repo_path(name)
+    if path not in available_files:
+        raise ValueError(f"Selected {variant!r} LM payload is missing: {path}")
+    return {path}
+
+
 def voice_files(
     config: dict[str, Any],
     voice_index: dict[str, Any],
@@ -76,8 +105,11 @@ def voice_files(
 
     missing = sorted(files - available_files)
     if missing:
-        raise ValueError("Selected voice assets are missing from this revision: " + ", ".join(missing))
+        raise ValueError(
+            "Selected voice assets are missing from this revision: " + ", ".join(missing)
+        )
     return files
+
 
 def all_voice_files(
     config: dict[str, Any],
@@ -90,18 +122,24 @@ def all_voice_files(
     return files
 
 
-
 def download_model(
     repo_id: str,
     revision: str,
     output: Path,
     *,
-    plain_lm: bool,
-    voice: str | None,
+    plain_lm: bool = False,
+    voice: str | None = None,
     all_voices: bool = False,
+    weights: str | None = None,
 ) -> dict[str, Any]:
     if voice is not None and all_voices:
         raise ValueError("Select either one voice or all voices, not both")
+    if plain_lm:
+        if weights is not None:
+            raise ValueError("Use either plain_lm or weights, not both")
+        weights = "full"
+    if weights is not None and weights not in {"full", "packed", "emb4"}:
+        raise ValueError("weights must be one of 'full', 'packed', or 'emb4'")
 
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
@@ -112,12 +150,14 @@ def download_model(
 
     files = set(BASE_FILES)
     selected_voices: list[str] = []
-    if plain_lm:
-        files.add("lm/model.safetensors")
-
-    if voice is not None or all_voices:
+    config = None
+    if weights is not None or voice is not None or all_voices:
         config_path = hf_hub_download(repo_id, "config.json", revision=resolved_revision)
         config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    if weights is not None:
+        files.update(weight_files(config, weights, available_files))
+
+    if voice is not None or all_voices:
         index_path = _repo_path(str(config.get("voices", "voices/voices.json")))
         index_local_path = hf_hub_download(repo_id, index_path, revision=resolved_revision)
         voice_index = json.loads(Path(index_local_path).read_text(encoding="utf-8"))
@@ -126,7 +166,6 @@ def download_model(
             files.update(all_voice_files(config, voice_index, available_files))
         else:
             files.update(voice_files(config, voice_index, voice, available_files))
-
     missing = sorted(files - available_files)
     if missing:
         raise ValueError("Required files are missing from this revision: " + ", ".join(missing))
@@ -145,6 +184,7 @@ def download_model(
         "source_model_revision": resolved_revision,
         "upstream_code_revision": UPSTREAM_CODE_REVISION,
         "downloaded_files": sorted(files),
+        "weight_variant": weights,
         "voice": voice,
         "voices": selected_voices,
     }
@@ -153,15 +193,30 @@ def download_model(
     )
     return manifest
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Download a pinned KittenTTS 2 reference model.")
-    parser.add_argument("repo_id", help="Hugging Face model repository, for example KittenML/kitten-tts-2")
+    parser.add_argument(
+        "repo_id", help="Hugging Face model repository, for example KittenML/kitten-tts-2"
+    )
     parser.add_argument("--revision", required=True, help="Pinned branch, tag, or commit revision")
     parser.add_argument("--output", type=Path, required=True, help="Local output directory")
-    parser.add_argument("--plain-lm", action="store_true", help="Download lm/model.safetensors")
+    weights_group = parser.add_mutually_exclusive_group()
+    weights_group.add_argument(
+        "--weights", choices=("full", "packed", "emb4"), help="Download one LM weight variant"
+    )
+    weights_group.add_argument(
+        "--plain-lm", action="store_true", help="Compatibility alias for --weights full"
+    )
     voice_group = parser.add_mutually_exclusive_group()
-    voice_group.add_argument("--voice", help="Also download one built-in voice and its selected decoder assets")
-    voice_group.add_argument("--all-voices", action="store_true", help="Download every built-in voice reference and the shared decoder")
+    voice_group.add_argument(
+        "--voice", help="Also download one built-in voice and its selected decoder assets"
+    )
+    voice_group.add_argument(
+        "--all-voices",
+        action="store_true",
+        help="Download every built-in voice reference and the shared decoder",
+    )
     args = parser.parse_args()
 
     manifest = download_model(
@@ -169,6 +224,7 @@ def main() -> None:
         args.revision,
         args.output,
         plain_lm=args.plain_lm,
+        weights=args.weights,
         voice=args.voice,
         all_voices=args.all_voices,
     )

@@ -40,7 +40,7 @@ class Kitten2OnnxTTS:
         self.bundle: dict[str, Any] = json.loads(
             (self.bundle_dir / "bundle.json").read_text(encoding="utf-8")
         )
-        if self.bundle.get("format") != "kitten2-onnx-bundle-v1":
+        if self.bundle.get("format") not in {"kitten2-onnx-bundle-v1", "kitten2-onnx-bundle-v2"}:
             raise ValueError("Unsupported Kitten2 ONNX bundle format")
         self.token_map = TokenMap.from_config({"token_map": self.bundle["token_map"]})
         self.tokenizer = AutoTokenizer.from_pretrained(

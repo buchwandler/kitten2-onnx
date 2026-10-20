@@ -27,8 +27,6 @@ from kitten2_onnx.quantize_int8_streaming import ExternalDataWriter
 
 SOURCE_GROUP_SIZE = 128
 BLOCK_SIZE = SOURCE_GROUP_SIZE  # Backwards-compatible name for the exact source group.
-BITS = 4
-ZERO_POINT = 8
 SUPPORTED_BLOCK_SIZES = (16, 32, 64, 128)
 
 
@@ -40,8 +38,8 @@ class TernaryNBitsConfig:
     accuracy_level: int = 1
 
     def __post_init__(self) -> None:
-        if self.bits != 4:
-            raise ValueError(f"only 4-bit ternary NBits is supported, found {self.bits}")
+        if self.bits not in (2, 4):
+            raise ValueError(f"bits must be 2 or 4, found {self.bits}")
         if self.source_group_size != SOURCE_GROUP_SIZE:
             raise ValueError(
                 f"source_group_size must remain {SOURCE_GROUP_SIZE}, found {self.source_group_size}"
@@ -58,8 +56,57 @@ class TernaryNBitsConfig:
             raise ValueError(f"accuracy_level must be 0 or 1, found {self.accuracy_level}")
 
 
+ZERO_POINTS = {2: 1, 4: 8}
+
+
+def codes_per_byte(bits: int) -> int:
+    if bits not in ZERO_POINTS:
+        raise ValueError(f"bits must be 2 or 4, found {bits}")
+    return 8 // bits
+
+
+def pack_codes(codes: np.ndarray, bits: int) -> np.ndarray:
+    """Pack low-bit-first unsigned codes into bytes."""
+    lanes = codes_per_byte(bits)
+    codes = np.asarray(codes)
+    if codes.dtype.kind not in "iu":
+        raise TypeError(f"codes must have an integer dtype, found {codes.dtype}")
+    if codes.ndim == 0:
+        raise ValueError("codes must have at least one dimension")
+    if np.any(codes < 0) or np.any(codes >= (1 << bits)):
+        raise ValueError(f"codes must fit in {bits} bits")
+    padding = (-codes.shape[-1]) % lanes
+    if padding:
+        codes = np.pad(codes, [(0, 0)] * (codes.ndim - 1) + [(0, padding)])
+    packed = np.zeros(codes.shape[:-1] + (codes.shape[-1] // lanes,), dtype=np.uint8)
+    for lane in range(lanes):
+        packed |= (codes[..., lane::lanes].astype(np.uint8) << (lane * bits))
+    return packed
+
+
+def unpack_codes(packed: np.ndarray, bits: int, count: int) -> np.ndarray:
+    """Unpack low-bit-first unsigned codes from bytes."""
+    lanes = codes_per_byte(bits)
+    packed = np.asarray(packed)
+    if packed.dtype != np.uint8:
+        raise TypeError(f"packed codes must have dtype uint8, found {packed.dtype}")
+    if count < 0 or packed.ndim == 0 or packed.shape[-1] != (count + lanes - 1) // lanes:
+        raise ValueError(f"packed code shape is incompatible with count {count}: {packed.shape}")
+    codes = np.empty(packed.shape[:-1] + (count,), dtype=np.uint8)
+    mask = (1 << bits) - 1
+    for lane in range(lanes):
+        indices = np.arange(lane, count, lanes)
+        codes[..., indices] = (packed[..., : len(indices)] >> (lane * bits)) & mask
+    return codes
+
+
+def pack_zero_points(zero_points: np.ndarray, bits: int) -> np.ndarray:
+    """Pack per-block zero points using the same bit geometry as codes."""
+    return pack_codes(zero_points, bits)
+
+
 @dataclass(frozen=True)
-class PackedTernaryNBits4:
+class PackedTernaryNBits:
     """Packed MatMulNBits operands for a source weight shaped ``[K, N]``."""
 
     packed: np.ndarray
@@ -67,12 +114,17 @@ class PackedTernaryNBits4:
     zero_points: np.ndarray
     shape: tuple[int, int]
     block_size: int = SOURCE_GROUP_SIZE
+    bits: int = 4
 
 
-def pack_ternary_nbits4(
+# Preserve the previous public type name.
+PackedTernaryNBits4 = PackedTernaryNBits
+
+
+def pack_ternary_nbits(
     weight: np.ndarray,
     config: TernaryNBitsConfig | None = None,
-) -> PackedTernaryNBits4:
+) -> PackedTernaryNBits:
     """Pack exact source-group ternary weights into the configured NBits blocks."""
     config = config or TernaryNBitsConfig()
     weight = np.asarray(weight)
@@ -88,6 +140,7 @@ def pack_ternary_nbits4(
     if not np.isfinite(weight).all():
         raise ValueError("weight values must be finite")
 
+    zero_point = ZERO_POINTS[config.bits]
     source_groups = weight.reshape(k // config.source_group_size, config.source_group_size, n)
     source_magnitudes = np.abs(source_groups)
     source_scales = source_magnitudes.max(axis=1)
@@ -98,39 +151,38 @@ def pack_ternary_nbits4(
 
     block_count = k // config.block_size
     blocks = weight.reshape(block_count, config.block_size, n).transpose(2, 0, 1)
-    codes = np.where(blocks < 0, ZERO_POINT - 1, np.where(blocks > 0, ZERO_POINT + 1, ZERO_POINT))
-    codes = codes.astype(np.uint8, copy=False)
-    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    codes = np.where(blocks < 0, zero_point - 1, np.where(blocks > 0, zero_point + 1, zero_point))
+    packed = pack_codes(codes.astype(np.uint8, copy=False), config.bits)
 
     scales = np.repeat(
         source_scales.T,
         config.source_group_size // config.block_size,
         axis=1,
     )
-    packed_zero_points = np.zeros((n, (block_count + 1) // 2), dtype=np.uint8)
-    for block in range(block_count):
-        packed_zero_points[:, block // 2] |= np.uint8(ZERO_POINT << (4 * (block % 2)))
-
-    return PackedTernaryNBits4(
+    zero_point_blocks = np.full((n, block_count), zero_point, dtype=np.uint8)
+    packed_zero_points = pack_zero_points(zero_point_blocks, config.bits)
+    return PackedTernaryNBits(
         packed=np.ascontiguousarray(packed),
         scales=np.ascontiguousarray(scales, dtype=np.float32),
-        zero_points=packed_zero_points,
+        zero_points=np.ascontiguousarray(packed_zero_points),
         shape=(k, n),
         block_size=config.block_size,
+        bits=config.bits,
     )
 
 
-def unpack_ternary_nbits4(packed: PackedTernaryNBits4) -> np.ndarray:
-    """Reconstruct the FP32 source matrix from its exact-scale NBits4 encoding."""
+def unpack_ternary_nbits(packed: PackedTernaryNBits) -> np.ndarray:
+    """Reconstruct the FP32 source matrix from its exact-scale NBits encoding."""
     k, n = packed.shape
     block_size = packed.block_size
-    config = TernaryNBitsConfig(block_size=block_size)
+    config = TernaryNBitsConfig(bits=packed.bits, block_size=block_size)
     if k <= 0 or n <= 0 or k % config.source_group_size:
         raise ValueError(f"invalid source shape {packed.shape}")
     block_count = k // block_size
-    expected_codes_shape = (n, block_count, block_size // 2)
+    lanes = codes_per_byte(config.bits)
+    expected_codes_shape = (n, block_count, (block_size + lanes - 1) // lanes)
     expected_scales_shape = (n, block_count)
-    expected_zero_points_shape = (n, (block_count + 1) // 2)
+    expected_zero_points_shape = (n, (block_count + lanes - 1) // lanes)
     if packed.packed.dtype != np.uint8 or packed.packed.shape != expected_codes_shape:
         raise ValueError(f"packed codes must be uint8 with shape {expected_codes_shape}")
     if packed.scales.dtype != np.float32 or packed.scales.shape != expected_scales_shape:
@@ -138,31 +190,45 @@ def unpack_ternary_nbits4(packed: PackedTernaryNBits4) -> np.ndarray:
     if packed.zero_points.dtype != np.uint8 or packed.zero_points.shape != expected_zero_points_shape:
         raise ValueError(f"zero points must be uint8 with shape {expected_zero_points_shape}")
 
-    low = packed.packed & 0x0F
-    high = packed.packed >> 4
-    codes = np.empty((n, block_count, block_size), dtype=np.uint8)
-    codes[..., 0::2] = low
-    codes[..., 1::2] = high
-    if np.any((codes != ZERO_POINT - 1) & (codes != ZERO_POINT) & (codes != ZERO_POINT + 1)):
+    zero_point = ZERO_POINTS[config.bits]
+    codes = unpack_codes(packed.packed, config.bits, block_size)
+    if np.any((codes != zero_point - 1) & (codes != zero_point) & (codes != zero_point + 1)):
         raise ValueError("packed codes contain values outside the exact ternary encoding")
 
-    expected_zero_points = np.zeros(expected_zero_points_shape, dtype=np.uint8)
-    for block in range(block_count):
-        expected_zero_points[:, block // 2] |= np.uint8(ZERO_POINT << (4 * (block % 2)))
+    expected_zero_points = pack_zero_points(
+        np.full((n, block_count), zero_point, dtype=np.uint8), config.bits
+    )
     if not np.array_equal(packed.zero_points, expected_zero_points):
         raise ValueError("zero points do not match the ternary encoding")
 
-    values = (codes.astype(np.int8) - ZERO_POINT).astype(np.float32)
+    values = (codes.astype(np.int8) - zero_point).astype(np.float32)
     values *= packed.scales[..., None]
     return values.transpose(1, 2, 0).reshape(k, n)
 
-def rewrite_matmul_to_nbits4(
+
+def pack_ternary_nbits4(
+    weight: np.ndarray,
+    config: TernaryNBitsConfig | None = None,
+) -> PackedTernaryNBits:
+    config = config or TernaryNBitsConfig()
+    if config.bits != 4:
+        raise ValueError("pack_ternary_nbits4 requires bits=4")
+    return pack_ternary_nbits(weight, config)
+
+
+def unpack_ternary_nbits4(packed: PackedTernaryNBits) -> np.ndarray:
+    if packed.bits != 4:
+        raise ValueError("unpack_ternary_nbits4 requires bits=4")
+    return unpack_ternary_nbits(packed)
+
+
+def rewrite_matmul_to_nbits(
     model: onnx.ModelProto,
     *,
     config: TernaryNBitsConfig | None = None,
     node_name: str | None = None,
 ) -> onnx.ModelProto:
-    """Return a copy of a tiny model with one constant FP32 MatMul rewritten to NBits4."""
+    """Return a copy of a tiny model with one constant FP32 MatMul rewritten to NBits."""
     config = config or TernaryNBitsConfig()
     rewritten = copy.deepcopy(model)
     matmuls = [node for node in rewritten.graph.node if node.op_type == "MatMul"]
@@ -185,7 +251,7 @@ def rewrite_matmul_to_nbits4(
     if weight_tensor.data_type != TensorProto.FLOAT:
         raise TypeError("target MatMul weight initializer must be float32")
 
-    packed = pack_ternary_nbits4(numpy_helper.to_array(weight_tensor), config)
+    packed = pack_ternary_nbits(numpy_helper.to_array(weight_tensor), config)
     used_names = {
         name
         for graph_node in rewritten.graph.node
@@ -204,9 +270,10 @@ def rewrite_matmul_to_nbits4(
         used_names.add(candidate)
         return candidate
 
-    packed_name = unique_name(f"{weight_name}_nbits4")
-    scales_name = unique_name(f"{weight_name}_nbits4_scales")
-    zero_points_name = unique_name(f"{weight_name}_nbits4_zero_points")
+    suffix = f"nbits{config.bits}"
+    packed_name = unique_name(f"{weight_name}_{suffix}")
+    scales_name = unique_name(f"{weight_name}_{suffix}_scales")
+    zero_points_name = unique_name(f"{weight_name}_{suffix}_zero_points")
     packed_tensor = numpy_helper.from_array(packed.packed, name=packed_name)
     scales_tensor = numpy_helper.from_array(packed.scales.reshape(-1), name=scales_name)
     zero_points_tensor = numpy_helper.from_array(packed.zero_points.reshape(-1), name=zero_points_name)
@@ -225,7 +292,7 @@ def rewrite_matmul_to_nbits4(
         "MatMulNBits",
         [node.input[0], packed_name, scales_name, zero_points_name],
         list(node.output),
-        name=f"{node.name}_nbits4" if node.name else "MatMulNBits4",
+        name=f"{node.name}_{suffix}" if node.name else f"MatMulNBits{config.bits}",
         domain="com.microsoft",
         K=k,
         N=n,
@@ -240,6 +307,30 @@ def rewrite_matmul_to_nbits4(
     if not any(opset.domain == "com.microsoft" for opset in rewritten.opset_import):
         rewritten.opset_import.append(helper.make_opsetid("com.microsoft", 1))
     return rewritten
+
+
+def rewrite_matmul_to_nbits4(
+    model: onnx.ModelProto,
+    *,
+    config: TernaryNBitsConfig | None = None,
+    node_name: str | None = None,
+) -> onnx.ModelProto:
+    config = config or TernaryNBitsConfig()
+    if config.bits != 4:
+        raise ValueError("rewrite_matmul_to_nbits4 requires bits=4")
+    return rewrite_matmul_to_nbits(model, config=config, node_name=node_name)
+
+
+def rewrite_matmul_to_nbits2(
+    model: onnx.ModelProto,
+    *,
+    config: TernaryNBitsConfig | None = None,
+    node_name: str | None = None,
+) -> onnx.ModelProto:
+    config = config or TernaryNBitsConfig(bits=2)
+    if config.bits != 2:
+        raise ValueError("rewrite_matmul_to_nbits2 requires bits=2")
+    return rewrite_matmul_to_nbits(model, config=config, node_name=node_name)
 
 
 @dataclass(frozen=True)
@@ -361,6 +452,7 @@ def _encode_weight_to_external(
     block_count = k // config.block_size
     blocks_per_source_group = config.source_group_size // config.block_size
     packed_block_bytes = config.block_size * config.bits // 8
+    zero_point = ZERO_POINTS[config.bits]
     packed_name, scales_name, zero_points_name = names
     code_digest = hashlib.sha256()
     scale_digest = hashlib.sha256()
@@ -390,15 +482,17 @@ def _encode_weight_to_external(
                 source_block = source_group[:, block_start : block_start + config.block_size]
                 codes = np.where(
                     source_block < 0,
-                    ZERO_POINT - 1,
-                    np.where(source_block > 0, ZERO_POINT + 1, ZERO_POINT),
+                    zero_point - 1,
+                    np.where(source_block > 0, zero_point + 1, zero_point),
                 ).astype(np.uint8, copy=False)
-                packed_columns[:, block_index, :] = codes[:, 0::2] | (codes[:, 1::2] << 4)
+                packed_columns[:, block_index, :] = pack_codes(codes, config.bits)
                 scales[n_start:n_end, block_index] = group_scales
-                reconstructed = (codes.astype(np.int8) - ZERO_POINT).astype(np.float32)
+                reconstructed = (codes.astype(np.int8) - zero_point).astype(np.float32)
                 reconstructed *= group_scales[:, None]
                 if not np.array_equal(reconstructed, source_block):
-                    raise ValueError(f"NBits4 weight reconstruction differs from source: {weight_name}")
+                    raise ValueError(
+                        f"NBits{config.bits} weight reconstruction differs from source: {weight_name}"
+                    )
                 signed_zero_differences += int(
                     np.count_nonzero(
                         (source_block == 0)
@@ -417,9 +511,8 @@ def _encode_weight_to_external(
     scale_digest.update(scale_bytes)
     scale_offset, scale_length = writer.finish_tensor(scale_offset)
 
-    zero_points = np.zeros((n, (block_count + 1) // 2), dtype=np.uint8)
-    for block_index in range(block_count):
-        zero_points[:, block_index // 2] |= np.uint8(ZERO_POINT << (4 * (block_index % 2)))
+    zero_point_blocks = np.full((n, block_count), zero_point, dtype=np.uint8)
+    zero_points = pack_zero_points(zero_point_blocks, config.bits)
     zero_offset = writer.start_tensor()
     zero_bytes = memoryview(zero_points).cast("B")
     writer.write(zero_bytes)
@@ -446,7 +539,13 @@ def _encode_weight_to_external(
         make_external_tensor(
             zero_points_name,
             TensorProto.UINT8,
-            (n * ((block_count + 1) // 2),),
+            (
+                n
+                * (
+                    (block_count + codes_per_byte(config.bits) - 1)
+                    // codes_per_byte(config.bits)
+                ),
+            ),
             external_location,
             zero_offset,
             zero_length,
@@ -473,6 +572,7 @@ def _encode_weight_to_external(
         "signed_zero_bit_differences": signed_zero_differences,
     }
     return tensors, report
+
 
 def quantize_ternary_matmuls_streaming(
     input_model: str | Path,
@@ -617,7 +717,11 @@ def quantize_ternary_matmuls_streaming(
         nbits_bytes_if_quantized = (
             n * block_count * (config.block_size * config.bits // 8)
             + n * block_count * np.dtype(np.float32).itemsize
-            + n * ((block_count + 1) // 2)
+            + n
+            * (
+                (block_count + codes_per_byte(config.bits) - 1)
+                // codes_per_byte(config.bits)
+            )
         )
         nbits_bytes_removed = 0 if name in targets_by_weight else nbits_bytes_if_quantized
         fallback_fp32_bytes = k * n * np.dtype(np.float32).itemsize
@@ -647,9 +751,9 @@ def quantize_ternary_matmuls_streaming(
     used_names = _graph_names(model.graph)
     quantized_names = {
         weight_name: (
-            _unique_graph_name(f"{weight_name}_nbits4", used_names),
-            _unique_graph_name(f"{weight_name}_nbits4_scales", used_names),
-            _unique_graph_name(f"{weight_name}_nbits4_zero_points", used_names),
+            _unique_graph_name(f"{weight_name}_nbits{config.bits}", used_names),
+            _unique_graph_name(f"{weight_name}_nbits{config.bits}_scales", used_names),
+            _unique_graph_name(f"{weight_name}_nbits{config.bits}_zero_points", used_names),
         )
         for weight_name in targets_by_weight
     }
@@ -724,7 +828,11 @@ def quantize_ternary_matmuls_streaming(
                 "MatMulNBits",
                 [node.input[0], packed_name, scales_name, zero_points_name],
                 list(node.output),
-                name=f"{node.name}_nbits4" if node.name else f"MatMul_{index}_nbits4",
+                name=(
+                    f"{node.name}_nbits{config.bits}"
+                    if node.name
+                    else f"MatMul_{index}_nbits{config.bits}"
+                ),
                 domain="com.microsoft",
                 K=weight_info.k,
                 N=weight_info.n,

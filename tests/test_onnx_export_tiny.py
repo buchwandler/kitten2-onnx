@@ -123,7 +123,7 @@ def test_tiny_qwen3_onnx_prefill_dynamic_cache_and_decode(tmp_path, tiny_qwen3, 
     model = tiny_qwen3
     monkeypatch.setattr(
         "kitten2_onnx.export_lm.load_hf_lm",
-        lambda repo_dir, dtype: model.to(dtype),
+        lambda repo_dir, dtype, *, weight_variant="full": model.to(dtype),
     )
     export_dir = tmp_path / "exported-lm"
     diagnostics_dir = tmp_path / "onnx-diagnostics"
@@ -234,7 +234,7 @@ def test_export_lm_input_ids_mode_omits_external_embedding_table(tmp_path, tiny_
     model = tiny_qwen3
     monkeypatch.setattr(
         "kitten2_onnx.export_lm.load_hf_lm",
-        lambda repo_dir, dtype: model.to(dtype),
+        lambda repo_dir, dtype, *, weight_variant="full": model.to(dtype),
     )
     export_dir = tmp_path / "input-ids-export"
     path = export_lm(
@@ -366,6 +366,89 @@ def test_input_ids_graph_injects_speaker_and_shares_tied_embedding(tmp_path, tin
     )
     np.testing.assert_array_equal(decode_output[0], zero_speaker_output[0])
     _assert_cache_shapes(decode_output[1:], layers, kv_heads, head_dim, input_ids.shape[1] + 1)
+
+
+def test_export_lm_shared_vocabulary_core_and_iobinding_runtime(tmp_path, tiny_qwen3, monkeypatch):
+    onnx = pytest.importorskip("onnx")
+    pytest.importorskip("onnxruntime")
+    from kitten2_onnx.runtime import Kitten2OnnxLM
+
+    source_dir = tmp_path / "source"
+    source_lm_dir = source_dir / "lm"
+    source_lm_dir.mkdir(parents=True)
+    (source_lm_dir / "config.json").write_text(
+        '{"model_type":"qwen3","dtype":"bfloat16"}', encoding="utf-8"
+    )
+    (source_lm_dir / "model.safetensors").write_bytes(b"tiny-model-placeholder")
+    model = tiny_qwen3.eval()
+    with torch.no_grad():
+        embedding_weight = model.get_input_embeddings().weight
+        embedding_weight.copy_(embedding_weight.to(torch.bfloat16).to(torch.float32))
+    monkeypatch.setattr(
+        "kitten2_onnx.export_lm.load_hf_lm",
+        lambda repo_dir, dtype, *, weight_variant="full": model.to(dtype),
+    )
+    export_dir = tmp_path / "shared-vocabulary-export"
+    core_path = export_lm(
+        source_dir,
+        export_dir,
+        profile_name="dev-fp32",
+        shared_vocabulary=True,
+        diagnostics_dir=tmp_path / "shared-vocabulary-diagnostics",
+    )
+
+    metadata = json.loads((export_dir / "lm.meta.json").read_text(encoding="utf-8"))
+    core = onnx.load(str(core_path), load_external_data=False)
+    output_head_path = export_dir / metadata["output_head_file"]
+    output_head = onnx.load(str(output_head_path), load_external_data=False)
+    vocabulary_shape = (int(model.config.vocab_size), int(model.config.hidden_size))
+    assert metadata["vocabulary_mode"] == "shared"
+    assert metadata["output_names"][0] == "last_hidden_state"
+    assert [value.name for value in output_head.graph.input] == [
+        "hidden_states",
+        "vocabulary_weight",
+    ]
+    assert not output_head.graph.initializer
+    assert not any(
+        tuple(initializer.dims) in {vocabulary_shape, vocabulary_shape[::-1]}
+        for initializer in core.graph.initializer
+    )
+    assert not Path(str(output_head_path) + ".data").exists()
+    assert list(export_dir.glob("embed_tokens*.npy")) == [export_dir / metadata["embedding_file"]]
+
+    runtime = Kitten2OnnxLM(export_dir)
+    assert runtime.vocabulary is not None
+    prompt_ids = torch.tensor([[3, 4, 5]], dtype=torch.long)
+    prompt_embeds = model.get_input_embeddings()(prompt_ids)
+    past_names, _ = _io_names(int(model.config.num_hidden_layers))
+    empty_cache = _empty_cache(model)
+    with torch.inference_mode():
+        expected = KittenQwen3ExportWrapper(model).eval()(
+            prompt_embeds,
+            torch.ones(1, prompt_ids.shape[1], dtype=torch.long),
+            torch.arange(prompt_ids.shape[1], dtype=torch.long)[None, :],
+            empty_cache,
+        )
+    actual_logits, actual_past = runtime.step(prompt_ids.numpy())
+    np.testing.assert_allclose(actual_logits, expected[0].numpy(), rtol=0, atol=1e-4)
+    for name, expected_tensor in zip(past_names, expected[1:], strict=True):
+        np.testing.assert_allclose(actual_past[name], expected_tensor.numpy(), rtol=0, atol=1e-4)
+    np.testing.assert_array_equal(
+        runtime._embed(prompt_ids.numpy(), prefill=False),
+        runtime.vocabulary.lookup(prompt_ids.numpy(), np.float32),
+    )
+
+    decode_ids = torch.tensor([[7]], dtype=torch.long)
+    position = prompt_ids.shape[1]
+    with torch.inference_mode():
+        expected_decode = KittenQwen3ExportWrapper(model).eval()(
+            model.get_input_embeddings()(decode_ids),
+            torch.ones(1, position + 1, dtype=torch.long),
+            torch.tensor([[position]], dtype=torch.long),
+            list(expected[1:]),
+        )
+    actual_decode, _ = runtime.step(decode_ids.numpy(), past=actual_past)
+    np.testing.assert_allclose(actual_decode, expected_decode[0].numpy(), rtol=0, atol=1e-4)
 
 
 def test_export_failure_preserves_diagnostic(tmp_path, monkeypatch):
