@@ -255,6 +255,11 @@ The parity runs used `scripts/run_bounded.py` with an 18 GiB RSS cap and a 6 GiB
 The augmented bundle and reports are local build artifacts. The release boundary is: pin source revisions, download and capture, stage and validate local augmentation, run parity and finite-audio checks, then review the hash and resource reports. Remote publication is a separate, explicit operation and is not part of this workflow.
 
 
+## Packed and emb4 local release qualification
+
+Use `scripts/build_variant_release.py` for isolated, fail-closed local candidate builds. It runs the pinned variant LM parity, expression and multilingual reference checks, all-indexed-voice CPU smoke, bundle validation and size audit, and the exact-int8 regression. It never uploads artifacts. The current packed and emb4 q4 diagnostics fail strict KV-cache parity, so neither is a verified release candidate. See [variant bundle build and qualification](docs/variant_bundles.md) and [measured variant results](docs/variant_benchmarks.md) before attempting a release.
+
+
 Run repository tests and lint before accepting a release bundle:
 
 ```bash

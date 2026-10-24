@@ -4,7 +4,7 @@
 
 The local real-model checks used `KittenML/kitten-tts-2` revision `fa8ce5c7547e322a065cad9b813d27a78fad9640` with the matching upstream code revision `36ef3090ca1e59122a81fc23be4a659a502b9d55`. The packed and emb4 checkpoint files were downloaded selectively into ignored `build/reference-variants/` directories. They were not published.
 
-Environment: Linux x86_64 under WSL2, Python 3.13.15, ONNX 1.23.2, ONNX Runtime 1.31.0, CPUExecutionProvider. Other ORT versions and providers remain untested.
+The primary full-bundle diagnostics used Linux x86_64 under WSL2, Python 3.13.15, ONNX 1.23.2, ONNX Runtime 1.31.0, and CPUExecutionProvider. The strict q4 LM cache mismatch was also reproduced with ONNX Runtime 1.22.1 and 1.23.2. The complete v2 bundle workflow and other execution providers were not qualified on those earlier runtimes.
 
 ## q4 build and size
 

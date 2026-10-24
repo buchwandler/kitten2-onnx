@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -12,6 +13,24 @@ import pytest
 from kitten2_onnx.text import has_expression_tag
 
 CORPUS_PATH = Path(__file__).parent / "fixtures" / "e2e_corpus.json"
+
+
+def test_bundle_provenance_hashes_the_bundle_and_its_files(tmp_path):
+    import scripts.validate_e2e_corpus as validator
+
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir()
+    bundle_json = bundle_dir / "bundle.json"
+    bundle_json.write_text('{"format": "test"}', encoding="utf-8")
+    (bundle_dir / "lm.onnx").write_bytes(b"onnx-data")
+
+    provenance = validator._bundle_provenance(bundle_dir)
+
+    assert provenance["status"] == "available"
+    assert provenance["file_count"] == 2
+    assert provenance["bytes"] == bundle_json.stat().st_size + (bundle_dir / "lm.onnx").stat().st_size
+    assert provenance["bundle_json_sha256"] == hashlib.sha256(bundle_json.read_bytes()).hexdigest()
+    assert len(provenance["tree_sha256"]) == 64
 
 
 def test_corpus_normalized_text_matches_pinned_normalizer():
@@ -85,7 +104,7 @@ def test_validate_corpus_defaults_and_explicit_reference_settings(tmp_path, monk
     monkeypatch.setattr(
         validator,
         "load_reference_artifacts",
-        lambda *args: SimpleNamespace(model_revision="revision"),
+        lambda *args, **kwargs: SimpleNamespace(model_revision="revision"),
     )
     monkeypatch.setattr(validator, "load_reference_model", fake_load_reference_model)
     monkeypatch.setattr(validator, "Kitten2OnnxTTS", FakeTTS)
@@ -99,6 +118,11 @@ def test_validate_corpus_defaults_and_explicit_reference_settings(tmp_path, monk
     assert default_report["reference_device"] == "cpu"
     assert default_report["reference_dtype"] == "float32"
     assert default_report["runtime_profile"] == "dev-fp32"
+    assert default_report["weight_variant"] == "full"
+    assert default_report["strict_parity_tolerances"]["logits_atol"] == 2e-4
+    assert default_report["onnx_bundle_provenance"]["status"] == "unavailable"
+    assert default_report["actual_providers"] == []
+    assert default_report["resource_usage"]["peak_rss_bytes"] is not None
 
     fp16_report = validator.validate_corpus(
         "model",
@@ -141,6 +165,14 @@ def test_cli_preserves_repeated_provider_arguments_and_reference_settings(monkey
             "cuda",
             "--reference-dtype",
             "float16",
+            "--weights",
+            "emb4",
+            "--weight-model",
+            "variant-model",
+            "--speaker-projection-model",
+            "full-model",
+            "--lm-parity-report",
+            "lm-parity.json",
         ],
     )
 
@@ -150,6 +182,10 @@ def test_cli_preserves_repeated_provider_arguments_and_reference_settings(monkey
     assert seen["providers"] == ["CUDAExecutionProvider", "CPUExecutionProvider"]
     assert seen["reference_device"] == "cuda"
     assert seen["reference_dtype"] is torch.float16
+    assert seen["weight_variant"] == "emb4"
+    assert seen["weight_model_dir"] == Path("variant-model")
+    assert seen["speaker_projection_model_dir"] == Path("full-model")
+    assert seen["lm_parity_report_path"] == Path("lm-parity.json")
 
 
 
@@ -249,7 +285,7 @@ def test_quality_report_records_token_divergence_without_relaxing_strict_mode(
             {"prompt_length": 2, "processed_text": "Hello", "expression_detected": False, "emotion_control_used": False},
         )
 
-    monkeypatch.setattr(validator, "load_reference_artifacts", lambda *args: artifacts)
+    monkeypatch.setattr(validator, "load_reference_artifacts", lambda *args, **kwargs: artifacts)
     monkeypatch.setattr(
         validator,
         "load_reference_model",

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,84 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _bundle_provenance(bundle_dir: Path) -> dict[str, Any]:
+    if not bundle_dir.is_dir():
+        return {
+            "path": str(bundle_dir),
+            "status": "unavailable",
+            "bundle_json_sha256": None,
+            "tree_sha256": None,
+            "file_count": 0,
+            "bytes": 0,
+        }
+    files = sorted(path for path in bundle_dir.rglob("*") if path.is_file())
+    bundle_json = bundle_dir / "bundle.json"
+    digest = hashlib.sha256()
+    total_bytes = 0
+    for path in files:
+        relative = path.relative_to(bundle_dir).as_posix()
+        file_hash = _sha256_file(path)
+        size = path.stat().st_size
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\\0")
+        digest.update(file_hash.encode("ascii"))
+        digest.update(b"\\n")
+        total_bytes += size
+    return {
+        "path": str(bundle_dir),
+        "status": "available" if bundle_json.is_file() else "missing_bundle_json",
+        "bundle_json_sha256": _sha256_file(bundle_json) if bundle_json.is_file() else None,
+        "tree_sha256": digest.hexdigest(),
+        "file_count": len(files),
+        "bytes": total_bytes,
+    }
+
+
+def _report_reference(report_path: str | Path | None) -> dict[str, Any] | None:
+    if report_path is None:
+        return None
+    path = Path(report_path)
+    return {
+        "path": str(path),
+        "status": "available" if path.is_file() else "missing",
+        "sha256": _sha256_file(path) if path.is_file() else None,
+    }
+
+
+def _actual_providers(tts: Kitten2OnnxTTS) -> list[str]:
+    sessions = (
+        getattr(getattr(tts, "lm", None), "session", None),
+        getattr(getattr(tts, "lm", None), "output_session", None),
+        getattr(getattr(tts, "lm", None), "speaker_session", None),
+        getattr(getattr(tts, "decoder", None), "flow_session", None),
+        getattr(getattr(tts, "decoder", None), "mel2wav_session", None),
+    )
+    providers: list[str] = []
+    for session in sessions:
+        if session is not None and hasattr(session, "get_providers"):
+            for provider in session.get_providers():
+                if provider not in providers:
+                    providers.append(provider)
+    return providers
+
+
+def _peak_rss_bytes() -> int | None:
+    try:
+        import resource
+    except ImportError:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(peak if sys.platform == "darwin" else peak * 1024)
 
 def _first_difference(expected: list[int], actual: list[int]) -> int | None:
     for index, (expected_id, actual_id) in enumerate(zip(expected, actual)):
@@ -82,6 +162,10 @@ def validate_corpus(
     reference_dtype: torch.dtype = torch.float32,
     quality_report: bool = False,
     reference_bundle_dir: str | Path | None = None,
+    weight_model_dir: str | Path | None = None,
+    weight_variant: str = "full",
+    speaker_projection_model_dir: str | Path | None = None,
+    lm_parity_report_path: str | Path | None = None,
 ) -> dict[str, Any]:
     corpus_path = Path(corpus_path)
     output_path = Path(output_path)
@@ -90,7 +174,13 @@ def validate_corpus(
     max_new_tokens = int(corpus["max_new_tokens"])
     seed = int(corpus["seed"])
 
-    artifacts = load_reference_artifacts(model_dir, voice)
+    artifacts = load_reference_artifacts(
+        model_dir,
+        voice,
+        weight_variant=weight_variant,
+        weight_model_dir=weight_model_dir,
+        speaker_projection_model_dir=speaker_projection_model_dir,
+    )
     reference_model = load_reference_model(
         artifacts,
         device=reference_device,
@@ -112,8 +202,15 @@ def validate_corpus(
     preset = corpus["preset"]
     sampling_settings = sampling_settings_from_config(tts.bundle, preset)
     report: dict[str, Any] = {
-        "format": "kitten2-onnx-e2e-parity-report-v1",
+        "format": "kitten2-onnx-e2e-parity-report-v2",
         "validation_mode": "quality_report" if quality_report else "exact_parity",
+        "strict_parity_tolerances": {
+            "logits_rtol": 1e-4,
+            "logits_atol": 2e-4,
+            "greedy_token_ids": "exact",
+            "seeded_waveform_repeat_rmse_max": 1e-7,
+            "seeded_waveform_repeat_correlation_min": 0.999999,
+        },
         "quality_review": (
             {"status": "requires_manual_review", "thresholds": None}
             if quality_report
@@ -122,6 +219,29 @@ def validate_corpus(
         "reference_bundle": str(reference_bundle_dir) if reference_bundle_dir else None,
         "voice": voice,
         "source_model_revision": artifacts.model_revision,
+        "weight_variant": getattr(artifacts, "weight_variant", weight_variant),
+        "weight_model_dir": str(getattr(artifacts, "repo_dir", model_dir)),
+        "source_weight_sha256": getattr(artifacts, "source_weight_sha256", None),
+        "source_weight_files": getattr(artifacts, "source_weight_files", []),
+        "voice_artifacts_provenance": {
+            "path": str(getattr(artifacts, "voice_artifacts_dir", model_dir)),
+            "source_model_revision": getattr(
+                artifacts, "voice_artifacts_source_model_revision", None
+            ),
+        },
+        "speaker_projection_provenance": {
+            "source": getattr(artifacts, "speaker_projection_source", None),
+            "weight_variant": getattr(artifacts, "speaker_projection_weight_variant", None),
+            "source_model_revision": getattr(
+                artifacts, "speaker_projection_source_model_revision", None
+            ),
+            "sha256": getattr(artifacts, "speaker_projection_source_sha256", None),
+        },
+        "onnx_bundle_provenance": _bundle_provenance(Path(bundle_dir)),
+        "onnx_bundle_revisions": tts.bundle.get("revisions", {}),
+        "onnxruntime_version": importlib.metadata.version("onnxruntime"),
+        "actual_providers": _actual_providers(tts),
+        "lm_parity_report": _report_reference(lm_parity_report_path),
         "upstream_code_revision": UPSTREAM_CODE_REVISION,
         "normalizer_version": importlib.metadata.version("kitten-text-processing"),
         "max_new_tokens": max_new_tokens,
@@ -384,6 +504,13 @@ def validate_corpus(
         )
         _write_json(output_path, report)
 
+    report["resource_usage"] = {
+        "peak_rss_bytes": _peak_rss_bytes(),
+        "measurement": "process maximum resident set size",
+        "guard_status": "not_configured",
+    }
+    _write_json(output_path, report)
+
     return report
 
 
@@ -398,6 +525,10 @@ def main() -> None:
     parser.add_argument("--reference-dtype", choices=("float32", "float16"), default="float32")
     parser.add_argument("--quality-report", action="store_true")
     parser.add_argument("--reference-bundle", type=Path)
+    parser.add_argument("--weights", choices=("full", "packed", "emb4"), default="full")
+    parser.add_argument("--weight-model", type=Path)
+    parser.add_argument("--speaker-projection-model", type=Path)
+    parser.add_argument("--lm-parity-report", type=Path)
     args = parser.parse_args()
     report = validate_corpus(
         args.model_dir,
@@ -409,6 +540,10 @@ def main() -> None:
         reference_dtype={"float32": torch.float32, "float16": torch.float16}[args.reference_dtype],
         quality_report=args.quality_report,
         reference_bundle_dir=args.reference_bundle,
+        weight_variant=args.weights,
+        weight_model_dir=args.weight_model,
+        speaker_projection_model_dir=args.speaker_projection_model,
+        lm_parity_report_path=args.lm_parity_report,
     )
     print(json.dumps(report, indent=2))
 

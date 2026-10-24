@@ -46,6 +46,24 @@ def _compare(reference: np.ndarray, candidate: np.ndarray) -> dict[str, Any]:
     }
 
 
+MAX_FAILURE_INDEX_SAMPLE = 10
+
+
+def _sample_failing_indices(mask: np.ndarray) -> list[list[int]]:
+    flattened = mask.ravel()
+    samples: list[list[int]] = []
+    chunk_size = 65_536
+    for start in range(0, flattened.size, chunk_size):
+        offsets = np.flatnonzero(flattened[start : start + chunk_size])
+        for offset in offsets[: MAX_FAILURE_INDEX_SAMPLE - len(samples)]:
+            samples.append(
+                [int(index) for index in np.unravel_index(start + int(offset), mask.shape)]
+            )
+        if len(samples) == MAX_FAILURE_INDEX_SAMPLE:
+            break
+    return samples
+
+
 def _compare_cache(
     reference: dict[str, np.ndarray], candidate: dict[str, np.ndarray]
 ) -> dict[str, Any]:
@@ -57,13 +75,41 @@ def _compare_cache(
         candidate_values = candidate[name]
         difference = np.abs(candidate_values - reference_values)
         tolerance = CACHE_ATOL + CACHE_RTOL * np.abs(reference_values)
-        failing_count = int(np.count_nonzero(difference > tolerance))
+        failing_mask = difference > tolerance
+        failing_count = int(np.count_nonzero(failing_mask))
         if failing_count:
+            prefix, separator, layer_text = name.rpartition("_")
+            layer = int(layer_text) if separator and layer_text.isdigit() else None
+            cache_kind = prefix.removeprefix("past_") if layer is not None else name
+            worst_index = tuple(
+                int(index) for index in np.unravel_index(np.argmax(difference), difference.shape)
+            )
+            nonzero_reference = reference_values != 0
+            max_relative_error = None
+            if np.any(nonzero_reference):
+                max_relative_error = float(
+                    np.max(
+                        difference[nonzero_reference] / np.abs(reference_values[nonzero_reference])
+                    )
+                )
+            failing_indices = _sample_failing_indices(failing_mask)
             failures[name] = {
+                "layer": layer,
+                "cache_kind": cache_kind,
                 "failing_elements": failing_count,
+                "failing_indices": failing_indices,
+                "failing_indices_truncated": failing_count > len(failing_indices),
                 "max_absolute_error": tensors[name]["max_absolute_error"],
+                "max_relative_error": max_relative_error,
+                "worst_index": list(worst_index),
+                "reference_value_at_worst_index": float(reference_values[worst_index]),
+                "candidate_value_at_worst_index": float(candidate_values[worst_index]),
             }
     worst_tensor = max(tensors, key=lambda name: tensors[name]["max_absolute_error"])
+    first_failure = None
+    if failures:
+        first_tensor = next(iter(failures))
+        first_failure = {"tensor": first_tensor, **failures[first_tensor]}
     return {
         "allclose": not failures,
         "max_absolute_error": tensors[worst_tensor]["max_absolute_error"],
@@ -72,8 +118,20 @@ def _compare_cache(
         "failing_tensor_count": len(failures),
         "failing_element_count": sum(item["failing_elements"] for item in failures.values()),
         "worst_tensor": worst_tensor,
+        "first_failure": first_failure,
         "failures": failures,
     }
+
+
+def _first_cache_failure(
+    prefill_cache: dict[str, Any], decode_cache_reports: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    if prefill_cache.get("first_failure") is not None:
+        return {"phase": "prefill", "step": 0, **prefill_cache["first_failure"]}
+    for step, report in enumerate(decode_cache_reports):
+        if report.get("first_failure") is not None:
+            return {"phase": "decode", "step": step, **report["first_failure"]}
+    return None
 
 
 def benchmark_variant(
@@ -211,6 +269,7 @@ def benchmark_variant(
         },
         "prefill_logits": prefill_logits,
         "prefill_cache": prefill_cache,
+        "first_cache_failure": _first_cache_failure(prefill_cache, decode_cache_reports),
         "decode_logits": {
             "allclose": all(item["allclose"] for item in decode_logit_reports),
             "argmax_match_steps": sum(item["argmax_match"] for item in decode_logit_reports),
@@ -221,6 +280,7 @@ def benchmark_variant(
             "allclose": all(item["allclose"] for item in decode_cache_reports),
             "max_absolute_error": max(item["max_absolute_error"] for item in decode_cache_reports),
             "relative_l2_error": max(item["relative_l2_error"] for item in decode_cache_reports),
+            "steps": decode_cache_reports,
         },
         "greedy_tokens_match": generated_reference == generated_onnx,
         "reference_generated_ids": generated_reference,
