@@ -53,19 +53,71 @@ def _write_exact_int8_bundle(path: Path) -> None:
 
 def _write_candidate_bundle(path: Path, variant: str) -> None:
     path.mkdir(parents=True)
+    source_hash = WEIGHT_SHA256[variant]
+    weights = [
+        {
+            "source_initializer": "weight",
+            "source_shape": [128, 1],
+            "source_sha256": "c" * 64,
+            "code_initializer": "weight_tritpack_codes",
+            "scale_initializer": "weight_tritpack_scales",
+            "transformed_nodes": [f"matmul_{index}" for index in range(196)],
+            "weight_value": "weight_tritpack_value",
+        }
+    ]
+    transformer = {
+        "method": "ternary-tritpack-exact",
+        "format_version": "kitten2-ternary-tritpack-v1",
+        "source_group_size": 128,
+        "trits_per_byte": 5,
+        "packed_bytes_per_group": 26,
+        "scale_dtype": "float32",
+        "execution_op": "MatMul",
+        "execution_semantics": "standard-fp32-matmul",
+        "lossy": False,
+        "numeric_reconstruction_exact": True,
+        "signed_zero_preserved": False,
+        "source_weight_sha256": source_hash,
+        "source_graph_sha256": "d" * 64,
+        "graph_sha256": "e" * 64,
+        "payload_file": "lm.tritpack-exact.onnx.data",
+        "payload_sha256": "f" * 64,
+        "packed_code_bytes": 26,
+        "scale_bytes": 4,
+        "logical_fp32_operand_bytes": 512,
+        "transformed_matmul_count": 196,
+        "transformed_initializer_count": 1,
+        "runtime_materialization_required": True,
+        "runtime_memory_profile": "low-memory-exact-ternary",
+        "materialized_dtype": "float32",
+        "materialized_external_bytes": 512,
+        "cache_key_inputs": ["graph_sha256", "payload_sha256", "format_version"],
+        "weights": weights,
+    }
+    quantization = {
+        "method": "ternary-tritpack-exact",
+        "format_version": "kitten2-ternary-tritpack-v1",
+        "source_weight_sha256": source_hash,
+        "transformed_matmul_count": 196,
+        "transformed_initializer_count": 1,
+        "runtime_materialization_required": True,
+        "runtime_memory_profile": "low-memory-exact-ternary",
+        "weights": weights,
+    }
     _write_json(
         path / "bundle.json",
         {
-            "format": "kitten2-onnx-bundle-v1",
+            "format": "kitten2-onnx-bundle-v2",
             "revisions": {"source_model_revision": REVISION, "upstream_code_revision": "b" * 40},
             "voices": {"Amy": "voices/Amy.npz", "Bruno": "voices/Bruno.npz"},
             "lm": {
+                "model": "lm/lm.onnx",
                 "metadata": "lm/lm.meta.json",
                 "weight_variant": variant,
-                "source_weight_sha256": WEIGHT_SHA256[variant],
+                "source_weight_sha256": source_hash,
                 "storage": {
-                    "transformer": {"format": "ternary-nbits4"},
-                    "vocabulary": {"format": "float32"},
+                    "transformer": transformer,
+                    "vocabulary": {"method": "bfloat16-u16", "lossy": False},
                 },
             },
         },
@@ -74,15 +126,15 @@ def _write_candidate_bundle(path: Path, variant: str) -> None:
         path / "lm/lm.meta.json",
         {
             "source_model_revision": REVISION,
-            "source_weight_sha256": WEIGHT_SHA256[variant],
-            "quantization": {"format": "ternary-nbits4", "bits": 4, "block_size": 128, "accuracy_level": 1},
+            "source_weight_sha256": source_hash,
+            "quantization": quantization,
         },
     )
     (path / "lm/lm.onnx").write_bytes(b"candidate payload")
-
 def _make_runner(*, variant: str = "packed", parity_passed: bool = True):
     def runner(command, **kwargs):
         args = [str(item) for item in command]
+        assert kwargs["max_additional_swap_gib"] == 3.0
         output_json = kwargs["output_json"]
         log_path = kwargs["log_path"]
         output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +148,7 @@ def _make_runner(*, variant: str = "packed", parity_passed: bool = True):
             export_dir.mkdir(parents=True)
             (export_dir / "export.marker").write_text("exported", encoding="utf-8")
         elif any("optimize_bundle.py" in arg for arg in args):
+            assert args[args.index("--lm") + 1] == "ternary-tritpack-exact"
             candidate_dir = Path(args[3])
             _write_candidate_bundle(candidate_dir, variant)
             report_dir = Path(args[args.index("--report-dir") + 1])
@@ -108,6 +161,7 @@ def _make_runner(*, variant: str = "packed", parity_passed: bool = True):
             _write_json(size_path, {"bundle_bytes": 1234, "bundle_dir": args[2]})
         elif any("benchmark_variant_lm.py" in arg for arg in args):
             assert args[args.index("--variant") + 1] == variant
+            assert kwargs["max_additional_swap_gib"] == 3.0
             _write_json(
                 Path(args[args.index("--output") + 1]),
                 {
@@ -269,9 +323,11 @@ def test_build_release_promotes_only_after_all_gates_and_preserves_inputs(tmp_pa
     assert (fixture["output_dir"] / "release_manifest.json").is_file()
     manifest = json.loads((fixture["output_dir"] / "release_manifest.json").read_text())
     assert manifest["variant"] == variant
-    assert manifest["build_config"]["nbits"] == 4
-    assert manifest["build_config"]["block_size"] == 128
-    assert manifest["build_config"]["accuracy_level"] == 1
+    assert manifest["build_config"]["transformer_storage_method"] == "ternary-tritpack-exact"
+    assert manifest["build_config"]["tritpack_format_version"] == "kitten2-ternary-tritpack-v1"
+    assert manifest["build_config"]["runtime_materialization_required"] is True
+    assert manifest["build_config"]["materialized_external_bytes"] == 512
+    assert manifest["build_config"]["max_additional_swap_gib"] == 3.0
     for relative, record in manifest["files"].items():
         payload = (fixture["output_dir"] / relative).read_bytes()
         assert len(payload) == record["bytes"]
@@ -284,6 +340,48 @@ def test_build_release_promotes_only_after_all_gates_and_preserves_inputs(tmp_pa
 
 
 
+
+
+@pytest.mark.parametrize("variant", ["packed", "emb4"])
+def test_post_staging_final_validation_failure_never_promotes_and_preserves_inputs(
+    tmp_path, variant
+):
+    fixture = _build_fixture(tmp_path, variant=variant)
+    base_runner = fixture["runner"]
+
+    def fail_final_validation(command, **kwargs):
+        args = [str(item) for item in command]
+        result = base_runner(command, **kwargs)
+        if "kitten2_onnx.validate_bundle" in args:
+            validation_path = Path(args[args.index("--output") + 1])
+            if validation_path.name == "final-validation.json":
+                _write_json(
+                    validation_path,
+                    {"valid": False, "bundle_dir": args[3]},
+                )
+        return result
+
+    with pytest.raises(build_variant_release.ReleaseGateError, match="Final bundle validation failed"):
+        build_variant_release.build_release(
+            fixture["model_dir"],
+            weights=variant,
+            output_dir=fixture["output_dir"],
+            reports_dir=fixture["reports_dir"],
+            variant_reference_dir=fixture["variant_dir"],
+            exact_int8_bundle_dir=fixture["exact_int8_dir"],
+            command_runner=fail_final_validation,
+        )
+
+    failure = json.loads((fixture["reports_dir"] / "release_status.json").read_text())
+    assert failure["candidate_promoted"] is False
+    assert failure["failed_gate"] == "final-validation"
+    assert (fixture["reports_dir"] / "release_manifest.json").is_file()
+    assert not fixture["output_dir"].exists()
+    assert not list(fixture["output_dir"].parent.glob(f".{variant}.staging-*"))
+    assert build_variant_release._tree_hash(fixture["model_dir"]) == fixture["hashes"]["source"]
+    assert build_variant_release._tree_hash(fixture["variant_dir"]) == fixture["hashes"]["variant"]
+    assert build_variant_release._tree_hash(fixture["exact_int8_dir"]) == fixture["hashes"]["exact"]
+    assert build_variant_release._tree_hash(fixture["sibling"]) == fixture["hashes"]["sibling"]
 def test_emb4_build_preserves_previously_promoted_packed_candidate(tmp_path):
     model_dir = tmp_path / "source-model"
     packed_reference = tmp_path / "packed-reference"
@@ -351,6 +449,33 @@ def test_failed_lm_parity_does_not_promote_or_mutate_any_input(tmp_path, variant
     assert build_variant_release._tree_hash(fixture["sibling"]) == fixture["hashes"]["sibling"]
 
 
+
+
+
+def test_build_release_rejects_diagnostic_q4_storage(tmp_path):
+    fixture = _build_fixture(tmp_path)
+
+    def unexpected_runner(*args, **kwargs):
+        raise AssertionError("No build command should run for diagnostic q4 storage")
+
+    with pytest.raises(ValueError, match="require transformer storage 'ternary-tritpack-exact'"):
+        build_variant_release.build_release(
+            fixture["model_dir"],
+            weights="packed",
+            output_dir=fixture["output_dir"],
+            reports_dir=fixture["reports_dir"],
+            variant_reference_dir=fixture["variant_dir"],
+            exact_int8_bundle_dir=fixture["exact_int8_dir"],
+            transformer_storage_method="ternary-nbits4",
+            command_runner=unexpected_runner,
+        )
+
+    assert not fixture["output_dir"].exists()
+    assert not fixture["reports_dir"].exists()
+    assert build_variant_release._tree_hash(fixture["model_dir"]) == fixture["hashes"]["source"]
+    assert build_variant_release._tree_hash(fixture["variant_dir"]) == fixture["hashes"]["variant"]
+    assert build_variant_release._tree_hash(fixture["exact_int8_dir"]) == fixture["hashes"]["exact"]
+    assert build_variant_release._tree_hash(fixture["sibling"]) == fixture["hashes"]["sibling"]
 def test_build_release_rejects_revision_mismatch_before_running_commands(tmp_path):
     fixture = _build_fixture(tmp_path)
     _write_json(

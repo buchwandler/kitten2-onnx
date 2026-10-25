@@ -141,6 +141,7 @@ def benchmark_variant(
     *,
     variant: str,
     decode_steps: int,
+    materialization_cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     import onnxruntime as ort
 
@@ -171,6 +172,7 @@ def benchmark_variant(
         onnx_bundle / "lm",
         speaker_model=onnx_bundle / "speaker/speaker.onnx",
         providers=["CPUExecutionProvider"],
+        materialization_cache_dir=materialization_cache_dir,
     )
     session_creation_seconds = time.perf_counter() - session_started
     prompt_ids = np.asarray(artifacts.build_prompt(PROMPT), dtype=np.int64)
@@ -259,6 +261,10 @@ def benchmark_variant(
         "prompt": PROMPT,
         "prompt_token_count": len(prompt_ids),
         "decode_steps": decode_steps,
+        "runtime_materialization": {
+            "cache": runtime.materialization_provenance,
+            "seconds": runtime.materialization_seconds,
+        },
         "timing_seconds": {
             "reference_model_load": model_load_seconds,
             "onnx_session_creation": session_creation_seconds,
@@ -308,6 +314,7 @@ def main() -> None:
     parser.add_argument("onnx_bundle", type=Path)
     parser.add_argument("--variant", required=True, choices=("packed", "emb4"))
     parser.add_argument("--decode-steps", type=int, default=32)
+    parser.add_argument("--materialization-cache-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = benchmark_variant(
@@ -316,6 +323,7 @@ def main() -> None:
         args.onnx_bundle,
         variant=args.variant,
         decode_steps=args.decode_steps,
+        materialization_cache_dir=args.materialization_cache_dir,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

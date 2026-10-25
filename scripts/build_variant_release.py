@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPRESSION_CORPUS = PROJECT_ROOT / "tests/fixtures/expression_cases.json"
 MULTILINGUAL_CORPUS = PROJECT_ROOT / "tests/fixtures/multilingual_cases.json"
 
+MAX_ADDITIONAL_SWAP_GIB = 3.0
 
 class ReleaseGateError(RuntimeError):
     def __init__(self, gate: str, message: str):
@@ -139,6 +140,7 @@ def _run_stage(
     min_available_gib: float,
     reserve_available_gib: float,
     timeout_seconds: float,
+    max_additional_swap_gib: float | None = MAX_ADDITIONAL_SWAP_GIB,
     command_runner: Callable[..., dict[str, Any]],
 ) -> dict[str, Any]:
     result_path = reports_dir / "resources" / f"{name}.json"
@@ -149,6 +151,7 @@ def _run_stage(
         min_available_gib=min_available_gib,
         reserve_available_gib=reserve_available_gib,
         timeout_seconds=timeout_seconds,
+        max_additional_swap_gib=max_additional_swap_gib,
         output_json=result_path,
         log_path=log_path,
         cwd=PROJECT_ROOT,
@@ -265,9 +268,16 @@ def _release_manifest(
         },
         "build_config": {
             "transformer_storage": transformer,
+            "transformer_storage_method": transformer.get("method"),
+            "tritpack_format_version": transformer.get("format_version"),
+            "runtime_materialization_required": transformer.get(
+                "runtime_materialization_required", False
+            ),
+            "materialized_external_bytes": transformer.get("materialized_external_bytes"),
             "nbits": quantization.get("bits"),
             "block_size": quantization.get("block_size"),
             "accuracy_level": quantization.get("accuracy_level"),
+            "max_additional_swap_gib": MAX_ADDITIONAL_SWAP_GIB,
             "vocabulary_storage": vocabulary,
             "quantization": quantization,
         },
@@ -286,6 +296,7 @@ def build_release(
     weights: str,
     output_dir: str | Path,
     reports_dir: str | Path,
+    transformer_storage_method: str = "ternary-tritpack-exact",
     variant_reference_dir: str | Path | None = None,
     exact_int8_bundle_dir: str | Path = "build/baseline-hosted-onnx",
     max_rss_gib: float = 16.0,
@@ -297,6 +308,8 @@ def build_release(
 ) -> dict[str, Any]:
     if weights not in {"packed", "emb4"}:
         raise ValueError("weights must be 'packed' or 'emb4'")
+    if transformer_storage_method != "ternary-tritpack-exact":
+        raise ValueError("release builds require transformer storage 'ternary-tritpack-exact'")
     if voice_smoke_max_new_tokens < 1:
         raise ValueError("voice_smoke_max_new_tokens must be positive")
     model_dir = Path(model_dir).resolve()
@@ -378,7 +391,7 @@ def build_release(
         )
         completed_gates.append(current_gate)
 
-        current_gate = "q4-transform"
+        current_gate = "tritpack-transform"
         _run_stage(
             current_gate,
             [
@@ -387,7 +400,7 @@ def build_release(
                 str(exported_bundle),
                 str(stage_bundle),
                 "--lm",
-                "ternary-nbits4",
+                transformer_storage_method,
                 "--validate",
                 "--report-dir",
                 str(reports_dir / "optimization"),
@@ -402,10 +415,58 @@ def build_release(
         report_paths["optimization"] = reports_dir / "optimization/optimization.json"
         optimization_report = _require_report(report_paths["optimization"], current_gate)
         if optimization_report.get("validation", {}).get("status") != "passed":
-            raise ReleaseGateError(current_gate, "q4 optimizer validation report did not pass")
+            raise ReleaseGateError(current_gate, "tritpack optimizer validation report did not pass")
         optimized_bundle = _read_json(stage_bundle / "bundle.json")
         optimized_lm = optimized_bundle["lm"]
         optimized_lm_metadata = _read_json(stage_bundle / optimized_lm["metadata"])
+        from kitten2_onnx.ternary_tritpack_storage import TERNARY_TRITPACK_FORMAT_VERSION
+
+        lm_storage = optimized_lm.get("storage", {})
+        transformer_storage = (
+            lm_storage.get("transformer", {}) if isinstance(lm_storage, dict) else {}
+        )
+        if not isinstance(transformer_storage, dict):
+            transformer_storage = {}
+        quantization = optimized_lm_metadata.get("quantization", {})
+        if not isinstance(quantization, dict):
+            quantization = {}
+        storage_weights = transformer_storage.get("weights")
+        initializer_count = transformer_storage.get("transformed_initializer_count")
+        materialized_bytes = transformer_storage.get("materialized_external_bytes")
+        if (
+            transformer_storage.get("method") != "ternary-tritpack-exact"
+            or transformer_storage.get("format_version") != TERNARY_TRITPACK_FORMAT_VERSION
+            or transformer_storage.get("source_group_size") != 128
+            or transformer_storage.get("trits_per_byte") != 5
+            or transformer_storage.get("packed_bytes_per_group") != 26
+            or transformer_storage.get("execution_op") != "MatMul"
+            or transformer_storage.get("execution_semantics") != "standard-fp32-matmul"
+            or transformer_storage.get("lossy") is not False
+            or transformer_storage.get("numeric_reconstruction_exact") is not True
+            or transformer_storage.get("runtime_materialization_required") is not True
+            or transformer_storage.get("runtime_memory_profile") != "low-memory-exact-ternary"
+            or transformer_storage.get("transformed_matmul_count") != 196
+            or type(initializer_count) is not int
+            or not 0 < initializer_count <= 196
+            or not isinstance(storage_weights, list)
+            or len(storage_weights) != initializer_count
+            or type(materialized_bytes) is not int
+            or materialized_bytes <= 0
+            or transformer_storage.get("signed_zero_preserved") is not False
+            or transformer_storage.get("scale_dtype") != "float32"
+            or transformer_storage.get("materialized_dtype") != "float32"
+            or transformer_storage.get("cache_key_inputs")
+            != ["graph_sha256", "payload_sha256", "format_version"]
+            or quantization.get("format_version") != TERNARY_TRITPACK_FORMAT_VERSION
+            or quantization.get("source_weight_sha256") != optimized_lm.get("source_weight_sha256")
+            or quantization.get("transformed_matmul_count") != 196
+            or quantization.get("transformed_initializer_count") != initializer_count
+            or quantization.get("weights") != storage_weights
+            or quantization.get("runtime_materialization_required") is not True
+            or quantization.get("runtime_memory_profile") != "low-memory-exact-ternary"
+            or quantization.get("method") != "ternary-tritpack-exact"
+        ):
+            raise ReleaseGateError(current_gate, "Candidate does not use the qualified exact tritpack storage")
         candidate_source_weight_sha256 = optimized_lm.get("source_weight_sha256") or optimized_lm_metadata.get(
             "source_weight_sha256"
         )
@@ -416,6 +477,7 @@ def build_release(
             or optimized_bundle.get("revisions", {}).get("upstream_code_revision")
             != source_manifest["upstream_code_revision"]
             or not candidate_source_weight_sha256
+            or transformer_storage.get("source_weight_sha256") != candidate_source_weight_sha256
         ):
             raise ReleaseGateError(current_gate, "Optimized bundle variant or pinned source provenance is invalid")
         completed_gates.append(current_gate)
@@ -786,6 +848,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("--weights", choices=("packed", "emb4"), required=True)
+    parser.add_argument(
+        "--transformer-storage",
+        choices=("ternary-tritpack-exact",),
+        default="ternary-tritpack-exact",
+        help="Release transformer storage backend (q4 remains diagnostic-only)",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--reports", type=Path, required=True)
     parser.add_argument("--variant-reference", type=Path)
@@ -799,6 +867,7 @@ def main() -> None:
     result = build_release(
         args.model_dir,
         weights=args.weights,
+        transformer_storage_method=args.transformer_storage,
         output_dir=args.output,
         reports_dir=args.reports,
         variant_reference_dir=args.variant_reference,

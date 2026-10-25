@@ -143,3 +143,92 @@ def test_input_ids_runtime_projects_speaker_only_during_prefill(
     np.testing.assert_array_equal(lm_session.feeds[1]["speaker_hidden"], np.zeros((1, hidden_size)))
     assert lm_session.feeds[1]["speaker_hidden"].dtype == expected_numpy_dtype
     np.testing.assert_array_equal(lm_session.feeds[1]["position_ids"], [[2]])
+
+
+
+def test_runtime_uses_explicit_tritpack_materialization_cache(tmp_path, monkeypatch):
+    from kitten2_onnx import materialized_weights
+
+    bundle_dir = tmp_path / "bundle"
+    lm_dir = bundle_dir / "lm"
+    lm_dir.mkdir(parents=True)
+    metadata = {
+        "input_mode": "input_ids",
+        "input_names": [
+            "input_ids",
+            "speaker_hidden",
+            "attention_mask",
+            "position_ids",
+            "past_key_0",
+            "past_value_0",
+        ],
+        "runtime_profile": "dev-fp32",
+        "runtime_provider": "CPUExecutionProvider",
+        "io_dtype": "float32",
+        "hidden_size": 4,
+        "num_hidden_layers": 1,
+        "num_key_value_heads": 1,
+        "head_dim": 1,
+    }
+    (lm_dir / "lm.meta.json").write_text(json.dumps(metadata), encoding="utf-8")
+    (lm_dir / "lm.onnx").write_bytes(b"diagnostic graph")
+    storage = {
+        "method": "ternary-tritpack-exact",
+        "runtime_materialization_required": True,
+        "runtime_memory_profile": "low-memory-exact-ternary",
+        "transformed_matmul_count": 196,
+        "transformed_initializer_count": 1,
+    }
+    (bundle_dir / "bundle.json").write_text(
+        json.dumps({"lm": {"storage": {"transformer": storage}}}),
+        encoding="utf-8",
+    )
+
+    sessions = []
+
+    class FakeSession:
+        def __init__(self, path, providers, sess_options=None):
+            self.path = Path(path)
+            self.providers = providers
+            self.sess_options = sess_options
+            sessions.append(self)
+
+        def get_inputs(self):
+            return [
+                SimpleNamespace(name="input_ids", type="tensor(int64)"),
+                SimpleNamespace(name="speaker_hidden", type="tensor(float)"),
+                SimpleNamespace(name="attention_mask", type="tensor(int64)"),
+                SimpleNamespace(name="position_ids", type="tensor(int64)"),
+                SimpleNamespace(name="past_key_0", type="tensor(float)"),
+                SimpleNamespace(name="past_value_0", type="tensor(float)"),
+            ]
+
+    fake_runtime = SimpleNamespace(
+        InferenceSession=FakeSession,
+        SessionOptions=type("FakeSessionOptions", (), {}),
+        ExecutionMode=SimpleNamespace(ORT_SEQUENTIAL="sequential"),
+        GraphOptimizationLevel=SimpleNamespace(ORT_DISABLE_ALL="disable"),
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_runtime)
+    materialized_path = tmp_path / "cache" / "lm.onnx"
+    calls = []
+
+    def materialize(source_model, cache_root, *, storage_metadata):
+        calls.append((Path(source_model), Path(cache_root), storage_metadata))
+        return SimpleNamespace(
+            model_path=materialized_path,
+            provenance={"cache_hit": False, "cache_key": "test-cache-key"},
+        )
+
+    monkeypatch.setattr(materialized_weights, "materialize_tritpack_model", materialize)
+    cache_root = tmp_path / "explicit-cache"
+    runtime = Kitten2OnnxLM(
+        lm_dir,
+        providers=["CPUExecutionProvider"],
+        materialization_cache_dir=cache_root,
+    )
+
+    assert calls == [(lm_dir / "lm.onnx", cache_root, storage)]
+    assert runtime.model_path == materialized_path
+    assert runtime.materialization_provenance["cache_key"] == "test-cache-key"
+    assert sessions[0].path == materialized_path

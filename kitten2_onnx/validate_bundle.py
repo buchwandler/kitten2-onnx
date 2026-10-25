@@ -27,6 +27,34 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+
+def _tensor_sha256(model_path: Path, tensor: Any) -> str:
+    import onnx
+
+    from kitten2_onnx.external_data import logical_tensor_bytes, resolve_external_data_range
+
+    digest = hashlib.sha256()
+    if tensor.data_location == onnx.TensorProto.EXTERNAL:
+        tensor_slice = resolve_external_data_range(
+            model_path.parent,
+            tensor,
+            logical_bytes=logical_tensor_bytes(tensor),
+            require_exact_length=True,
+        )
+        with tensor_slice.path.open("rb") as stream:
+            stream.seek(tensor_slice.offset)
+            remaining = tensor_slice.length
+            while remaining:
+                block = stream.read(min(8 * 1024 * 1024, remaining))
+                if not block:
+                    raise ValueError(f"External tensor data ended early: {tensor.name}")
+                digest.update(block)
+                remaining -= len(block)
+    else:
+        raw = tensor.raw_data or onnx.numpy_helper.to_array(tensor).tobytes(order="C")
+        digest.update(raw)
+    return digest.hexdigest()
+
 def _resolve_file(root: Path, relative_path: str) -> Path:
     relative = Path(relative_path)
     if relative.is_absolute() or ".." in relative.parts:
@@ -96,6 +124,7 @@ def _check_graph(
     input_shapes: dict[str, list[Any]] | None,
     output_shape: list[Any] | None,
     errors: list[str],
+    session_graph_path: Path | None = None,
 ) -> dict[str, Any] | None:
     import onnx
     import onnxruntime as ort
@@ -122,10 +151,10 @@ def _check_graph(
 
     try:
         if session_options is None:
-            session = ort.InferenceSession(str(graph_path), providers=providers)
+            session = ort.InferenceSession(str(session_graph_path or graph_path), providers=providers)
         else:
             session = ort.InferenceSession(
-                str(graph_path), sess_options=session_options, providers=providers
+                str(session_graph_path or graph_path), sess_options=session_options, providers=providers
             )
     except (ValueError, OSError, RuntimeError) as error:
         errors.append(f"{label} ONNX Runtime session failed: {error}")
@@ -183,6 +212,7 @@ def validate_bundle(
     bundle_dir: str | Path,
     *,
     providers: list[str] | None = None,
+    materialization_cache_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Check file integrity, graph contracts, token/config invariants, and voice assets."""
     root = Path(bundle_dir).resolve()
@@ -334,6 +364,7 @@ def validate_bundle(
     if not isinstance(export_meta, dict):
         errors.append("Bundle export metadata must be an object")
         export_meta = {}
+    transformer_storage: dict[str, Any] = {}
     if bundle_v2:
         variant = lm.get("weight_variant")
         if variant not in {"packed", "emb4"}:
@@ -348,6 +379,7 @@ def validate_bundle(
             errors.append("Bundle v2 must declare transformer and vocabulary storage")
             transformer = transformer if isinstance(transformer, dict) else {}
             vocabulary = vocabulary if isinstance(vocabulary, dict) else {}
+        transformer_storage = transformer
         source_hash = lm.get("source_weight_sha256")
         if not isinstance(source_hash, str) or len(source_hash) != 64 or any(
             char not in "0123456789abcdef" for char in source_hash
@@ -406,6 +438,221 @@ def validate_bundle(
                 or quantization.get("source_weight_sha256") != source_hash
             ):
                 errors.append("LM q4 quantization provenance is inconsistent with bundle metadata")
+        elif transformer.get("method") == "ternary-tritpack-exact":
+            import onnx
+
+            from kitten2_onnx.ternary_tritpack_storage import TERNARY_TRITPACK_FORMAT_VERSION
+
+            quantization = lm_meta.get("quantization", {}) if lm_meta is not None else {}
+            if (
+                transformer.get("format_version") != TERNARY_TRITPACK_FORMAT_VERSION
+                or transformer.get("source_group_size") != 128
+                or transformer.get("trits_per_byte") != 5
+                or transformer.get("packed_bytes_per_group") != 26
+                or transformer.get("scale_dtype") != "float32"
+                or transformer.get("execution_op") != "MatMul"
+                or transformer.get("execution_semantics") != "standard-fp32-matmul"
+                or transformer.get("lossy") is not False
+                or transformer.get("numeric_reconstruction_exact") is not True
+                or transformer.get("signed_zero_preserved") is not False
+                or transformer.get("runtime_materialization_required") is not True
+                or transformer.get("runtime_memory_profile") != "low-memory-exact-ternary"
+                or transformer.get("materialized_dtype") != "float32"
+                or transformer.get("cache_key_inputs")
+                != ["graph_sha256", "payload_sha256", "format_version"]
+            ):
+                errors.append("Bundle tritpack transformer storage contract is inconsistent")
+            if (
+                not isinstance(quantization, dict)
+                or quantization.get("method") != "ternary-tritpack-exact"
+                or quantization.get("format_version") != TERNARY_TRITPACK_FORMAT_VERSION
+                or quantization.get("source_weight_sha256") != source_hash
+                or quantization.get("graph_sha256") != transformer.get("graph_sha256")
+                or quantization.get("payload_file") != transformer.get("payload_file")
+                or quantization.get("payload_sha256") != transformer.get("payload_sha256")
+                or quantization.get("weights") != transformer.get("weights")
+                or quantization.get("transformed_matmul_count")
+                != transformer.get("transformed_matmul_count")
+                or quantization.get("transformed_initializer_count")
+                != transformer.get("transformed_initializer_count")
+                or quantization.get("runtime_materialization_required") is not True
+                or quantization.get("runtime_memory_profile")
+                != transformer.get("runtime_memory_profile")
+                or lm_meta is None
+                or lm_meta.get("runtime_memory_profile") != transformer.get("runtime_memory_profile")
+            ):
+                errors.append("LM tritpack quantization provenance is inconsistent with bundle metadata")
+            lm_graph_path = require(lm.get("model", lm.get("core_model", "")))
+            payload_file = transformer.get("payload_file")
+            payload_path = None
+            if not isinstance(payload_file, str) or not payload_file:
+                errors.append("Bundle tritpack payload file is missing")
+            else:
+                payload_relative = (Path(lm.get("model", lm.get("core_model", ""))).parent / payload_file).as_posix()
+                payload_path = require(payload_relative)
+                if payload_path is not None and _sha256(payload_path) != transformer.get("payload_sha256"):
+                    errors.append("Bundle tritpack payload SHA256 differs from storage metadata")
+            if lm_graph_path is not None:
+                if _sha256(lm_graph_path) != transformer.get("graph_sha256"):
+                    errors.append("Bundle tritpack graph SHA256 differs from storage metadata")
+                try:
+                    model = onnx.load(str(lm_graph_path), load_external_data=False)
+                except (onnx.checker.ValidationError, ValueError, OSError, RuntimeError) as error:
+                    errors.append(f"Bundle tritpack graph could not be parsed: {error}")
+                    model = onnx.ModelProto()
+                initializer_by_name = {item.name: item for item in model.graph.initializer}
+                node_by_name = {item.name: item for item in model.graph.node if item.name}
+                graph_values = {output for node in model.graph.node for output in node.output}
+                matmul_nodes = [item for item in model.graph.node if item.op_type == "MatMul"]
+                matmul_nbits_count = sum(item.op_type == "MatMulNBits" for item in model.graph.node)
+                weights = transformer.get("weights")
+                reports = quantization.get("initializer_reports", []) if isinstance(quantization, dict) else []
+                if not isinstance(reports, list):
+                    errors.append("LM tritpack initializer reports must be a list")
+                    reports = []
+                reports_by_source = {}
+                for item in reports:
+                    if isinstance(item, dict) and isinstance(item.get("source_initializer"), str):
+                        reports_by_source[item["source_initializer"]] = item
+                if not isinstance(weights, list) or len(weights) != transformer.get(
+                    "transformed_initializer_count"
+                ):
+                    errors.append("Bundle tritpack initializer count differs from its weight mapping")
+                    weights = []
+                if (
+                    transformer.get("transformed_matmul_count") != 196
+                    or matmul_nbits_count != 0
+                ):
+                    errors.append("Bundle tritpack graph must use standard MatMul for all 196 transformer weights")
+                seen_source: set[str] = set()
+                seen_nodes: set[str] = set()
+                source_hashes: set[str] = set()
+                code_bytes = 0
+                scale_bytes = 0
+                logical_bytes = 0
+                source_shapes: set[tuple[int, ...]] = set()
+                for weight in weights:
+                    if not isinstance(weight, dict):
+                        errors.append("Bundle tritpack weight mapping must contain objects")
+                        continue
+                    source_name = weight.get("source_initializer")
+                    source_shape = weight.get("source_shape")
+                    code_name = weight.get("code_initializer")
+                    scale_name = weight.get("scale_initializer")
+                    target_nodes = weight.get("transformed_nodes")
+                    weight_value = weight.get("weight_value")
+                    if (
+                        not isinstance(source_name, str)
+                        or not isinstance(source_shape, list)
+                        or len(source_shape) != 2
+                        or any(type(dim) is not int or dim <= 0 for dim in source_shape)
+                        or not isinstance(code_name, str)
+                        or not isinstance(scale_name, str)
+                        or not isinstance(weight_value, str)
+                        or not isinstance(target_nodes, list)
+                        or not target_nodes
+                    ):
+                        errors.append("Bundle tritpack weight mapping is malformed")
+                        continue
+                    if source_name in seen_source or source_name in initializer_by_name:
+                        errors.append(f"Bundle tritpack source initializer is duplicated or retained: {source_name}")
+                    seen_source.add(source_name)
+                    source_shapes.add(tuple(source_shape))
+                    source_sha = weight.get("source_sha256")
+                    if not isinstance(source_sha, str) or len(source_sha) != 64 or any(
+                        char not in "0123456789abcdef" for char in source_sha
+                    ):
+                        errors.append(f"Bundle tritpack source hash is invalid: {source_name}")
+                    else:
+                        source_hashes.add(source_sha)
+                    codes = initializer_by_name.get(code_name)
+                    scales = initializer_by_name.get(scale_name)
+                    if codes is None or scales is None:
+                        errors.append(f"Bundle tritpack codes or scales are missing: {source_name}")
+                        continue
+                    k, n = source_shape
+                    group_count = k // 128
+                    expected_code_shape = [group_count, n, 26]
+                    expected_scale_shape = [group_count, 1, n]
+                    if (
+                        k % 128
+                        or codes.data_type != onnx.TensorProto.UINT8
+                        or list(codes.dims) != expected_code_shape
+                        or scales.data_type != onnx.TensorProto.FLOAT
+                        or list(scales.dims) != expected_scale_shape
+                    ):
+                        errors.append(f"Bundle tritpack code or scale shape is invalid: {source_name}")
+                    code_bytes += int(np.prod(codes.dims))
+                    scale_bytes += int(np.prod(scales.dims)) * np.dtype(np.float32).itemsize
+                    logical_bytes += k * n * np.dtype(np.float32).itemsize
+                    for tensor in (codes, scales):
+                        external = {entry.key: entry.value for entry in tensor.external_data}
+                        if tensor.data_location != onnx.TensorProto.EXTERNAL or external.get(
+                            "location"
+                        ) != payload_file:
+                            errors.append(f"Bundle tritpack tensor is outside its payload: {tensor.name}")
+                    initializer_report = reports_by_source.get(source_name, {})
+                    for tensor, expected_sha in (
+                        (codes, initializer_report.get("code_sha256")),
+                        (scales, initializer_report.get("scale_sha256")),
+                    ):
+                        if not isinstance(expected_sha, str) or len(expected_sha) != 64:
+                            errors.append(f"Bundle tritpack tensor hash metadata is invalid: {tensor.name}")
+                            continue
+                        try:
+                            actual_sha = _tensor_sha256(lm_graph_path, tensor)
+                        except (OSError, ValueError, TypeError) as error:
+                            errors.append(f"Bundle tritpack tensor could not be read: {tensor.name}: {error}")
+                        else:
+                            if actual_sha != expected_sha:
+                                errors.append(f"Bundle tritpack tensor hash differs: {tensor.name}")
+                    for node_name in target_nodes:
+                        if not isinstance(node_name, str):
+                            errors.append("Bundle tritpack transformed MatMul name is invalid")
+                            continue
+                        node = node_by_name.get(node_name)
+                        if (
+                            node is None
+                            or node.op_type != "MatMul"
+                            or len(node.input) < 2
+                            or node.input[1] != weight_value
+                        ):
+                            errors.append(f"Bundle tritpack transformed MatMul mapping is invalid: {node_name}")
+                        if node_name in seen_nodes:
+                            errors.append(f"Bundle tritpack MatMul is mapped more than once: {node_name}")
+                        seen_nodes.add(node_name)
+                    if weight_value not in graph_values and weight_value not in initializer_by_name:
+                        errors.append(f"Bundle tritpack reconstructed weight is missing: {source_name}")
+                if set(reports_by_source) != seen_source:
+                    errors.append("Bundle tritpack initializer reports differ from the weight mapping")
+                matmul_node_names = {node.name for node in matmul_nodes if node.name}
+                if len(seen_nodes) != 196 or not seen_nodes <= matmul_node_names:
+                    errors.append("Bundle tritpack mapping does not cover all 196 transformed MatMuls")
+                if (
+                    code_bytes != transformer.get("packed_code_bytes")
+                    or scale_bytes != transformer.get("scale_bytes")
+                    or logical_bytes != transformer.get("logical_fp32_operand_bytes")
+                    or logical_bytes != transformer.get("materialized_external_bytes")
+                ):
+                    errors.append("Bundle tritpack storage byte counts are inconsistent")
+                for initializer in model.graph.initializer:
+                    if (
+                        initializer.data_type != onnx.TensorProto.FLOAT
+                        or tuple(initializer.dims) not in source_shapes
+                        or initializer.name in seen_source
+                    ):
+                        continue
+                    try:
+                        initializer_sha = _tensor_sha256(lm_graph_path, initializer)
+                    except (OSError, ValueError, TypeError) as error:
+                        errors.append(
+                            f"Bundle tritpack initializer could not be read: {initializer.name}: {error}"
+                        )
+                        continue
+                    if initializer_sha in source_hashes:
+                        errors.append(
+                            f"Bundle tritpack graph retains a duplicate FP32 source weight: {initializer.name}"
+                        )
         elif transformer.get("method") != "float":
             errors.append("Bundle transformer storage method is unsupported")
     if export_meta.get("runtime_profile") == "cuda-fp16":
@@ -496,10 +743,41 @@ def validate_bundle(
             output_shape = [1, metadata.get("hidden_size")]
         if label in {"lm", "lm_output"}:
             output_shape = None if label == "lm" else metadata.get("output_head_output_shape")
+        runtime_graph_path = None
+        materialization_report = None
+        if label == "lm" and transformer_storage.get("method") == "ternary-tritpack-exact":
+            from kitten2_onnx.materialized_weights import (
+                default_materialization_cache_root,
+                materialize_tritpack_model,
+            )
+
+            cache_root = (
+                Path(materialization_cache_dir)
+                if materialization_cache_dir is not None
+                else default_materialization_cache_root()
+            )
+            try:
+                materialized = materialize_tritpack_model(
+                    graph_path,
+                    cache_root,
+                    storage_metadata=transformer_storage,
+                )
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+                errors.append(f"LM tritpack materialization failed: {error}")
+                continue
+            runtime_graph_path = materialized.model_path
+            materialization_report = {
+                "cache_dir": str(materialized.cache_dir),
+                "cache_key": materialized.provenance.get("cache_key"),
+                "model_sha256": _sha256(materialized.model_path),
+                "external_data_sha256": _sha256(materialized.data_path),
+                "provenance": materialized.provenance,
+            }
         graph_report = _check_graph(
             root=root,
             label=label,
             graph_path=graph_path,
+            session_graph_path=runtime_graph_path,
             metadata=metadata,
             providers=providers,
             expected_inputs=inputs,
@@ -509,6 +787,8 @@ def validate_bundle(
             errors=errors,
         )
         if graph_report is not None:
+            if materialization_report is not None:
+                graph_report["materialization"] = materialization_report
             report["graphs"][label] = graph_report
     if len(report["graphs"]) == len(graph_specs):
         report["checks"].append("ONNX checker, Runtime sessions, and graph I/O")
@@ -774,9 +1054,18 @@ def main(argv: Iterable[str] | None = None) -> int:
         dest="providers",
         help="ONNX Runtime provider to use (repeatable, defaults to CPUExecutionProvider)",
     )
+    parser.add_argument(
+        "--materialization-cache-dir",
+        type=Path,
+        help="External cache root for exact tritpack runtime materialization",
+    )
     args = parser.parse_args(argv)
 
-    report = validate_bundle(args.bundle_dir, providers=args.providers)
+    report = validate_bundle(
+        args.bundle_dir,
+        providers=args.providers,
+        materialization_cache_dir=args.materialization_cache_dir,
+    )
     serialized = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)

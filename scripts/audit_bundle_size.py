@@ -413,6 +413,46 @@ def _ternary_exact_int8_size_report(
 
 
 
+
+
+def _ternary_tritpack_size_report(
+    graph: Any,
+    initializer_details: list[dict[str, Any]],
+    quantization: dict[str, Any],
+) -> dict[str, Any]:
+    if quantization.get("method") != "ternary-tritpack-exact":
+        return {}
+    initializers = {item["name"]: item for item in initializer_details}
+    reports = quantization.get("initializer_reports", [])
+    code_names = [item["code_initializer"] for item in reports]
+    scale_names = [item["scale_initializer"] for item in reports]
+    missing = sorted((set(code_names) | set(scale_names)) - initializers.keys())
+    code_bytes = sum(initializers[name]["storage_bytes"] for name in code_names if name in initializers)
+    scale_bytes = sum(initializers[name]["storage_bytes"] for name in scale_names if name in initializers)
+    logical_bytes = sum(
+        int(np.prod(item["source_shape"])) * np.dtype(np.float32).itemsize
+        for item in reports
+    )
+    source_names = {item["source_initializer"] for item in reports}
+    source_initializers_remaining = sorted(source_names & initializers.keys())
+    compact_bytes = code_bytes + scale_bytes
+    return {
+        "method": "ternary-tritpack-exact",
+        "transformed_matmul_count": quantization.get("transformed_matmul_count"),
+        "transformed_initializer_count": len(reports),
+        "packed_code_bytes": code_bytes,
+        "scale_bytes": scale_bytes,
+        "compact_transformer_storage_bytes": compact_bytes,
+        "logical_fp32_operand_bytes": logical_bytes,
+        "compression_ratio": compact_bytes / logical_bytes if logical_bytes else None,
+        "materialized_local_cache_bytes_required": quantization.get(
+            "materialized_external_bytes"
+        ),
+        "source_initializers_remaining": source_initializers_remaining,
+        "missing_code_or_scale_initializers": missing,
+        "standard_matmul_count": sum(node.op_type == "MatMul" for node in graph.node),
+        "matmul_nbits_count": sum(node.op_type == "MatMulNBits" for node in graph.node),
+    }
 def _graph_size_report(graph_path: Path) -> dict[str, Any]:
     model = onnx.load(str(graph_path), load_external_data=False)
     graph = model.graph
@@ -504,6 +544,9 @@ def _graph_size_report(graph_path: Path) -> dict[str, Any]:
             json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.is_file() else {}
         )
         quantization = metadata.get("quantization", {})
+        report["ternary_tritpack"] = _ternary_tritpack_size_report(
+            graph, initializer_details, quantization
+        )
         report["fallback_storage"] = quantization.get("fallback_storage", {})
         report["quantization_provenance"] = quantization.get("provenance", {})
         if quantization.get("method") == "ternary-exact-int8":
@@ -738,6 +781,7 @@ def audit_bundle(
             ),
             "fallback_storage": graphs.get("lm", {}).get("fallback_storage", {}),
             "ternary_exact_int8": graphs.get("lm", {}).get("ternary_exact_int8", {}),
+            "ternary_tritpack": graphs.get("lm", {}).get("ternary_tritpack", {}),
         },
     }
     if bundle_manifest.get("format") == "kitten2-onnx-bundle-v2":

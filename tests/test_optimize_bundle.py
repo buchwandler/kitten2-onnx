@@ -387,6 +387,7 @@ def test_optimize_cli_exposes_chunked_mode_without_removing_legacy_mode(monkeypa
     assert "int8-dynamic-chunked" in help_output
 
     assert "ternary-nbits4" in help_output
+    assert "ternary-tritpack-exact" in help_output
     assert "ternary-exact-int8-to-nbits4" in help_output
     assert "--chunk-rows" in help_output
     assert "--exclude-matmul-initializer" in help_output
@@ -1113,3 +1114,112 @@ def test_optimize_bundle_v2_builds_q4_and_preserves_variant_provenance(tmp_path)
     assert output_metadata["quantization"]["source_weight_sha256"] == source_hash
     assert report["quantization"]["method"] == "ternary-nbits"
     assert report["size_report"]
+
+
+    source_graph_path = source / "lm/lm.onnx"
+    source_model = onnx.load(str(source_graph_path))
+    non_ternary_weight = np.linspace(-0.4, 0.6, 256, dtype=np.float32).reshape(128, 2)
+    source_model.graph.initializer.append(
+        numpy_helper.from_array(non_ternary_weight, name="non_ternary_weight")
+    )
+    source_model.graph.node.append(
+        helper.make_node(
+            "MatMul",
+            ["inputs_embeds", "non_ternary_weight"],
+            ["diagnostic_logits"],
+            name="non_ternary_matmul",
+        )
+    )
+    source_model.graph.output.append(
+        helper.make_tensor_value_info("diagnostic_logits", TensorProto.FLOAT, [1, 2])
+    )
+    onnx.save_model(
+        source_model,
+        str(source_graph_path),
+        save_as_external_data=True,
+        all_tensors_to_one_file=True,
+        location="lm.onnx.data",
+        size_threshold=0,
+    )
+    source_metadata_path = source / "lm/lm.meta.json"
+    source_metadata = json.loads(source_metadata_path.read_text(encoding="utf-8"))
+    source_metadata["output_names"].append("diagnostic_logits")
+    source_metadata_path.write_text(json.dumps(source_metadata), encoding="utf-8")
+    source_bundle_path = source / "bundle.json"
+    source_bundle = json.loads(source_bundle_path.read_text(encoding="utf-8"))
+    source_bundle["files"] = {
+        path.relative_to(source).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(source.rglob("*"))
+        if path.is_file() and path != source_bundle_path
+    }
+    source_bundle_path.write_text(json.dumps(source_bundle), encoding="utf-8")
+
+
+    tritpack_output = tmp_path / "optimized-tritpack-v2"
+    tritpack_reports = tmp_path / "tritpack-reports"
+    tritpack_result = optimize_bundle(
+        source,
+        tritpack_output,
+        lm_method="ternary-tritpack-exact",
+        report_dir=tritpack_reports,
+        chunk_rows=1,
+    )
+    tritpack_bundle = json.loads((tritpack_output / "bundle.json").read_text(encoding="utf-8"))
+    tritpack_metadata = json.loads(
+        (tritpack_output / "lm/lm.meta.json").read_text(encoding="utf-8")
+    )
+    tritpack_storage = tritpack_bundle["lm"]["storage"]["transformer"]
+    tritpack_graph = onnx.load(
+        str(tritpack_output / "lm/lm.onnx"), load_external_data=False
+    )
+
+    assert tritpack_result["quantization"]["method"] == "ternary-tritpack-exact"
+    assert tritpack_storage["method"] == "ternary-tritpack-exact"
+    assert tritpack_storage["transformed_matmul_count"] == 196
+    assert tritpack_storage["transformed_initializer_count"] == 1
+    assert tritpack_storage["runtime_materialization_required"] is True
+    assert tritpack_storage["source_weight_sha256"] == source_hash
+    assert len(tritpack_storage["weights"]) == 1
+    assert tritpack_metadata["quantization"]["source_weight_sha256"] == source_hash
+    assert sum(node.op_type == "MatMul" for node in tritpack_graph.graph.node) == 197
+    assert not any(node.op_type == "MatMulNBits" for node in tritpack_graph.graph.node)
+    assert "weight" not in {item.name for item in tritpack_graph.graph.initializer}
+    assert (tritpack_output / "lm" / tritpack_storage["payload_file"]).is_file()
+    from kitten2_onnx.materialized_weights import materialize_tritpack_model
+
+    materialized = materialize_tritpack_model(
+        tritpack_output / "lm/lm.onnx",
+        tmp_path / "materialized-cache",
+        storage_metadata=tritpack_storage,
+    )
+    sample = np.random.default_rng(8).normal(size=(1, 128)).astype(np.float32)
+    source_session = ort.InferenceSession(
+        str(source / "lm/lm.onnx"), providers=["CPUExecutionProvider"]
+    )
+    materialized_session = ort.InferenceSession(
+        str(materialized.model_path), providers=["CPUExecutionProvider"]
+    )
+    expected_outputs = source_session.run(None, {"inputs_embeds": sample})
+    actual_outputs = materialized_session.run(None, {"inputs_embeds": sample})
+    assert len(actual_outputs) == 197
+    for expected, actual in zip(expected_outputs, actual_outputs, strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+    size_report = json.loads(Path(tritpack_result["size_report"]).read_text(encoding="utf-8"))
+    assert size_report["storage_breakdown"]["ternary_tritpack"][
+        "compact_transformer_storage_bytes"
+    ] == tritpack_storage["packed_code_bytes"] + tritpack_storage["scale_bytes"]
+
+
+    from kitten2_onnx.validate_bundle import validate_bundle
+
+    validation = validate_bundle(
+        tritpack_output,
+        materialization_cache_dir=tmp_path / "validator-cache",
+    )
+    assert "lm" in validation["graphs"]
+    assert validation["vocabulary_storage"]["physical_copies"] == 1
+    assert validation["graphs"]["lm"]["materialization"]["cache_key"]
+    assert not any("tritpack" in error.lower() for error in validation["errors"]), validation[
+        "errors"
+    ]

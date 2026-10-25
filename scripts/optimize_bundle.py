@@ -243,6 +243,27 @@ def _exact_ternary_external_location(
             continue
         return location, path, stale_candidates
     raise FileExistsError("Could not allocate exact ternary INT8 external-data path")
+
+
+def _tritpack_external_location(
+    lm_model_path: Path,
+    referenced_paths: set[Path],
+) -> tuple[str, Path, list[Path]]:
+    stale_candidates: list[Path] = []
+    for index in range(1000):
+        location = (
+            "lm.tritpack-exact.onnx.data"
+            if index == 0
+            else f"lm.tritpack-exact-{index}.onnx.data"
+        )
+        path = _bundle_path(lm_model_path.parent, location)
+        if path in referenced_paths:
+            continue
+        if path.exists():
+            stale_candidates.append(path)
+            continue
+        return location, path, stale_candidates
+    raise FileExistsError("Could not allocate tritpack external-data path")
 def _quantize_lm_chunked(
     bundle_dir: Path,
     bundle: dict[str, Any],
@@ -768,6 +789,176 @@ def _quantize_lm_ternary_exact_int8(
     return metadata["quantization"]
 
 
+
+
+def _quantize_lm_ternary_tritpack_exact(
+    bundle_dir: Path,
+    bundle: dict[str, Any],
+    *,
+    column_chunk: int,
+    progress_path: Path | None = None,
+) -> dict[str, Any]:
+    import platform
+    import subprocess
+
+    import onnx
+
+    from kitten2_onnx.ternary_tritpack_storage import (
+        build_ternary_tritpack_inventory,
+        compress_ternary_matmuls_to_tritpack_streaming,
+    )
+
+    lm_entry = bundle["lm"]
+    lm_meta_path = _bundle_path(bundle_dir, lm_entry["metadata"])
+    lm_model_path = _bundle_path(bundle_dir, lm_entry["model"])
+    metadata = json.loads(lm_meta_path.read_text(encoding="utf-8"))
+    if metadata.get("runtime_provider") != "CPUExecutionProvider":
+        raise ValueError("Tritpack LM optimization requires a CPU deployment bundle")
+    if metadata.get("io_dtype") != "float32":
+        raise ValueError("Tritpack LM optimization requires float32 graph I/O")
+
+    source_hash = _sha256(lm_model_path)
+    source_model = onnx.load(str(lm_model_path), load_external_data=False)
+    source_locations = _all_external_locations(source_model)
+    source_paths = {
+        _bundle_path(lm_model_path.parent, location) for location in source_locations
+    }
+    source_external_hashes = {
+        location: _sha256(_bundle_path(lm_model_path.parent, location))
+        for location in sorted(source_locations)
+    }
+    referenced_before = _bundle_external_paths(bundle_dir)
+    external_location, external_path, stale_candidates = _tritpack_external_location(
+        lm_model_path,
+        referenced_before,
+    )
+    candidate_graph = lm_model_path.with_name(
+        f".lm.tritpack-{uuid.uuid4().hex}.tmp.onnx"
+    )
+
+    def record_stage(stage: str, details: dict[str, Any]) -> None:
+        if progress_path is not None:
+            _append_build_progress(progress_path, stage, **details)
+
+    try:
+        inventory = build_ternary_tritpack_inventory(
+            lm_model_path,
+            expected_eligible_matmul_count=196,
+            column_chunk=column_chunk,
+        )
+        transformation = compress_ternary_matmuls_to_tritpack_streaming(
+            lm_model_path,
+            candidate_graph,
+            external_path,
+            inventory=inventory,
+            column_chunk=column_chunk,
+            stage_callback=record_stage,
+        )
+        candidate_model = onnx.load(str(candidate_graph), load_external_data=False)
+        external_locations = _all_external_locations(candidate_model)
+        if external_location not in external_locations:
+            raise ValueError("Tritpack payload is not referenced by the transformed graph")
+        onnx.checker.check_model(str(candidate_graph))
+        os.replace(candidate_graph, lm_model_path)
+    except BaseException:
+        candidate_graph.unlink(missing_ok=True)
+        external_path.unlink(missing_ok=True)
+        raise
+
+    referenced_after = _bundle_external_paths(bundle_dir)
+    stale_paths = {
+        path
+        for path in source_paths | set(stale_candidates)
+        if path.is_relative_to(bundle_dir.resolve())
+    } - referenced_after
+    for stale_path in sorted(stale_paths):
+        if stale_path.is_file():
+            stale_path.unlink()
+
+    transformed_model = onnx.load(str(lm_model_path), load_external_data=False)
+    nodes_by_name = {node.name: node for node in transformed_model.graph.node if node.name}
+    weights = []
+    for entry in transformation["initializer_reports"]:
+        first_node = nodes_by_name[entry["transformed_nodes"][0]]
+        weight_value = entry.get("weight_value", first_node.input[1])
+        if first_node.input[1] != weight_value:
+            raise ValueError(f"Tritpack weight value differs for {entry['source_initializer']}")
+        weights.append(
+            {
+                "source_initializer": entry["source_initializer"],
+                "source_shape": entry["source_shape"],
+                "source_sha256": entry["source_sha256"],
+                "code_initializer": entry["code_initializer"],
+                "scale_initializer": entry["scale_initializer"],
+                "transformed_nodes": entry["transformed_nodes"],
+                "weight_value": weight_value,
+            }
+        )
+
+    project_root = Path(__file__).resolve().parents[1]
+    repository_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=project_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    runtime_options = {
+        "intra_op_threads": 1,
+        "inter_op_threads": 1,
+        "execution_mode": "sequential",
+        "enable_mem_pattern": False,
+        "enable_cpu_mem_arena": False,
+        "graph_optimization_level": "ORT_DISABLE_ALL",
+    }
+    runtime_memory_profile = "low-memory-exact-ternary"
+    payload_sha256 = _sha256(external_path)
+    materialized_bytes = transformation["logical_fp32_operand_bytes"]
+    metadata["external_data"] = bool(external_locations)
+    metadata["external_data_files"] = sorted(external_locations)
+    metadata["runtime_memory_profile"] = runtime_memory_profile
+    metadata["runtime_options"] = runtime_options
+    metadata["quantization"] = {
+        **transformation,
+        "method": "ternary-tritpack-exact",
+        "backend": "streaming",
+        "runtime_materialization_required": True,
+        "runtime_memory_profile": runtime_memory_profile,
+        "runtime_options": runtime_options,
+        "materialized_dtype": "float32",
+        "materialized_external_bytes": materialized_bytes,
+        "cache_key_inputs": ["graph_sha256", "payload_sha256", "format_version"],
+        "payload_file": external_location,
+        "payload_sha256": payload_sha256,
+        "provenance": {
+            "onnx_version": onnx.__version__,
+            "python_version": platform.python_version(),
+            "cpu_architecture": platform.machine(),
+            "repository_commit": repository_commit,
+            "source_model_revision": bundle.get("revisions", {}).get(
+                "source_model_revision", metadata.get("source_model_revision")
+            ),
+            "source_weight_variant": bundle["lm"].get("weight_variant"),
+        },
+    }
+    metadata["quantization"].update(
+        {
+            "source_graph_sha256": source_hash,
+            "source_external_data_sha256": source_external_hashes,
+            "graph_sha256": _sha256(lm_model_path),
+            "external_data_sha256": {
+                location: _sha256(_bundle_path(lm_model_path.parent, location))
+                for location in sorted(external_locations)
+            },
+            "initializer_reports": transformation["initializer_reports"],
+            "weights": weights,
+        }
+    )
+    lm_meta_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return metadata["quantization"]
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -852,7 +1043,11 @@ def _optimize_bundle_build(
         else output_root.with_name(f"{output_root.name}-reports")
     )
     report_root.mkdir(parents=True, exist_ok=True)
-    progress_path = report_root / "build-progress.jsonl" if lm_method == "ternary-exact-int8" else None
+    progress_path = (
+        report_root / "build-progress.jsonl"
+        if lm_method in {"ternary-exact-int8", "ternary-tritpack-exact"}
+        else None
+    )
     if progress_path is not None and progress_path.exists():
         raise FileExistsError(progress_path)
     output_root.parent.mkdir(parents=True, exist_ok=True)
@@ -861,6 +1056,7 @@ def _optimize_bundle_build(
         "int8-dynamic-chunked",
         "ternary-nbits",
         "ternary-nbits4",
+        "ternary-tritpack-exact",
         "ternary-exact-int8",
         "ternary-exact-int8-to-nbits4",
     ):
@@ -870,6 +1066,7 @@ def _optimize_bundle_build(
             "int8-dynamic-chunked",
             "ternary-nbits",
             "ternary-nbits4",
+            "ternary-tritpack-exact",
             "ternary-exact-int8",
             "ternary-exact-int8-to-nbits4",
         )
@@ -880,18 +1077,26 @@ def _optimize_bundle_build(
         raise ValueError("MatMul inclusion requires the ternary-exact-int8 method")
     if include_matmul_nodes and (exclude_matmul_nodes or exclude_matmul_initializers):
         raise ValueError("MatMul inclusion cannot be combined with exclusions")
+    if lm_method == "ternary-tritpack-exact" and (
+        exclude_matmul_nodes or exclude_matmul_initializers or include_matmul_nodes
+    ):
+        raise ValueError("Tritpack optimization requires all eligible MatMuls")
 
     input_bundle_path = input_root / "bundle.json"
     bundle = json.loads(input_bundle_path.read_text(encoding="utf-8"))
     if bundle.get("format") not in {"kitten2-onnx-bundle-v1", "kitten2-onnx-bundle-v2"}:
         raise ValueError("Unsupported bundle format")
+    if lm_method == "ternary-tritpack-exact" and bundle["format"] != "kitten2-onnx-bundle-v2":
+        raise ValueError("Exact tritpack storage is supported only for bundle v2")
     if bundle["format"] == "kitten2-onnx-bundle-v2":
         if bundle.get("lm", {}).get("weight_variant") not in {"packed", "emb4"}:
             raise ValueError("Bundle v2 requires a packed or emb4 LM weight variant")
-        if lm_method != "ternary-nbits4" or nbits != 4:
-            raise ValueError("Packed and emb4 bundle v2 builds require q4 ternary-nbits4 optimization")
+        if lm_method not in {"ternary-nbits4", "ternary-tritpack-exact"} or (
+            lm_method == "ternary-nbits4" and nbits != 4
+        ):
+            raise ValueError("Packed and emb4 bundle v2 requires q4 diagnostics or exact tritpack storage")
         if exclude_matmul_nodes or exclude_matmul_initializers:
-            raise ValueError("Packed and emb4 bundle v2 builds require all transformer MatMuls to use q4")
+            raise ValueError("Packed and emb4 bundle v2 requires all transformer MatMuls to be transformed")
     source_size = sum(path.stat().st_size for path in input_root.rglob("*") if path.is_file())
     if lm_method == "ternary-exact-int8":
         _copy_bundle_for_exact_ternary(input_root, output_root, bundle)
@@ -919,6 +1124,13 @@ def _optimize_bundle_build(
             exclude_nodes=exclude_matmul_nodes,
             exclude_initializers=exclude_matmul_initializers,
             include_nodes=include_matmul_nodes,
+            progress_path=progress_path,
+        )
+    elif lm_method == "ternary-tritpack-exact":
+        quantization = _quantize_lm_ternary_tritpack_exact(
+            output_root,
+            bundle,
+            column_chunk=chunk_rows,
             progress_path=progress_path,
         )
     elif lm_method == "ternary-exact-int8-to-nbits4":
@@ -954,16 +1166,60 @@ def _optimize_bundle_build(
         lm_meta_path.write_text(
             json.dumps(lm_metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
-        bundle["lm"]["storage"]["transformer"] = {
-            "method": "matmul-nbits",
-            "bits": 4,
-            "block_size": quantization["block_size"],
-            "source_group_size": quantization.get("source_group_size", 128),
-            "zero_point": 8,
-            "source_weight_sha256": bundle["lm"]["source_weight_sha256"],
-            "source_graph_sha256": quantization["source_graph_sha256"],
-            "graph_sha256": quantization["graph_sha256"],
-        }
+        if lm_method == "ternary-tritpack-exact":
+            bundle["lm"]["storage"]["transformer"] = {
+                "method": "ternary-tritpack-exact",
+                "format_version": quantization["format_version"],
+                "source_group_size": quantization["group_size"],
+                "trits_per_byte": quantization["trits_per_byte"],
+                "packed_bytes_per_group": quantization["packed_bytes_per_group"],
+                "scale_dtype": "float32",
+                "execution_op": "MatMul",
+                "execution_semantics": "standard-fp32-matmul",
+                "lossy": False,
+                "numeric_reconstruction_exact": quantization[
+                    "numeric_reconstruction_exact"
+                ],
+                "signed_zero_preserved": quantization["signed_zero_preserved"],
+                "source_weight_sha256": bundle["lm"]["source_weight_sha256"],
+                "source_graph_sha256": quantization["source_graph_sha256"],
+                "source_external_data_sha256": quantization[
+                    "source_external_data_sha256"
+                ],
+                "graph_sha256": quantization["graph_sha256"],
+                "payload_file": quantization["payload_file"],
+                "payload_sha256": quantization["payload_sha256"],
+                "packed_code_bytes": quantization["packed_code_bytes"],
+                "scale_bytes": quantization["scale_bytes"],
+                "logical_fp32_operand_bytes": quantization[
+                    "logical_fp32_operand_bytes"
+                ],
+                "transformed_matmul_count": quantization[
+                    "transformed_matmul_count"
+                ],
+                "transformed_initializer_count": quantization[
+                    "transformed_initializer_count"
+                ],
+                "runtime_materialization_required": True,
+                "runtime_memory_profile": quantization["runtime_memory_profile"],
+                "materialized_dtype": "float32",
+                "materialized_external_bytes": quantization[
+                    "materialized_external_bytes"
+                ],
+                "cache_key_inputs": quantization["cache_key_inputs"],
+                "weights": quantization["weights"],
+            }
+        else:
+            bundle["lm"]["storage"]["transformer"] = {
+                "method": "matmul-nbits",
+                "bits": 4,
+                "block_size": quantization["block_size"],
+                "source_group_size": quantization.get("source_group_size", 128),
+                "zero_point": 8,
+                "source_weight_sha256": bundle["lm"]["source_weight_sha256"],
+                "source_graph_sha256": quantization["source_graph_sha256"],
+                "graph_sha256": quantization["graph_sha256"],
+            }
     export_metadata = bundle.get("export")
     if not isinstance(export_metadata, dict):
         raise TypeError("Bundle export metadata must be an object")
@@ -1131,6 +1387,7 @@ def main() -> None:
             "int8-dynamic-chunked",
             "ternary-nbits",
             "ternary-nbits4",
+            "ternary-tritpack-exact",
             "ternary-exact-int8",
             "ternary-exact-int8-to-nbits4",
         ),

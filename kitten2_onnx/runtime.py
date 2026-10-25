@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -129,11 +130,25 @@ class Kitten2OnnxLM:
         *,
         speaker_model: str | Path | None = None,
         providers: list[str] | None = None,
+        materialization_cache_dir: str | Path | None = None,
     ):
         import onnxruntime as ort
 
         self.model_dir = Path(model_dir)
         self.meta = json.loads((self.model_dir / "lm.meta.json").read_text(encoding="utf-8"))
+        bundle_manifest_path = self.model_dir.parent / "bundle.json"
+        self.bundle_manifest = (
+            json.loads(bundle_manifest_path.read_text(encoding="utf-8"))
+            if bundle_manifest_path.is_file()
+            else {}
+        )
+        bundle_lm = self.bundle_manifest.get("lm", {})
+        bundle_storage = bundle_lm.get("storage", {}) if isinstance(bundle_lm, dict) else {}
+        self.tritpack_storage = (
+            bundle_storage.get("transformer") if isinstance(bundle_storage, dict) else None
+        )
+        if self.tritpack_storage is not None and not isinstance(self.tritpack_storage, dict):
+            raise ValueError("LM bundle transformer storage metadata must be an object")
         runtime_profile = self.meta.get("runtime_profile")
         io_dtype = self.meta.get("io_dtype")
         if runtime_profile is None or io_dtype is None:
@@ -182,20 +197,64 @@ class Kitten2OnnxLM:
             self.embedding_storage_dtype = None
         else:
             raise ValueError(f"Unsupported LM input mode: {self.input_mode!r}")
-        runtime_memory_profile = self.meta.get("runtime_memory_profile", "default")
+        storage_runtime_profile = (
+            self.tritpack_storage.get("runtime_memory_profile")
+            if isinstance(self.tritpack_storage, dict)
+            else None
+        )
+        runtime_memory_profile = self.meta.get(
+            "runtime_memory_profile", storage_runtime_profile or "default"
+        )
         if runtime_memory_profile not in {"default", "low-memory-exact-ternary"}:
             raise ValueError(f"Unsupported runtime memory profile: {runtime_memory_profile!r}")
+        self.model_path = self.model_dir / "lm.onnx"
+        self.materialization_provenance = None
+        self.materialization_seconds = 0.0
+        storage = self.tritpack_storage
+        if isinstance(storage, dict) and storage.get("method") == "ternary-tritpack-exact":
+            if storage.get("runtime_materialization_required") is not True:
+                raise ValueError("exact tritpack storage requires local runtime materialization")
+            if (
+                storage.get("transformed_matmul_count") != 196
+                or type(storage.get("transformed_initializer_count")) is not int
+                or storage.get("transformed_initializer_count") <= 0
+            ):
+                raise ValueError("runtime materialization requires all 196 packed MatMuls")
+            if runtime_memory_profile != "low-memory-exact-ternary":
+                raise ValueError("tritpack materialization requires the low-memory runtime profile")
+            if runtime_provider != "CPUExecutionProvider" or providers != ["CPUExecutionProvider"]:
+                raise ValueError("tritpack materialization requires CPUExecutionProvider only")
+            from kitten2_onnx.materialized_weights import (
+                default_materialization_cache_root,
+                materialize_tritpack_model,
+            )
+
+            if materialization_cache_dir is None:
+                cache_root = default_materialization_cache_root()
+            else:
+                cache_root = Path(materialization_cache_dir)
+            materialization_started = time.perf_counter()
+            materialized = materialize_tritpack_model(
+                self.model_path,
+                cache_root,
+                storage_metadata=storage,
+            )
+            self.materialization_seconds = time.perf_counter() - materialization_started
+            self.materialization_provenance = materialized.provenance
+            self.model_path = materialized.model_path
+        elif isinstance(storage, dict) and storage.get("runtime_materialization_required") is True:
+            raise ValueError("unsupported LM runtime materialization storage method")
         if runtime_memory_profile == "low-memory-exact-ternary":
             if runtime_provider != "CPUExecutionProvider":
                 raise ValueError("Low-memory exact-ternary profile requires CPUExecutionProvider")
             self.session = ort.InferenceSession(
-                str(self.model_dir / "lm.onnx"),
+                str(self.model_path),
                 sess_options=_cpu_session_options(runtime_memory_profile),
                 providers=providers,
             )
         else:
             self.session = ort.InferenceSession(
-                str(self.model_dir / "lm.onnx"),
+                str(self.model_path),
                 providers=providers,
             )
         self.output_session = None
