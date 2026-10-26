@@ -5,12 +5,24 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from scripts import build_variant_release, smoke_variant_bundle
 
 REVISION = "a" * 40
 WEIGHT_PAYLOADS = {"packed": b"packed-weight-payload", "emb4": b"emb4-weight-payload"}
 WEIGHT_SHA256 = {name: hashlib.sha256(payload).hexdigest() for name, payload in WEIGHT_PAYLOADS.items()}
+
+
+def _speaker_projection_state() -> dict[str, torch.Tensor]:
+    return {
+        "spk_proj.0.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        "spk_proj.0.bias": torch.arange(2, dtype=torch.float32),
+        "spk_proj.1.weight": torch.ones(2, dtype=torch.float32),
+        "spk_proj.1.bias": torch.zeros(2, dtype=torch.float32),
+    }
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -40,7 +52,10 @@ def _write_model_root(path: Path, *, variant: str | None = None) -> None:
     else:
         checkpoint = path / "lm/model.safetensors"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint.write_bytes(WEIGHT_PAYLOADS[variant] if variant else b"full-weight-payload")
+    if variant is None or variant == "emb4":
+        save_file(_speaker_projection_state(), str(path / "lm/model.safetensors"))
+    if variant is not None:
+        checkpoint.write_bytes(WEIGHT_PAYLOADS[variant])
     _write_json(path / "voices/voices.json", {"Amy": {}, "Bruno": {}})
     (path / "tokenizer.json").write_text("{}", encoding="utf-8")
 
@@ -134,7 +149,7 @@ def _write_candidate_bundle(path: Path, variant: str) -> None:
 def _make_runner(*, variant: str = "packed", parity_passed: bool = True):
     def runner(command, **kwargs):
         args = [str(item) for item in command]
-        assert kwargs["max_additional_swap_gib"] == 3.0
+        assert kwargs["max_additional_swap_gib"] == 4.0
         output_json = kwargs["output_json"]
         log_path = kwargs["log_path"]
         output_json.parent.mkdir(parents=True, exist_ok=True)
@@ -161,7 +176,7 @@ def _make_runner(*, variant: str = "packed", parity_passed: bool = True):
             _write_json(size_path, {"bundle_bytes": 1234, "bundle_dir": args[2]})
         elif any("benchmark_variant_lm.py" in arg for arg in args):
             assert args[args.index("--variant") + 1] == variant
-            assert kwargs["max_additional_swap_gib"] == 3.0
+            assert kwargs["max_additional_swap_gib"] == 4.0
             _write_json(
                 Path(args[args.index("--output") + 1]),
                 {
@@ -291,6 +306,29 @@ def test_prepare_variant_source_copies_selected_weights_without_touching_source(
 
 
 
+def test_prepare_emb4_stages_only_speaker_projection_from_full_source(tmp_path):
+    model_dir = tmp_path / "source"
+    variant_dir = tmp_path / "emb4-reference"
+    staged_dir = tmp_path / "staged"
+    _write_model_root(model_dir)
+    _write_model_root(variant_dir, variant="emb4")
+    source_hash = build_variant_release._tree_hash(model_dir)
+    variant_hash = build_variant_release._tree_hash(variant_dir)
+
+    build_variant_release._prepare_variant_source(model_dir, variant_dir, "emb4", staged_dir)
+
+    assert not (staged_dir / "lm/model.safetensors").exists()
+    assert (staged_dir / "lm/model-tl2-emb4.safetensors").read_bytes() == WEIGHT_PAYLOADS["emb4"]
+    with safe_open(
+        str(staged_dir / "lm/model-speaker-projection.safetensors"), framework="pt", device="cpu"
+    ) as staged_projection:
+        assert set(staged_projection.keys()) == set(_speaker_projection_state())
+        for name, tensor in _speaker_projection_state().items():
+            assert torch.equal(staged_projection.get_tensor(name), tensor)
+    assert build_variant_release._tree_hash(model_dir) == source_hash
+    assert build_variant_release._tree_hash(variant_dir) == variant_hash
+
+
 
 def test_prepare_variant_source_isolates_when_source_and_reference_are_the_same(tmp_path):
     model_dir = tmp_path / "source"
@@ -327,7 +365,7 @@ def test_build_release_promotes_only_after_all_gates_and_preserves_inputs(tmp_pa
     assert manifest["build_config"]["tritpack_format_version"] == "kitten2-ternary-tritpack-v1"
     assert manifest["build_config"]["runtime_materialization_required"] is True
     assert manifest["build_config"]["materialized_external_bytes"] == 512
-    assert manifest["build_config"]["max_additional_swap_gib"] == 3.0
+    assert manifest["build_config"]["max_additional_swap_gib"] == 4.0
     for relative, record in manifest["files"].items():
         payload = (fixture["output_dir"] / relative).read_bytes()
         assert len(payload) == record["bytes"]

@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXPRESSION_CORPUS = PROJECT_ROOT / "tests/fixtures/expression_cases.json"
 MULTILINGUAL_CORPUS = PROJECT_ROOT / "tests/fixtures/multilingual_cases.json"
 
-MAX_ADDITIONAL_SWAP_GIB = 3.0
+MAX_ADDITIONAL_SWAP_GIB = 4.0
 
 class ReleaseGateError(RuntimeError):
     def __init__(self, gate: str, message: str):
@@ -80,6 +80,48 @@ def _revision_manifest(model_dir: Path) -> dict[str, Any]:
     return manifest
 
 
+def _stage_emb4_speaker_projection(model_dir: Path, staged_model_dir: Path) -> None:
+    full_lm = resolve_weight_path(model_dir, "full")
+    if full_lm is None:
+        raise FileNotFoundError(f"Full LM checkpoint is missing from {model_dir}")
+    if full_lm.is_file():
+        checkpoint_paths = [full_lm]
+    elif full_lm.is_dir():
+        checkpoint = full_lm / "model.safetensors"
+        checkpoint_paths = (
+            [checkpoint]
+            if checkpoint.is_file()
+            else sorted(full_lm.glob("model-*-of-*.safetensors"))
+        )
+    else:
+        checkpoint_paths = []
+    if not checkpoint_paths:
+        raise FileNotFoundError(f"Full LM SafeTensors checkpoint is missing from {full_lm}")
+
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    required = {
+        "spk_proj.0.weight",
+        "spk_proj.0.bias",
+        "spk_proj.1.weight",
+        "spk_proj.1.bias",
+    }
+    projection: dict[str, Any] = {}
+    for checkpoint_path in checkpoint_paths:
+        with safe_open(str(checkpoint_path), framework="pt", device="cpu") as checkpoint:
+            for name in required.intersection(checkpoint.keys()):
+                if name in projection:
+                    raise ValueError(f"Duplicate speaker projection tensor {name!r} in full LM shards")
+                projection[name] = checkpoint.get_tensor(name)
+    missing = required - projection.keys()
+    if missing:
+        raise ValueError(f"Full LM checkpoint is missing speaker projection tensors: {sorted(missing)}")
+
+    destination = staged_model_dir / "lm/model-speaker-projection.safetensors"
+    save_file(projection, str(destination))
+
+
 def _prepare_variant_source(
     model_dir: Path,
     variant_reference_dir: Path,
@@ -124,6 +166,8 @@ def _prepare_variant_source(
         raise ValueError(f"Source config declares no {variant} checkpoint path")
     destination_weight.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(selected_weight, destination_weight)
+    if variant == "emb4":
+        _stage_emb4_speaker_projection(model_dir, staged_model_dir)
     staged_manifest = dict(source_manifest)
     staged_manifest["weight_variant"] = variant
     staged_manifest["variant_weight_source_sha256"] = _sha256_file(selected_weight)

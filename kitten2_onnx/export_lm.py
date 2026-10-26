@@ -298,15 +298,31 @@ def load_hf_lm(
         config = AutoConfig.from_pretrained(str(lm_dir), local_files_only=True)
         with init_empty_weights():
             model = AutoModelForCausalLM.from_config(config, attn_implementation="eager")
-        state = {
-            name: tensor.to(dtype=dtype)
-            for name, tensor in load_lm_state_dict(repo_dir, variant=weight_variant).items()
-            if not name.startswith("spk_proj.")
-        }
-        loading_info = model.load_state_dict(state, strict=False, assign=True)
-        missing = set(loading_info.missing_keys)
-        unexpected = set(loading_info.unexpected_keys)
-        del state
+        if weight_variant == "emb4":
+            from kitten2_onnx.tl2_emb4 import iter_emb4_tensors
+
+            expected = set(model.state_dict())
+            loaded: set[str] = set()
+            unexpected: set[str] = set()
+            for name, tensor in iter_emb4_tensors(checkpoint_path):
+                if name.startswith("spk_proj."):
+                    continue
+                loading_info = model.load_state_dict(
+                    {name: tensor.to(dtype=dtype)}, strict=False, assign=True
+                )
+                loaded.add(name)
+                unexpected.update(loading_info.unexpected_keys)
+            missing = expected - loaded
+        else:
+            state = {
+                name: tensor.to(dtype=dtype)
+                for name, tensor in load_lm_state_dict(repo_dir, variant=weight_variant).items()
+                if not name.startswith("spk_proj.")
+            }
+            loading_info = model.load_state_dict(state, strict=False, assign=True)
+            missing = set(loading_info.missing_keys)
+            unexpected = set(loading_info.unexpected_keys)
+            del state
 
     if model.config.tie_word_embeddings:
         missing.discard("lm_head.weight")

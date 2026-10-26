@@ -204,6 +204,61 @@ def test_load_hf_lm_rejects_missing_transformer_weight(tmp_path, monkeypatch):
         export_lm_module.load_hf_lm(repo_dir, torch.float32)
 
 
+
+def test_load_hf_lm_streams_emb4_state_without_building_a_full_state_dict(tmp_path, monkeypatch):
+    import accelerate
+    import transformers
+
+    from kitten2_onnx import tl2_emb4, weights
+
+    class StreamingCausalLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=False)
+            self.layer_a = nn.Parameter(torch.zeros(2))
+            self.layer_b = nn.Parameter(torch.zeros(2))
+
+        def tie_weights(self):
+            pass
+
+    repo_dir = tmp_path / "emb4-source"
+    lm_dir = _make_repo(repo_dir)
+    (repo_dir / "config.json").write_text(
+        json.dumps({"lm_dir": "lm", "lm_emb4": "lm/model-tl2-emb4.safetensors"}),
+        encoding="utf-8",
+    )
+    checkpoint = lm_dir / "model-tl2-emb4.safetensors"
+    checkpoint.write_bytes(b"emb4-checkpoint")
+    model = StreamingCausalLM()
+    reconstructed = {
+        "layer_a": torch.tensor([1.0, 2.0]),
+        "layer_b": torch.tensor([3.0, 4.0]),
+    }
+    monkeypatch.setattr(accelerate, "init_empty_weights", __import__("contextlib").nullcontext)
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        staticmethod(lambda *args, **kwargs: object()),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModelForCausalLM,
+        "from_config",
+        staticmethod(lambda *args, **kwargs: model),
+    )
+    monkeypatch.setattr(tl2_emb4, "iter_emb4_tensors", lambda path: iter(reconstructed.items()))
+    monkeypatch.setattr(
+        weights,
+        "load_lm_state_dict",
+        lambda *args, **kwargs: pytest.fail("emb4 export must stream reconstructed weights"),
+    )
+
+    loaded = export_lm_module.load_hf_lm(repo_dir, torch.float32, weight_variant="emb4")
+
+    assert loaded is model
+    assert torch.equal(model.layer_a, reconstructed["layer_a"])
+    assert torch.equal(model.layer_b, reconstructed["layer_b"])
+    assert not model.training
+
 def test_runtime_uses_profile_provider_and_refuses_bfloat16_numpy(tmp_path, monkeypatch):
     import sys
 
